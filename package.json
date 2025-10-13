@@ -1,0 +1,50 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server",
+    "dev": "nodemon server"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "agenda": "^5.0.0",
+    "axios": "^1.11.0",
+    "bcrypt": "^6.0.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "crypto": "^1.0.1",
+    "date-fns": "^4.1.0",
+    "dayjs": "^1.11.13",
+    "deepmerge": "^4.3.1",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "express-async-handler": "^1.2.0",
+    "express-rate-limit": "^8.0.1",
+    "express-validator": "^7.2.1",
+    "fs": "^0.0.1-security",
+    "google-auth-library": "^10.2.0",
+    "http": "^0.0.1-security",
+    "ical-generator": "^9.0.0",
+    "json2csv": "^6.0.0-alpha.2",
+    "jsonwebtoken": "^9.0.2",
+    "mime-types": "^3.0.1",
+    "mongoose": "^8.17.0",
+    "mongoose-sequence": "^6.0.1",
+    "multer": "^2.0.2",
+    "nanoid": "^3.3.4",
+    "nodemailer": "^7.0.5",
+    "path": "^0.12.7",
+    "pdfkit": "^0.17.2",
+    "qrcode": "^1.5.4",
+    "slugify": "^1.6.6",
+    "socket.io": "^4.8.1",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
