@@ -57,7 +57,7 @@ function safeRequire(p) {
 // Adjust paths if your model paths differ
 const EMAIL_MODELS = {
   Attendee      : safeRequire('../models/attendee'),
-  Exhibitor     : safeRequire('../models/Exhibitor'),
+  Exhibitor     : safeRequire('../models/exhibitor'),
   Speaker       : safeRequire('../models/speaker'),
   Employee      : safeRequire('../models/Employee'),      // admin/backoffice accounts, if applicable
   Student       : safeRequire('../models/Student'),       // if you allow student login via email
