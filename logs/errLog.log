@@ -7083,3 +7083,4 @@
 20251013	09:58:54	7f2c4b12-db88-4564-b387-956c1391ec60	ReferenceError: Consultant is not defined	GET	/actors/meetings/suggest	http://localhost:3000
 20251013	10:02:40	8931ee63-8361-40e4-ab93-aaebc9917683	ReferenceError: Consultant is not defined	GET	/actors/meetings/suggest	http://localhost:3000
 20251013	10:02:43	a3100705-b57f-4297-bdaa-9885ff1022de	ReferenceError: Consultant is not defined	GET	/actors/meetings/suggest	http://localhost:3000
+20251014	10:15:31	880b53d5-8c90-47b3-bf80-b606eff85353	Error: connect ECONNREFUSED 72.61.160.199:443	POST	/auth/register/attendee	http://eventra.cloud
