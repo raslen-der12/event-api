@@ -75,7 +75,7 @@ app.use('/actors',  require('./routes/actorsRoutes'));
 // 404
 app.use((_req, res) => {
   console.log('404 Not Found');
-  res.status(404).json({ message: '404 Not Found' });
+  res.status(404).json({ message: '404 Not Found but ready to get requests' });
 });
 
 /* 6) Error handler ------------------------------------------------------- */
