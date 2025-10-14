@@ -83,3 +83,11 @@
 20251012	21:06:35	f22a73f4-0867-4568-97db-c152e32d86f6	Error: querySrv ESERVFAIL _mongodb._tcp.cluster0.n4zvuoo.mongodb.net
 20251013	16:22:51	b7502da8-d12e-4884-b0eb-f644c4927efa	MongoServerSelectionError: C01C52D51C720000:error:0A000438:SSL routines:ssl3_read_bytes:tlsv1 alert internal error:../deps/openssl/openssl/ssl/record/rec_layer_s3.c:916:SSL alert number 80
 
+20251014	21:00:28	b63de83d-d93b-434c-aefb-63679acb47f3	MongoServerSelectionError: C0920000:error:0A000438:SSL routines:ssl3_read_bytes:tlsv1 alert internal error:c:\ws\deps\openssl\openssl\ssl\record\rec_layer_s3.c:916:SSL alert number 80
+
+20251014	21:47:01	7e76c151-16d1-4fd4-b038-b092a744fcb3	MongoServerSelectionError: 50260000:error:0A000438:SSL routines:ssl3_read_bytes:tlsv1 alert internal error:c:\ws\deps\openssl\openssl\ssl\record\rec_layer_s3.c:916:SSL alert number 80
+
+20251014	21:50:06	fc579fb3-917c-4d59-b98b-1ea6c575ba3b	MongoServerSelectionError: 489D0000:error:0A000438:SSL routines:ssl3_read_bytes:tlsv1 alert internal error:c:\ws\deps\openssl\openssl\ssl\record\rec_layer_s3.c:916:SSL alert number 80
+
+20251014	21:50:48	4369c6cc-7933-407e-912d-19e39ac8c5aa	MongoServerSelectionError: 24890000:error:0A000438:SSL routines:ssl3_read_bytes:tlsv1 alert internal error:c:\ws\deps\openssl\openssl\ssl\record\rec_layer_s3.c:916:SSL alert number 80
+

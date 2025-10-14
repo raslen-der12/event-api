@@ -7084,3 +7084,28 @@
 20251013	10:02:40	8931ee63-8361-40e4-ab93-aaebc9917683	ReferenceError: Consultant is not defined	GET	/actors/meetings/suggest	http://localhost:3000
 20251013	10:02:43	a3100705-b57f-4297-bdaa-9885ff1022de	ReferenceError: Consultant is not defined	GET	/actors/meetings/suggest	http://localhost:3000
 20251014	10:15:31	880b53d5-8c90-47b3-bf80-b606eff85353	Error: connect ECONNREFUSED 72.61.160.199:443	POST	/auth/register/attendee	http://eventra.cloud
+20251014	21:45:25	e1541243-269c-4044-9799-07fd1475decf	Error: Not allowed by CORS	GET	/biz/bp/search?	http://localhost:3000
+20251014	21:45:25	3b29359c-073a-4c83-baa6-db1611615066	Error: Not allowed by CORS	OPTIONS	/events/event/mini	http://localhost:3000
+20251014	21:45:25	1b757201-6038-48d7-baab-358b3c419cf7	Error: Not allowed by CORS	GET	/actors/me/notifications	http://localhost:3000
+20251014	21:45:25	02793ec4-9a2b-4632-a707-7e3a65e2e1c8	Error: Not allowed by CORS	GET	/events	http://localhost:3000
+20251014	21:45:25	366e5801-d9aa-4a15-906a-6fd1e9852f20	Error: Not allowed by CORS	OPTIONS	/actors/profile	http://localhost:3000
+20251014	21:45:55	bdb74dfa-735a-4645-99bd-3a57cb41272a	Error: Not allowed by CORS	GET	/actors/me/notifications	http://localhost:3000
+20251014	21:46:23	4283d75d-24d2-4c60-90b5-86f4f75f002a	Error: Not allowed by CORS	GET	/actors/me/notifications	http://localhost:3000
+20251014	21:46:54	9708d23c-2674-46f3-81ea-71e82be4c3be	MongooseError: Operation `businessprofiles.find()` buffering timed out after 10000ms	GET	/biz/bp/search?	http://localhost:3000
+20251014	21:46:54	3212f642-ab95-4b12-a78e-0b257d4deecf	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251014	21:46:54	2a43bae7-f612-4356-b338-ebc6c9418294	MongooseError: Operation `events.findOne()` buffering timed out after 10000ms	POST	/events/event/mini	http://localhost:3000
+20251014	21:47:05	34793510-d247-4fde-8a58-91a806f9da00	MongooseError: Operation `businessprofiles.find()` buffering timed out after 10000ms	GET	/biz/bp/search?	http://localhost:3000
+20251014	21:47:05	b2e6dfad-0abb-44be-bd1c-e170a4ee822b	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251014	21:47:05	42e2a6cd-1c1f-4404-8bdc-4cd2fdf407c5	MongooseError: Operation `events.findOne()` buffering timed out after 10000ms	POST	/events/event/mini	http://localhost:3000
+20251014	21:47:27	7ebb3ebd-209b-4af5-803a-56a24519619c	MongooseError: Operation `businessprofiles.find()` buffering timed out after 10000ms	GET	/biz/bp/search?	http://localhost:3000
+20251014	21:47:27	caeea1ef-cf2f-4fff-9ec8-cfe77a732a29	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251014	21:47:27	e0cb7495-3086-4c76-b0dd-d40202bdefac	MongooseError: Operation `events.findOne()` buffering timed out after 10000ms	POST	/events/event/mini	http://localhost:3000
+20251014	21:47:43	f42e5ef5-da2f-4daa-a525-116a92287ad4	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251014	21:47:43	c603a584-efa8-4ec3-82d2-7bb775e39afe	MongooseError: Operation `businessprofiles.find()` buffering timed out after 10000ms	GET	/biz/bp/search?	http://localhost:3000
+20251014	21:47:43	71fe4d8a-a627-43d7-ae62-997858037f3a	MongooseError: Operation `events.findOne()` buffering timed out after 10000ms	POST	/events/event/mini	http://localhost:3000
+20251014	21:50:17	c95c2c42-4655-4738-bf30-06e9c1fa4437	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	undefined
+20251014	21:50:21	606f9ec4-3ae9-4334-8783-12a7802afe98	MongooseError: Operation `businessprofiles.find()` buffering timed out after 10000ms	GET	/biz/bp/search?	http://localhost:3000
+20251014	21:50:21	b21a838e-a336-4a0f-9400-37cd384d4a17	MongooseError: Operation `events.findOne()` buffering timed out after 10000ms	POST	/events/event/mini	http://localhost:3000
+20251014	22:46:17	e8ec434c-c9e2-40ac-a737-dd89a05cd8e9	MulterError: File too large	POST	/auth/register/attendee	http://localhost:3000
+20251014	22:58:00	063f12c3-84f1-4103-9a42-1bd26d30b41f	Error: Message failed: 553 Sender is not allowed to relay emails	POST	/auth/register/attendee	http://localhost:3000
+20251014	22:59:30	c03d6128-1f5b-4122-8c8f-ac2478da87b4	TypeError: jwt.split is not a function	GET	/auth/google?redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Foauth%2Fcallback	undefined
