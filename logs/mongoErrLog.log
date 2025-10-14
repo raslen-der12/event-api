@@ -81,3 +81,5 @@
 20251011	23:08:11	13072d34-199d-4745-b198-6f2d69adb0fe	MongoServerSelectionError: 68710000:error:0A000438:SSL routines:ssl3_read_bytes:tlsv1 alert internal error:openssl\ssl\record\rec_layer_s3.c:916:SSL alert number 80
 
 20251012	21:06:35	f22a73f4-0867-4568-97db-c152e32d86f6	Error: querySrv ESERVFAIL _mongodb._tcp.cluster0.n4zvuoo.mongodb.net
+20251013	16:22:51	b7502da8-d12e-4884-b0eb-f644c4927efa	MongoServerSelectionError: C01C52D51C720000:error:0A000438:SSL routines:ssl3_read_bytes:tlsv1 alert internal error:../deps/openssl/openssl/ssl/record/rec_layer_s3.c:916:SSL alert number 80
+
