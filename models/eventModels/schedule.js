@@ -27,6 +27,7 @@ const scheduleSchema = new mongoose.Schema({
     default: ['attendee','exhibitor','speaker']
   },
   capacity: { type: Number, default: 0 }, // 0 = unlimited
+  seatsTaken:{type: Number, default :0 },
   registrationOpenAt:  { type: Date, default: null },
   registrationCloseAt: { type: Date, default: null },
 

@@ -65,7 +65,7 @@ app.use('/selects', require('./routes/selectsRoutes'));
 app.use('/biz', require("./routes/businessProfile.v2.routes"));
 app.use('/pp', require("./routes/profile.v2.routes"));
 app.use('/api', require("./routes/freightRoutes"));
-
+app.use('/search', require('./routes/searchRoutes'));
 // Admin chat REST lives under /admin/chat/*
 app.use('/admin/chat', require('./routes/adminChatRoutes'));
 

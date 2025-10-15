@@ -202,93 +202,6 @@ async function bumpScheduleSeatsTaken(sessionIds, delta = 1) {
 
 // --- helpers at top of authController.js ---
 
-async function buildRegistrationPdf({ event, actor, role, sessions }) {
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: 'A4', margin: 36 }); // 0.5" margins
-    const chunks = [];
-    doc.on('data', d => chunks.push(d));
-    doc.on('end', () => resolve(Buffer.concat(chunks)));
-    doc.on('error', reject);
-
-    // ── Header with logo
-    const brandLogoPath = process.env.BRAND_LOGO_PATH && path.resolve(process.env.BRAND_LOGO_PATH);
-    if (brandLogoPath && fs.existsSync(brandLogoPath)) {
-      doc.image(brandLogoPath, 36, 24, { fit: [120, 40] });
-    }
-    doc
-      .fontSize(18)
-      .text(event?.title || 'Event', 36, 78, { align: 'left', continued: false })
-      .moveDown(0.5);
-    doc
-      .fontSize(10)
-      .fillColor('#555')
-      .text(
-        `${new Date(event?.startDate || Date.now()).toLocaleDateString()} → ${new Date(event?.endDate || Date.now()).toLocaleDateString()} • ${event?.city || ''} ${event?.country ? '• ' + event.country : ''}`
-      )
-      .moveDown(1);
-
-    // ── Actor block
-    const who = role === 'exhibitor'
-      ? (actor?.identity?.contactName || actor?.identity?.exhibitorName || 'Participant')
-      : (actor?.personal?.fullName || 'Participant');
-
-    doc.fillColor('#000').fontSize(14).text(`Registration confirmation — ${who}`);
-    doc.moveDown(0.3);
-    doc.fontSize(11).fillColor('#333').text(`Role: ${role}`);
-    if (role === 'exhibitor') {
-      doc.text(`Brand: ${actor?.identity?.exhibitorName || '—'}`);
-    }
-    doc.moveDown(0.8);
-
-    // ── Sessions table
-    doc.fontSize(13).fillColor('#000').text('Registered sessions', { underline: true });
-    doc.moveDown(0.5);
-
-    const rows = (sessions || []).map(s => {
-      const start = s.startAt || s.startTime || s.startsAt || s.start || s.timeStart;
-      const end   = s.endAt   || s.endTime   || s.endsAt   || s.end   || s.timeEnd;
-      const startStr = start ? new Date(start).toLocaleString([], { hour: '2-digit', minute: '2-digit' }) : '—';
-      const endStr   = end   ? new Date(end).toLocaleString([], { hour: '2-digit', minute: '2-digit' })   : '—';
-      return {
-        title: s.title || s.sessionTitle || 'Untitled',
-        time:  `${startStr} – ${endStr}`,
-        room:  (s.room?.name || s.roomName || '—'),
-        track: s.track || '—'
-      };
-    });
-
-    // table header
-    doc.fontSize(11).fillColor('#111');
-    doc.text('Time', 36, doc.y, { continued: true, width: 110 });
-    doc.text('Title', 36 + 110, doc.y, { continued: true, width: 260 });
-    doc.text('Room', 36 + 110 + 260, doc.y, { continued: true, width: 90 });
-    doc.text('Track', 36 + 110 + 260 + 90, doc.y, { width: 90 });
-    doc.moveTo(36, doc.y + 2).lineTo(559, doc.y + 2).strokeColor('#999').lineWidth(0.5).stroke();
-    doc.moveDown(0.4);
-
-    rows.forEach(r => {
-      doc.fillColor('#222');
-      doc.text(r.time, 36, doc.y, { continued: true, width: 110 });
-      doc.text(r.title, 36 + 110, doc.y, { continued: true, width: 260 });
-      doc.text(r.room, 36 + 110 + 260, doc.y, { continued: true, width: 90 });
-      doc.text(r.track, 36 + 110 + 260 + 90, doc.y, { width: 90 });
-      doc.moveDown(0.2);
-    });
-
-    doc.moveDown(1.2);
-    // ── Footer
-    doc
-      .fontSize(10)
-      .fillColor('#555')
-      .text('Best regards,', { align: 'left' })
-      .text('GITS Team')
-      .moveDown(0.2)
-      .fillColor('#999')
-      .text('This PDF is attached to your confirmation email.');
-
-    doc.end();
-  });
-}
 
 
 
@@ -679,40 +592,8 @@ exports.refresh = asyncHandler(async (req, res) => {
 
 
 /* ─── helper: create verification token & e-mail ───────────────────── */
-async function issueVerification(userDoc, email, role) {
-  const raw  = randomBytes(32).toString('hex');
-  const hash = await bcrypt.hash(raw, 12);
 
-  userDoc.verifyToken   = hash;
-  userDoc.verifyExpires = Date.now() + 24 * 60 * 60 * 1000; // 24 h
-  await userDoc.save();
 
-  const link = `${process.env.FRONTEND_URL}/verify-email?token=${raw}&role=${role}&id=${userDoc._id}`;
-  await sendMail(email, 'Verify your e-mail', `
-    <p>Hello ${email.split('@')[0]},</p>
-    <p>Please verify your e-mail by clicking the link below:</p>
-    <p><a href="${link}">${link}</a></p>
-    <p>This link expires in 24 hours.</p>
-  `);
-}
-function sendDbError(err, res, fallback = 'Registration failed') {
-  // Duplicate key (any unique index, not only email)
-  if (err && (err.code === 11000 || err.code === 11001)) {
-    const field = Object.keys(err.keyPattern || err.keyValue || {})[0] || 'field';
-    return res.status(409).json({ message: `${field} must be unique`, details: err.keyValue || undefined });
-  }
-  // Schema validation
-  if (err && err.name === 'ValidationError') {
-    const first = Object.values(err.errors || {})[0];
-    return res.status(400).json({ message: first?.message || 'Validation error' });
-  }
-  // Cast errors (e.g., bad ObjectId)
-  if (err && err.name === 'CastError') {
-    return res.status(400).json({ message: `Bad ${err.path}` });
-  }
-  // Default
-  return res.status(500).json({ message: fallback });
-}
 function parseSubRoles(body) {
   // Accept: subRole[]=a&subRole[]=b, or subRole: "a,b", or subRole: ["a","b"]
   const list = []
@@ -779,14 +660,17 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     .concat(req.body['sessionIds[]'] || req.body.sessionIds || [])
     .flat()
     .filter(Boolean);
+
   await assertEmailAvailableEverywhere(req.body.email);
+
   // Basic validation
   if (!isId(eventId)) return res.status(400).json({ message: 'Valid eventId is required' });
   if (!toStr(fullName).trim()) return res.status(400).json({ message: 'Full name is required' });
   if (!EMAIL_RX.test(toStr(email))) return res.status(400).json({ message: 'Valid email is required' });
   if (!toStr(country).trim()) return res.status(400).json({ message: 'Country is required' });
-  if (!req.file?.path) return res.status(400).json({ message: 'Profile photo is required' });
+  // Photo is OPTIONAL now (no error if missing)
   if (!sessionIds.length) return res.status(400).json({ message: 'Please select at least one session' });
+
   const PASSWORD_MIN = 8;
   if (!toStr(pwd)) return res.status(400).json({ message: 'Password is required' });
   if (toStr(pwd).length < PASSWORD_MIN)
@@ -799,21 +683,30 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
 
   const subRole = parseSubRoles(req.body);
   const actorTypeNorm = toStr(actorType).trim();
-const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
+  const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
+
   const preferredLanguages = csvToArr(prefLangCsv).slice(0, 3);
   const openFlag = normBool(openToMeetings);
   const salt    = await bcrypt.genSalt(12);
   const pwdHash = await bcrypt.hash(toStr(pwd), salt);
+
+  // Photo: uploaded or default
+  const DEF_PHOTO =
+    `${(process.env.DEF_ROOT || '').replace(/\/+$/,'')}/uploads/default/photodef.png`;
+  const profilePicUrl = req.file?.path
+    ? localPathToWebUrl(req.file.path)
+    : DEF_PHOTO;
+
   // Persist
   const created = await attendee.create({
     personal: {
       fullName: toStr(fullName).trim(),
       email: toStr(email).toLowerCase().trim(),
-      firstEmail : toStr(email).toLowerCase().trim(), 
+      firstEmail : toStr(email).toLowerCase().trim(),
       phone: toStr(phone).trim(),
       country: toStr(country).toUpperCase(),
       city: toStr(city).trim(),
-      profilePic: localPathToWebUrl(req.file.path),
+      profilePic: profilePicUrl,
       preferredLanguages
     },
     organization: {
@@ -846,6 +739,31 @@ const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
 
   // Sessions (normalized)
   const normSessions = await loadAndValidateSessions(eventId, sessionIds);
+
+  // ==== Conflict system (per time slot + track family) ====
+  // Separate Atelier vs Masterclass so they do NOT conflict at the same time.
+  const conflictBucket = (track) => {
+    const t = String(track || '').toLowerCase();
+    if (t.includes('atelier')) return 'atelier';
+    if (t.includes('masterclass')) return 'masterclass';
+    return 'other';
+  };
+
+  // Allow one selection per (startAt|bucket)
+  const seen = new Map();
+  for (const s of normSessions) {
+    const start = s.startAt instanceof Date ? s.startAt : new Date(s.startAt);
+    const key = `${start.getTime()}|${conflictBucket(s.track)}`;
+    if (seen.has(key)) {
+      return res.status(409).json({
+        message: 'Conflicting sessions selected for the same time/track family',
+        conflictAt: s._id,
+        conflictWith: seen.get(key)._id
+      });
+    }
+    seen.set(key, s);
+  }
+
   try {
     await attachSeatsAndEnforce({ normSessions, enforce: true }); // throws if any session is full
   } catch (e) {
@@ -857,6 +775,7 @@ const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
     }
     throw e;
   }
+
   // Create registrations
   await createSessionRegs({ actorId: created._id, actorRole: 'attendee', eventId, sessions: normSessions });
   await bumpScheduleSeatsTaken(normSessions.map(s => s._id), +1);
@@ -874,18 +793,25 @@ const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
   const brandLogoPath = process.env.BRAND_LOGO_PATH;
   const who = created?.personal?.fullName || 'there';
 
+  // Taller, more readable rows + wrapping for very long titles
   const rowsHtml = normSessions.map(s => {
     const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
     const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
-    return `<tr>
-      <td style="padding:8px;border-bottom:1px solid #eee;white-space:nowrap">${startStr}–${endStr}</td>
-      <td style="padding:8px;border-bottom:1px solid #eee;font-weight:600">${escapeHtml(s.title)}</td>
-      <td style="padding:8px;border-bottom:1px solid #eee">${escapeHtml(s.room.name || '')}</td>
-      <td style="padding:8px;border-bottom:1px solid #eee;color:#64748b">${escapeHtml(s.track || '')}</td>
-    </tr>`;
+    return `
+      <tr>
+        <td style="padding:10px 8px;border-bottom:1px solid #eee;white-space:nowrap;vertical-align:top">${startStr}–${endStr}</td>
+        <td style="padding:10px 8px;border-bottom:1px solid #eee;font-weight:600;white-space:normal;word-break:break-word;line-height:1.35;vertical-align:top">
+          ${escapeHtml(s.title)}
+        </td>
+        <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:top">${escapeHtml(s.room.name || '')}</td>
+        <td style="padding:10px 8px;border-bottom:1px solid #eee;color:#64748b;vertical-align:top">${escapeHtml(s.track || '')}</td>
+      </tr>`;
   }).join('');
 
-  const logoImg = brandLogoPath ? `<img src="cid:brandlogo@cid" alt="Logo" style="max-height:40px;vertical-align:middle;margin-right:8px"/>` : '';
+  const logoImg = brandLogoPath
+    ? `<img src="cid:brandlogo@cid" alt="Logo" style="max-height:40px;vertical-align:middle;margin-right:8px"/>`
+    : '';
+
   const hdr = `
     <div style="padding:14px 0;border-bottom:1px solid #e5e7eb;margin-bottom:12px">
       ${logoImg}
@@ -900,7 +826,13 @@ const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
 
   const sessionsHtml = normSessions.length ? `
     <h3 style="font:800 14px system-ui;margin:12px 0 8px">Your selected sessions</h3>
-    <table style="border-collapse:collapse;width:100%;font:600 12px system-ui">
+    <table style="border-collapse:collapse;width:100%;font:600 12px system-ui;table-layout:fixed">
+      <colgroup>
+        <col style="width:100px" />
+        <col style="width:auto" />
+        <col style="width:140px" />
+        <col style="width:120px" />
+      </colgroup>
       <thead>
         <tr>
           <th align="left" style="padding:8px;border-bottom:2px solid #e5e7eb">Time</th>
@@ -928,7 +860,9 @@ const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
   `;
 
   const attachments = [{ filename: 'registration.pdf', content: pdf, contentType: 'application/pdf' }];
-  if (brandLogoPath) attachments.push({ filename: path.basename(brandLogoPath), path: brandLogoPath, cid: 'brandlogo@cid' });
+  if (brandLogoPath) {
+    attachments.push({ filename: path.basename(brandLogoPath), path: brandLogoPath, cid: 'brandlogo@cid' });
+  }
 
   await sendMail(
     created.personal.email,
@@ -948,6 +882,7 @@ const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
   await notifyRegistrationPending(created._id, 'attendee', eventId);
   return res.status(201).json({ success: true, data: { id: created._id, role: 'attendee' } });
 });
+
 
 
 
@@ -993,7 +928,9 @@ exports.registerExhibitor = asyncHandler(async (req, res) => {
     'links.website': website,
     'links.linkedin': linkedin,
   } = req.body || {};
+
   await assertEmailAvailableEverywhere(req.body.email);
+
   const sessionIds = []
     .concat(req.body['sessionIds[]'] || req.body.sessionIds || [])
     .flat()
@@ -1005,8 +942,9 @@ exports.registerExhibitor = asyncHandler(async (req, res) => {
   if (!toStr(contactName).trim()) return res.status(400).json({ message: 'Contact person is required' });
   if (!EMAIL_RX.test(toStr(email))) return res.status(400).json({ message: 'Valid email is required' });
   if (!toStr(country).trim()) return res.status(400).json({ message: 'Country is required' });
-  if (!req.file?.path) return res.status(400).json({ message: 'Logo is required' });
+  // Logo is OPTIONAL now (no error if missing)
   if (!sessionIds.length) return res.status(400).json({ message: 'Please select at least one session' });
+
   const PASSWORD_MIN = 8;
   if (!toStr(pwd)) return res.status(400).json({ message: 'Password is required' });
   if (toStr(pwd).length < PASSWORD_MIN)
@@ -1018,23 +956,29 @@ exports.registerExhibitor = asyncHandler(async (req, res) => {
 
   const subRole = parseSubRoles(req.body);
   const actorTypeNorm = toStr(actorType).trim();
-const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
+  const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
 
   const preferredLanguages = csvToArr(prefLangCsv).slice(0, 3);
   const openFlag = normBool(availableMeetings);
   const salt    = await bcrypt.genSalt(12);
   const pwdHash = await bcrypt.hash(toStr(pwd), salt);
+
+  // Logo: uploaded or default
+  const DEF_PHOTO =
+    `${(process.env.DEF_ROOT || '').replace(/\/+$/,'')}/uploads/default/photodef.png`;
+  const logoUrl = req.file?.path ? localPathToWebUrl(req.file.path) : DEF_PHOTO;
+
   const created = await Exhibitor.create({
     identity: {
       exhibitorName: toStr(exhibitorName).trim(),
       contactName: toStr(contactName).trim(),
       email: toStr(email).toLowerCase().trim(),
-      firstEmail : toStr(email).toLowerCase().trim(), 
+      firstEmail: toStr(email).toLowerCase().trim(),
       phone: toStr(phone).trim(),
       country: toStr(country).toUpperCase(),
       city: toStr(city).trim(),
       orgName: toStr(orgName).trim(),
-      logo: localPathToWebUrl(req.file.path),
+      logo: logoUrl,
       preferredLanguages
     },
     business: { industry: toStr(industry).trim() },
@@ -1060,17 +1004,41 @@ const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
 
   // Sessions (normalized)
   const normSessions = await loadAndValidateSessions(eventId, sessionIds);
-try {
-  await attachSeatsAndEnforce({ normSessions, enforce: true }); // throws if any session is full
-} catch (e) {
-  if (e && e.message === 'SESSION_FULL') {
-    return res.status(409).json({
-      message: 'One or more sessions are full',
-      fullSessionId: e.sessionId
-    });
+
+  // ==== Conflict system (per time slot + track family) ====
+  // Atelier and Masterclass do NOT conflict with each other at the same time.
+  const conflictBucket = (track) => {
+    const t = String(track || '').toLowerCase();
+    if (t.includes('atelier')) return 'atelier';
+    if (t.includes('masterclass')) return 'masterclass';
+    return 'other';
+  };
+  const seen = new Map(); // key = `${startMs}|${bucket}`
+  for (const s of normSessions) {
+    const start = s.startAt instanceof Date ? s.startAt : new Date(s.startAt);
+    const key = `${start.getTime()}|${conflictBucket(s.track)}`;
+    if (seen.has(key)) {
+      return res.status(409).json({
+        message: 'Conflicting sessions selected for the same time/track family',
+        conflictAt: s._id,
+        conflictWith: seen.get(key)._id
+      });
+    }
+    seen.set(key, s);
   }
-  throw e;
-}
+
+  try {
+    await attachSeatsAndEnforce({ normSessions, enforce: true }); // throws if any session is full
+  } catch (e) {
+    if (e && e.message === 'SESSION_FULL') {
+      return res.status(409).json({
+        message: 'One or more sessions are full',
+        fullSessionId: e.sessionId
+      });
+    }
+    throw e;
+  }
+
   // Create registrations
   await createSessionRegs({ actorId: created._id, actorRole: 'exhibitor', eventId, sessions: normSessions });
   await bumpScheduleSeatsTaken(normSessions.map(s => s._id), +1);
@@ -1088,21 +1056,27 @@ try {
   const brandLogoPath = process.env.BRAND_LOGO_PATH;
   const who = created?.identity?.contactName || created?.identity?.exhibitorName || 'there';
 
- const rowsHtml = normSessions.map(s => {
-  const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
-  const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
-  const seatNote = s.seats && s.seats.capacity > 0
-    ? ` (${Math.max(0, s.seats.capacity - s.seats.taken)} left / ${s.seats.capacity})`
-    : '';
-  return `<tr>
-    <td style="padding:8px;border-bottom:1px solid #eee;white-space:nowrap">${startStr}–${endStr}</td>
-    <td style="padding:8px;border-bottom:1px solid #eee;font-weight:600">${escapeHtml(s.title)}${seatNote}</td>
-    <td style="padding:8px;border-bottom:1px solid #eee">${escapeHtml(s.room.name || '')}</td>
-    <td style="padding:8px;border-bottom:1px solid #eee;color:#64748b">${escapeHtml(s.track || '')}</td>
-  </tr>`;
-}).join('');
+  // Taller, wrapped rows for long titles
+  const rowsHtml = normSessions.map(s => {
+    const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
+    const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
+    const seatNote = s.seats && s.seats.capacity > 0
+      ? ` (${Math.max(0, s.seats.capacity - s.seats.taken)} left / ${s.seats.capacity})`
+      : '';
+    return `
+      <tr>
+        <td style="padding:10px 8px;border-bottom:1px solid #eee;white-space:nowrap;vertical-align:top">${startStr}–${endStr}</td>
+        <td style="padding:10px 8px;border-bottom:1px solid #eee;font-weight:600;white-space:normal;word-break:break-word;line-height:1.35;vertical-align:top">
+          ${escapeHtml(s.title)}${seatNote}
+        </td>
+        <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:top">${escapeHtml(s.room.name || '')}</td>
+        <td style="padding:10px 8px;border-bottom:1px solid #eee;color:#64748b;vertical-align:top">${escapeHtml(s.track || '')}</td>
+      </tr>`;
+  }).join('');
 
-  const logoImg = brandLogoPath ? `<img src="cid:brandlogo@cid" alt="Logo" style="max-height:40px;vertical-align:middle;margin-right:8px"/>` : '';
+  const logoImg = brandLogoPath
+    ? `<img src="cid:brandlogo@cid" alt="Logo" style="max-height:40px;vertical-align:middle;margin-right:8px"/>`
+    : '';
   const hdr = `
     <div style="padding:14px 0;border-bottom:1px solid #e5e7eb;margin-bottom:12px">
       ${logoImg}
@@ -1117,7 +1091,13 @@ try {
 
   const sessionsHtml = normSessions.length ? `
     <h3 style="font:800 14px system-ui;margin:12px 0 8px">Your selected sessions</h3>
-    <table style="border-collapse:collapse;width:100%;font:600 12px system-ui">
+    <table style="border-collapse:collapse;width:100%;font:600 12px system-ui;table-layout:fixed">
+      <colgroup>
+        <col style="width:100px" />
+        <col style="width:auto" />
+        <col style="width:140px" />
+        <col style="width:120px" />
+      </colgroup>
       <thead>
         <tr>
           <th align="left" style="padding:8px;border-bottom:2px solid #e5e7eb">Time</th>
@@ -1145,7 +1125,9 @@ try {
   `;
 
   const attachments = [{ filename: 'registration.pdf', content: pdf, contentType: 'application/pdf' }];
-  if (brandLogoPath) attachments.push({ filename: path.basename(brandLogoPath), path: brandLogoPath, cid: 'brandlogo@cid' });
+  if (brandLogoPath) {
+    attachments.push({ filename: path.basename(brandLogoPath), path: brandLogoPath, cid: 'brandlogo@cid' });
+  }
 
   await sendMail(
     created.identity.email,
@@ -1165,6 +1147,7 @@ try {
   await notifyRegistrationPending(created._id, 'exhibitor', eventId);
   return res.status(201).json({ success: true, data: { id: created._id, role: 'exhibitor' } });
 });
+
 
 
 
@@ -1289,14 +1272,7 @@ exports.verifyEmail = asyncHandler(async (req, res) => {
 });
 
 /* helper to pull the email field depending on schema */
-function getEmail(doc, role){
-  switch(role){
-    case 'attendee' : return doc.personal.email;
-    case 'speaker'  : return doc.personal.email;
-    case 'exhibitor': return doc.identity.email;
-    default         : return doc.email;
-  }
-}
+
 
 exports.forgotPassword = asyncHandler(async (req, res) => {
   const { email } = req.body;
@@ -1446,14 +1422,7 @@ exports.resetPassword = asyncHandler(async (req, res) => {
 });
 
 /* helper reused from Part 4 */
-function getEmail(doc, role){
-  switch(role){
-    case 'attendee' : return doc.personal.email;
-    case 'speaker'  : return doc.personal.email;
-    case 'exhibitor': return doc.identity.email;
-    default         : return doc.email;
-  }
-}
+
 
 
 /* ───────────────────────── 1. LOGOUT ─────────────────────────────── */
@@ -1687,19 +1656,7 @@ exports.resendVerificationById = asyncHandler(async (req, res) => {
   return res.json({ success: true, message: 'Verification e-mail re-sent.' });
 });
 
-async function issueResetToken(userDoc, ttlMs = 60 * 60 * 1000) {
-  const raw = randomBytes(32).toString('hex');
 
-  // rotate: keep previous token also valid until its original expiry
-  userDoc.resetTokenPrev   = userDoc.resetToken;
-  userDoc.resetPrevExpires = userDoc.resetExpires;
-
-  userDoc.resetToken   = await bcrypt.hash(raw, 12);
-  userDoc.resetExpires = Date.now() + ttlMs;
-
-  await userDoc.save();
-  return raw; // you email this
-}
 
 // POST /api/auth/reset-password   (also accepts GET with query for manual tests)
 

@@ -7084,3 +7084,103 @@
 20251013	10:02:40	8931ee63-8361-40e4-ab93-aaebc9917683	ReferenceError: Consultant is not defined	GET	/actors/meetings/suggest	http://localhost:3000
 20251013	10:02:43	a3100705-b57f-4297-bdaa-9885ff1022de	ReferenceError: Consultant is not defined	GET	/actors/meetings/suggest	http://localhost:3000
 20251014	10:15:31	880b53d5-8c90-47b3-bf80-b606eff85353	Error: connect ECONNREFUSED 72.61.160.199:443	POST	/auth/register/attendee	http://eventra.cloud
+20251014	21:37:00	eee3211e-03a6-400f-ac1b-2e048d5154c6	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-139.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251014	21:37:00	89343ab8-4373-4b36-a52f-80f65bfb383a	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-50.png?q=80&w=1200	https://eventra.cloud
+20251014	21:37:00	785d18ad-25f0-44c0-9eb7-5b58d0d70983	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/KH_03168.png	https://eventra.cloud
+20251014	21:37:00	361543dc-47cb-44a9-bf40-412c75c2bd84	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-260.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251014	21:45:44	ba4eecd8-a606-4f96-b7ee-c096fcf61423	Error: Not allowed by CORS	GET	/biz/bp/search?	http://localhost:3000
+20251014	21:45:44	e58dc7d2-cb89-4dc4-84f8-47f9d140120d	Error: Not allowed by CORS	OPTIONS	/events/event/mini	http://localhost:3000
+20251014	21:45:44	3fcc4ac9-851f-4e3a-9e08-d78df581dffc	Error: Not allowed by CORS	GET	/events	http://localhost:3000
+20251014	21:45:44	b5bd8d2c-7405-4461-8aef-cefa5e2ed52f	Error: Not allowed by CORS	OPTIONS	/actors/profile	http://localhost:3000
+20251014	21:45:44	6aa425e2-aab6-4cbd-96c6-d93ad47bcb0f	Error: Not allowed by CORS	GET	/actors/me/notifications	http://localhost:3000
+20251014	21:46:15	d17579b2-064a-4c52-a230-5a3f4cdd5b98	Error: Not allowed by CORS	GET	/actors/me/notifications	http://localhost:3000
+20251014	21:46:16	8be3d6b4-107b-4913-b112-7241a1b73011	Error: Not allowed by CORS	GET	/actors/me/notifications	http://localhost:3000
+20251014	21:46:19	682a424e-d866-436c-9732-3eba5afc8436	Error: Not allowed by CORS	OPTIONS	/events/event/mini	http://localhost:3000
+20251014	21:46:19	b0f64523-1205-4daf-9280-33a2ed0f9637	Error: Not allowed by CORS	OPTIONS	/actors/profile	http://localhost:3000
+20251014	21:46:19	5c144e03-f8ab-41c8-be6c-2644cfb33259	Error: Not allowed by CORS	GET	/biz/bp/search?	http://localhost:3000
+20251014	21:46:19	54f5d557-4ac5-4503-b6e9-c99adfc4d41b	Error: Not allowed by CORS	GET	/events	http://localhost:3000
+20251014	21:46:19	201710ea-b1a3-4227-8aed-4450715e6930	Error: Not allowed by CORS	GET	/actors/me/notifications	http://localhost:3000
+20251014	21:46:24	e19586bc-e318-4f6b-8ec8-df27a9e2fa30	Error: Not allowed by CORS	GET	/events	http://localhost:3000
+20251014	21:46:24	931aff36-c41f-4734-a53e-b73ee36a78e2	Error: Not allowed by CORS	GET	/actors/me/notifications	http://localhost:3000
+20251014	21:46:26	856bca17-9786-4ad9-9f9b-98aac9ff2bb9	Error: Not allowed by CORS	GET	/events	http://localhost:3000
+20251014	21:46:26	b57ca323-e5b4-4a9a-bb6e-7a774e8a72a1	Error: Not allowed by CORS	GET	/actors/me/notifications	http://localhost:3000
+20251014	21:46:49	8aa82351-4883-486e-9d17-a1e680f940ce	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251015	00:37:44	c5faf620-cdf1-4235-97a9-ac5ff703e5ea	Too Many Requests: Too many login attempts from this IP, please try again after a 60 second pause	POST	/login	http://localhost:3000
+20251015	00:37:54	d5856b0e-5299-44c2-bb6f-5d4a7d02d162	Too Many Requests: Too many login attempts from this IP, please try again after a 60 second pause	POST	/login	http://localhost:3000
+20251015	00:38:08	f22c8308-0b61-4219-9ce4-1d88af08261f	Too Many Requests: Too many login attempts from this IP, please try again after a 60 second pause	POST	/login	http://localhost:3000
+20251015	02:17:16	5fd606cc-8384-4c09-bd75-b524821c1000	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-139.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251015	02:17:16	b99fcf86-1faf-43aa-a2e1-bc3c1a243d28	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-260.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251015	02:17:16	ff7f2fff-c975-4c53-9872-474532eb83eb	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-50.png?q=80&w=1200	https://eventra.cloud
+20251015	02:17:16	98b95ef9-e263-4fd3-90fd-b23261395d59	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/KH_03168.png	https://eventra.cloud
+20251015	03:17:56	1029dddf-1837-4d7a-b948-8b3e1eebb3c4	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-139.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251015	03:17:56	6eadc53c-fc41-4a4b-9b07-7f22790421e9	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/KH_03168.png	https://eventra.cloud
+20251015	03:17:56	eb986661-2742-4a10-b511-09ef1ddcf69a	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-50.png?q=80&w=1200	https://eventra.cloud
+20251015	03:17:56	5d46fcff-5dc2-4fc8-9b9b-f7f517322ab8	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-260.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251015	03:19:12	8f18e7b9-36f9-46d0-99e1-e97d14833001	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-01.png	https://eventra.cloud
+20251015	03:19:12	26528e83-9a12-4f6d-92ce-d60e4a626c94	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-50.png?q=80&w=1200	https://eventra.cloud
+20251015	03:19:12	34f8e174-d3ff-4c39-970b-25e5fed19f59	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-260.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251015	03:19:12	d65a5c3e-a055-47e6-b757-28268976115f	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-139.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251015	03:19:12	7b039a58-0893-4cb9-9f2a-c33b132e9608	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/KH_03168.png	https://eventra.cloud
+20251015	03:19:12	f0205523-c878-4b2e-bd7a-4cfcb7a415fc	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-02.png	https://eventra.cloud
+20251015	03:19:12	492fa617-2c69-4390-b335-0c3e2e35ac22	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-03.png	https://eventra.cloud
+20251015	03:19:12	d4a4962e-c0ae-4270-a841-e08f13d9269b	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-04.png	https://eventra.cloud
+20251015	03:19:12	a79a793a-fbca-4a41-b3b9-a1046eafeac0	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-05.png	https://eventra.cloud
+20251015	03:19:12	9b2c0ce4-655b-4c4b-a4ca-b91fff255090	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-06.png	https://eventra.cloud
+20251015	03:19:12	d218231b-0886-4912-93f6-87fe16cdc066	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-07.png	https://eventra.cloud
+20251015	03:33:08	b05e893a-c1a1-4a93-af63-3c0677c309b2	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-50.png?q=80&w=1200	https://eventra.cloud
+20251015	03:33:08	0b61b483-9d73-4807-9f30-ff7028becd0f	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-139.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251015	03:33:08	4abb5e18-593f-41f9-a1cf-5d00122ed3be	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-260.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251015	03:33:08	eafd1336-de85-4e70-92b6-92821047aee7	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/KH_03168.png	https://eventra.cloud
+20251015	03:33:08	a9202231-a38d-4686-9f96-53e45d9c2e72	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-01.png	https://eventra.cloud
+20251015	03:33:08	6d0022f5-b8f1-4e89-ad03-2da5acfc8df9	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-02.png	https://eventra.cloud
+20251015	03:33:08	6aef5baf-39cf-4c18-aa5c-fbf80e45fa3e	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-03.png	https://eventra.cloud
+20251015	03:33:08	c7aabb9e-3576-4264-ac08-199097e164d1	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-04.png	https://eventra.cloud
+20251015	03:33:08	188a9529-afdf-4cd5-854b-29172a581642	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-05.png	https://eventra.cloud
+20251015	03:33:08	e0f15ff9-cdaa-4e55-8bb7-8e696f28f56c	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-06.png	https://eventra.cloud
+20251015	03:33:08	681cd924-c9ad-469a-976f-635a66ddaa73	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-07.png	https://eventra.cloud
+20251015	05:25:23	4c925e94-711d-4839-a061-db3f7e51f09d	ReferenceError: Consultant is not defined	GET	/actors/meetings/suggest	http://localhost:3000
+20251015	07:07:05	49347564-16f5-416c-a827-9d32959a669c	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-139.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251015	07:07:05	ac959a17-a843-4ca5-b789-dd32a4f3daec	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-260.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251015	07:07:05	29945e17-8aba-43ff-8d22-5286af33f3c9	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/KH_03168.png	https://eventra.cloud
+20251015	07:07:05	6281ca33-3059-4d44-a644-6f9f3d285013	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-50.png?q=80&w=1200	https://eventra.cloud
+20251015	07:07:09	e52e19cd-22b3-434c-a424-5c76b5057815	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-01.png	https://eventra.cloud
+20251015	07:07:09	119cb9ba-d89b-472a-adee-7b4c2c2f6f68	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-02.png	https://eventra.cloud
+20251015	07:07:09	8fd1fea0-7296-4e8c-8591-ba4ffdeb9a97	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-04.png	https://eventra.cloud
+20251015	07:07:09	c108a3e5-18bd-41de-8ea7-35f0a699408f	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-03.png	https://eventra.cloud
+20251015	07:07:09	6931ec69-c303-424e-a038-ef1bd5125580	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-05.png	https://eventra.cloud
+20251015	07:07:09	5e26153b-8037-491a-b968-b11f037fbc1d	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-06.png	https://eventra.cloud
+20251015	07:07:09	21deaab4-ea2d-4ebc-81ef-edd9e8060409	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-07.png	https://eventra.cloud
+20251015	07:07:33	e32d5a45-e5ee-4dab-aa87-c9987c3f433d	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-139.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251015	07:07:33	46d11bcb-8274-4e09-babb-d0586093a1e8	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-50.png?q=80&w=1200	https://eventra.cloud
+20251015	07:07:33	51ba77b5-c427-43b8-b08d-6a29ed8c9790	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/KH_03168.png	https://eventra.cloud
+20251015	07:07:33	63d3d2b6-16ab-4e2a-846c-f33effa2ff81	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/sans%20titre-260.png?q=80&w=1600&auto=format&fit=crop	https://eventra.cloud
+20251015	17:14:30	92beea5c-a408-42f6-a8aa-44033c302dbd	MongooseError: Operation `eventschedules.aggregate()` buffering timed out after 10000ms	GET	/search/tags	http://localhost:3000
+20251015	17:14:40	a7adac7f-116a-45fb-ae34-047894576a60	MongooseError: Operation `eventschedules.aggregate()` buffering timed out after 10000ms	GET	/search/tags	http://localhost:3000
+20251015	17:14:40	763d282a-9a4c-4c10-b018-099e1edac1e2	MongooseError: Operation `businessprofiles.find()` buffering timed out after 10000ms	GET	/biz/bp/search?	http://localhost:3000
+20251015	17:14:40	55c849db-de3a-4332-9866-ce4828228787	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251015	17:14:40	e5ed8f20-8151-48a8-a948-ee42139809d4	MongooseError: Operation `events.findOne()` buffering timed out after 10000ms	POST	/events/event/mini	http://localhost:3000
+20251015	17:14:54	650e5a66-c70f-4079-acc5-309d7588234e	MongooseError: Operation `eventschedules.aggregate()` buffering timed out after 10000ms	GET	/search/tags	http://localhost:3000
+20251015	17:14:54	5661a31d-f286-4437-81f5-b09e309845cd	MongooseError: Operation `businessprofiles.find()` buffering timed out after 10000ms	GET	/biz/bp/search?	http://localhost:3000
+20251015	17:14:54	9ebd0f42-c393-47ca-bf92-92ebf0cb4b47	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251015	17:14:54	b4ed3900-984c-4755-b7d9-7ae0aa957dde	MongooseError: Operation `events.findOne()` buffering timed out after 10000ms	POST	/events/event/mini	http://localhost:3000
+20251015	17:15:00	b39b84cd-01c5-434f-988b-79db47419636	MongooseError: Operation `eventschedules.aggregate()` buffering timed out after 10000ms	GET	/search/tags	http://localhost:3000
+20251015	17:15:00	4f388e46-e207-49d5-bcd4-8be225a52b5f	MongooseError: Operation `businessprofiles.find()` buffering timed out after 10000ms	GET	/biz/bp/search?	http://localhost:3000
+20251015	17:15:00	1385e7a5-d61a-42b9-b602-8370c30a8d2a	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251015	17:15:00	6669d4d2-294e-4a91-b173-6b79d8dbd78f	MongooseError: Operation `events.findOne()` buffering timed out after 10000ms	POST	/events/event/mini	http://localhost:3000
+20251015	17:15:04	a027394c-a074-4990-8f21-6ccec467d84e	MongooseError: Operation `eventschedules.aggregate()` buffering timed out after 10000ms	GET	/search/quick?q=IPDAYS&limit=4	http://localhost:3000
+20251015	17:17:37	0b1a6fa5-af50-49f9-9749-b3e270f94e45	MongooseError: Operation `businessprofiles.find()` buffering timed out after 10000ms	GET	/biz/bp/search?	http://localhost:3000
+20251015	17:17:37	ab467393-f654-4cce-8e87-b9be5786071d	MongooseError: Operation `eventschedules.aggregate()` buffering timed out after 10000ms	GET	/search/tags	http://localhost:3000
+20251015	17:17:37	51e55bbb-dc4e-44da-8898-d8ffa09a4a04	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251015	17:17:37	0460c0c4-4ca7-48db-ae1b-9a903f53efc4	MongooseError: Operation `events.findOne()` buffering timed out after 10000ms	POST	/events/event/mini	http://localhost:3000
+20251015	17:17:42	7d5780e6-1937-497e-bdb7-88bea6ad9db1	MongooseError: Operation `eventschedules.aggregate()` buffering timed out after 10000ms	GET	/search/quick?q=IPDAYS&limit=4	http://localhost:3000
+20251015	17:18:34	08037e16-eb70-4225-83f4-eb64ca985782	MongooseError: Operation `eventschedules.aggregate()` buffering timed out after 10000ms	GET	/search/tags	http://localhost:3000
+20251015	17:18:34	a5e52c8d-fce4-48bd-9964-2496d5fde425	MongooseError: Operation `businessprofiles.find()` buffering timed out after 10000ms	GET	/biz/bp/search?	http://localhost:3000
+20251015	17:18:34	546d62d5-42cb-4631-be79-1756ebd2dfb6	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251015	17:18:34	3f3cc3a1-7a1f-47de-880f-d95ee6480a81	MongooseError: Operation `events.findOne()` buffering timed out after 10000ms	POST	/events/event/mini	http://localhost:3000
+20251015	17:18:39	a892b7e4-e50e-45b4-b577-7aea4258f069	MongooseError: Operation `eventschedules.aggregate()` buffering timed out after 10000ms	GET	/search/quick?q=IPDAYS&limit=4	http://localhost:3000
+20251015	17:18:56	d3ec83d6-c459-4536-b130-39f4da514dee	MongooseError: Operation `eventschedules.aggregate()` buffering timed out after 10000ms	GET	/search/tags	http://localhost:3000
+20251015	17:18:56	a3b16b12-b168-46c7-bcbf-9a0b13fc7906	MongooseError: Operation `businessprofiles.find()` buffering timed out after 10000ms	GET	/biz/bp/search?	http://localhost:3000
+20251015	17:18:56	dbfb137b-7d18-41fa-9b36-4a9b39e83a7f	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251015	17:18:56	1ab5af2d-a25a-4aad-8c53-cf6fd108021b	MongooseError: Operation `events.findOne()` buffering timed out after 10000ms	POST	/events/event/mini	http://localhost:3000
+20251015	17:19:04	d408cf49-544e-420a-8b09-db642bedca91	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251015	17:19:14	fb68ce1c-82e0-4d34-9fdf-4ac57e4cbb7f	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
