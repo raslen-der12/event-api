@@ -1,6 +1,13 @@
 node_modules
 .env
 /uploads
-uploads/****
+uploads/*****
 uploads/.gitkeep
 /config/allowedOrigin.js
+config/allowedOrigin.js
+
+config/allowedOrigin.js
+uploads/
+logs/
+*.rar
+logs/
