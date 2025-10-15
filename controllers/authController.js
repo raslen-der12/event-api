@@ -795,69 +795,72 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
 
   // Taller, more readable rows + wrapping for very long titles
   const rowsHtml = normSessions.map(s => {
-    const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
-    const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
-    return `
+  const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
+  const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
+
+  // common cell style to prevent clipping and let row height expand with content
+  const cellBase = "padding:12px 10px;border-bottom:1px solid #eee;vertical-align:top;line-height:1.45;white-space:normal;word-break:break-word;overflow-wrap:anywhere;";
+  return `
+    <tr>
+      <td style="${cellBase}white-space:nowrap">${startStr}–${endStr}</td>
+      <td style="${cellBase}font-weight:600">
+        ${escapeHtml(s.title)}
+      </td>
+      <td style="${cellBase}">${escapeHtml(s.room.name || '')}</td>
+      <td style="${cellBase}color:#64748b">${escapeHtml(s.track || '')}</td>
+    </tr>`;
+}).join('');
+
+const logoImg = brandLogoPath
+  ? `<img src="cid:brandlogo@cid" alt="Logo" style="max-height:40px;vertical-align:middle;margin-right:8px"/>`
+  : '';
+
+const hdr = `
+  <div style="padding:14px 0;border-bottom:1px solid #e5e7eb;margin-bottom:12px">
+    ${logoImg}
+    <div style="font:700 18px/1.2 system-ui,Segoe UI,Roboto;display:inline-block;vertical-align:middle">
+      ${escapeHtml(eventDoc.title || 'Event')}
+    </div>
+    <div style="font:600 12px/1.4 system-ui;color:#64748b">
+      ${new Date(eventDoc.startDate||Date.now()).toLocaleDateString()} → ${new Date(eventDoc.endDate||Date.now()).toLocaleDateString()}
+      ${eventDoc.city ? `• ${escapeHtml(eventDoc.city)}` : ''} ${eventDoc.country ? `• ${escapeHtml(eventDoc.country)}` : ''}
+    </div>
+  </div>`;
+
+const sessionsHtml = normSessions.length ? `
+  <h3 style="font:800 14px system-ui;margin:12px 0 8px">Your selected sessions</h3>
+  <table style="border-collapse:collapse;width:100%;font:600 12px system-ui;table-layout:auto">
+    <colgroup>
+      <col style="width:110px" />
+      <col style="width:auto" />
+      <col style="width:160px" />
+      <col style="width:130px" />
+    </colgroup>
+    <thead>
       <tr>
-        <td style="padding:10px 8px;border-bottom:1px solid #eee;white-space:nowrap;vertical-align:top">${startStr}–${endStr}</td>
-        <td style="padding:10px 8px;border-bottom:1px solid #eee;font-weight:600;white-space:normal;word-break:break-word;line-height:1.35;vertical-align:top">
-          ${escapeHtml(s.title)}
-        </td>
-        <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:top">${escapeHtml(s.room.name || '')}</td>
-        <td style="padding:10px 8px;border-bottom:1px solid #eee;color:#64748b;vertical-align:top">${escapeHtml(s.track || '')}</td>
-      </tr>`;
-  }).join('');
+        <th align="left" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;vertical-align:top;line-height:1.45">Time</th>
+        <th align="left" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;vertical-align:top;line-height:1.45">Title</th>
+        <th align="left" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;vertical-align:top;line-height:1.45">Room</th>
+        <th align="left" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;vertical-align:top;line-height:1.45">Track</th>
+      </tr>
+    </thead>
+    <tbody>${rowsHtml}</tbody>
+  </table>` : '';
 
-  const logoImg = brandLogoPath
-    ? `<img src="cid:brandlogo@cid" alt="Logo" style="max-height:40px;vertical-align:middle;margin-right:8px"/>`
-    : '';
-
-  const hdr = `
-    <div style="padding:14px 0;border-bottom:1px solid #e5e7eb;margin-bottom:12px">
-      ${logoImg}
-      <div style="font:700 18px/1.2 system-ui,Segoe UI,Roboto;display:inline-block;vertical-align:middle">
-        ${escapeHtml(eventDoc.title || 'Event')}
-      </div>
-      <div style="font:600 12px/1.4 system-ui;color:#64748b">
-        ${new Date(eventDoc.startDate||Date.now()).toLocaleDateString()} → ${new Date(eventDoc.endDate||Date.now()).toLocaleDateString()}
-        ${eventDoc.city ? `• ${escapeHtml(eventDoc.city)}` : ''} ${eventDoc.country ? `• ${escapeHtml(eventDoc.country)}` : ''}
-      </div>
-    </div>`;
-
-  const sessionsHtml = normSessions.length ? `
-    <h3 style="font:800 14px system-ui;margin:12px 0 8px">Your selected sessions</h3>
-    <table style="border-collapse:collapse;width:100%;font:600 12px system-ui;table-layout:fixed">
-      <colgroup>
-        <col style="width:100px" />
-        <col style="width:auto" />
-        <col style="width:140px" />
-        <col style="width:120px" />
-      </colgroup>
-      <thead>
-        <tr>
-          <th align="left" style="padding:8px;border-bottom:2px solid #e5e7eb">Time</th>
-          <th align="left" style="padding:8px;border-bottom:2px solid #e5e7eb">Title</th>
-          <th align="left" style="padding:8px;border-bottom:2px solid #e5e7eb">Room</th>
-          <th align="left" style="padding:8px;border-bottom:2px solid #e5e7eb">Track</th>
-        </tr>
-      </thead>
-      <tbody>${rowsHtml}</tbody>
-    </table>` : '';
-
-  const html = `
-    ${hdr}
-    <p style="font:600 14px system-ui">Hello ${escapeHtml(who)},</p>
-    <p style="font:600 13px system-ui">
-      Thank you for registering to <b>${escapeHtml(eventDoc.title || 'the event')}</b>.
-      We attached your confirmation PDF below (with your sessions and QR).
-    </p>
-    <p style="font:600 13px system-ui;margin:12px 0">
-      Please verify your email to activate your account:
-      <br/><a href="${verifyLink}" style="font-weight:700;color:#2563eb">${verifyLink}</a>
-    </p>
-    ${sessionsHtml}
-    <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>GITS Team</p>
-  `;
+const html = `
+  ${hdr}
+  <p style="font:600 14px system-ui">Hello ${escapeHtml(who)},</p>
+  <p style="font:600 13px system-ui">
+    Thank you for registering to <b>${escapeHtml(eventDoc.title || 'the event')}</b>.
+    We attached your confirmation PDF below (with your sessions and QR).
+  </p>
+  <p style="font:600 13px system-ui;margin:12px 0">
+    Please verify your email to activate your account:
+    <br/><a href="${verifyLink}" style="font-weight:700;color:#2563eb">${verifyLink}</a>
+  </p>
+  ${sessionsHtml}
+  <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>GITS Team</p>
+`;
 
   const attachments = [{ filename: 'registration.pdf', content: pdf, contentType: 'application/pdf' }];
   if (brandLogoPath) {
@@ -1058,71 +1061,77 @@ exports.registerExhibitor = asyncHandler(async (req, res) => {
 
   // Taller, wrapped rows for long titles
   const rowsHtml = normSessions.map(s => {
-    const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
-    const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
-    const seatNote = s.seats && s.seats.capacity > 0
-      ? ` (${Math.max(0, s.seats.capacity - s.seats.taken)} left / ${s.seats.capacity})`
-      : '';
-    return `
-      <tr>
-        <td style="padding:10px 8px;border-bottom:1px solid #eee;white-space:nowrap;vertical-align:top">${startStr}–${endStr}</td>
-        <td style="padding:10px 8px;border-bottom:1px solid #eee;font-weight:600;white-space:normal;word-break:break-word;line-height:1.35;vertical-align:top">
-          ${escapeHtml(s.title)}${seatNote}
-        </td>
-        <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:top">${escapeHtml(s.room.name || '')}</td>
-        <td style="padding:10px 8px;border-bottom:1px solid #eee;color:#64748b;vertical-align:top">${escapeHtml(s.track || '')}</td>
-      </tr>`;
-  }).join('');
-
-  const logoImg = brandLogoPath
-    ? `<img src="cid:brandlogo@cid" alt="Logo" style="max-height:40px;vertical-align:middle;margin-right:8px"/>`
+  const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
+  const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
+  const seatNote = s.seats && s.seats.capacity > 0
+    ? ` (${Math.max(0, s.seats.capacity - s.seats.taken)} left / ${s.seats.capacity})`
     : '';
-  const hdr = `
-    <div style="padding:14px 0;border-bottom:1px solid #e5e7eb;margin-bottom:12px">
-      ${logoImg}
-      <div style="font:700 18px/1.2 system-ui,Segoe UI,Roboto;display:inline-block;vertical-align:middle">
-        ${escapeHtml(eventDoc.title || 'Event')}
-      </div>
-      <div style="font:600 12px/1.4 system-ui;color:#64748b">
-        ${new Date(eventDoc.startDate||Date.now()).toLocaleDateString()} → ${new Date(eventDoc.endDate||Date.now()).toLocaleDateString()}
-        ${eventDoc.city ? `• ${escapeHtml(eventDoc.city)}` : ''} ${eventDoc.country ? `• ${escapeHtml(eventDoc.country)}` : ''}
-      </div>
-    </div>`;
 
-  const sessionsHtml = normSessions.length ? `
-    <h3 style="font:800 14px system-ui;margin:12px 0 8px">Your selected sessions</h3>
-    <table style="border-collapse:collapse;width:100%;font:600 12px system-ui;table-layout:fixed">
-      <colgroup>
-        <col style="width:100px" />
-        <col style="width:auto" />
-        <col style="width:140px" />
-        <col style="width:120px" />
-      </colgroup>
-      <thead>
-        <tr>
-          <th align="left" style="padding:8px;border-bottom:2px solid #e5e7eb">Time</th>
-          <th align="left" style="padding:8px;border-bottom:2px solid #e5e7eb">Title</th>
-          <th align="left" style="padding:8px;border-bottom:2px solid #e5e7eb">Room</th>
-          <th align="left" style="padding:8px;border-bottom:2px solid #e5e7eb">Track</th>
-        </tr>
-      </thead>
-      <tbody>${rowsHtml}</tbody>
-    </table>` : '';
+  // prevent clipping; let row height grow with long text
+  const cellBase = "padding:12px 10px;border-bottom:1px solid #eee;vertical-align:top;line-height:1.45;white-space:normal;word-break:break-word;overflow-wrap:anywhere;";
 
-  const html = `
-    ${hdr}
-    <p style="font:600 14px system-ui">Hello ${escapeHtml(who)},</p>
-    <p style="font:600 13px system-ui">
-      Thank you for registering to <b>${escapeHtml(eventDoc.title || 'the event')}</b>.
-      We attached your confirmation PDF below (with your sessions and QR).
-    </p>
-    <p style="font:600 13px system-ui;margin:12px 0">
-      Please verify your email to activate your account:
-      <br/><a href="${verifyLink}" style="font-weight:700;color:#2563eb">${verifyLink}</a>
-    </p>
-    ${sessionsHtml}
-    <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>GITS Team</p>
-  `;
+  return `
+    <tr>
+      <td style="${cellBase}white-space:nowrap">${startStr}–${endStr}</td>
+      <td style="${cellBase}font-weight:600">
+        ${escapeHtml(s.title)}${seatNote}
+      </td>
+      <td style="${cellBase}">${escapeHtml(s.room.name || '')}</td>
+      <td style="${cellBase}color:#64748b">${escapeHtml(s.track || '')}</td>
+    </tr>`;
+}).join('');
+
+const logoImg = brandLogoPath
+  ? `<img src="cid:brandlogo@cid" alt="Logo" style="max-height:40px;vertical-align:middle;margin-right:8px"/>`
+  : '';
+
+const hdr = `
+  <div style="padding:14px 0;border-bottom:1px solid #e5e7eb;margin-bottom:12px">
+    ${logoImg}
+    <div style="font:700 18px/1.2 system-ui,Segoe UI,Roboto;display:inline-block;vertical-align:middle">
+      ${escapeHtml(eventDoc.title || 'Event')}
+    </div>
+    <div style="font:600 12px/1.4 system-ui;color:#64748b">
+      ${new Date(eventDoc.startDate||Date.now()).toLocaleDateString()} → ${new Date(eventDoc.endDate||Date.now()).toLocaleDateString()}
+      ${eventDoc.city ? `• ${escapeHtml(eventDoc.city)}` : ''} ${eventDoc.country ? `• ${escapeHtml(eventDoc.country)}` : ''}
+    </div>
+  </div>`;
+
+const sessionsHtml = normSessions.length ? `
+  <h3 style="font:800 14px system-ui;margin:12px 0 8px">Your selected sessions</h3>
+  <table style="border-collapse:collapse;width:100%;font:600 12px system-ui;table-layout:auto">
+    <colgroup>
+      <col style="width:110px" />
+      <col style="width:auto" />
+      <col style="width:160px" />
+      <col style="width:130px" />
+    </colgroup>
+    <thead>
+      <tr>
+        <th align="left" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;vertical-align:top;line-height:1.45">Time</th>
+        <th align="left" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;vertical-align:top;line-height:1.45">Title</th>
+        <th align="left" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;vertical-align:top;line-height:1.45">Room</th>
+        <th align="left" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;vertical-align:top;line-height:1.45">Track</th>
+      </tr>
+    </thead>
+    <tbody>${rowsHtml}</tbody>
+  </table>` : '';
+
+const html = `
+  ${hdr}
+  <p style="font:600 14px system-ui">Hello ${escapeHtml(who)},</p>
+  <p style="font:600 13px system-ui">
+    Thank you for registering to <b>${escapeHtml(eventDoc.title || 'the event')}</b>.
+    We attached your confirmation PDF below (with your sessions and QR).
+  </p>
+  <p style="font:600 13px system-ui;margin:12px 0">
+    Please verify your email to activate your account:
+    <br/><a href="${verifyLink}" style="font-weight:700;color:#2563eb">${verifyLink}</a>
+  </p>
+  ${sessionsHtml}
+  <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>GITS Team</p>
+`;
+
 
   const attachments = [{ filename: 'registration.pdf', content: pdf, contentType: 'application/pdf' }];
   if (brandLogoPath) {

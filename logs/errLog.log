@@ -7184,3 +7184,26 @@
 20251015	17:18:56	1ab5af2d-a25a-4aad-8c53-cf6fd108021b	MongooseError: Operation `events.findOne()` buffering timed out after 10000ms	POST	/events/event/mini	http://localhost:3000
 20251015	17:19:04	d408cf49-544e-420a-8b09-db642bedca91	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
 20251015	17:19:14	fb68ce1c-82e0-4d34-9fdf-4ac57e4cbb7f	MongooseError: Operation `events.find()` buffering timed out after 10000ms	GET	/events	http://localhost:3000
+20251015	18:19:31	6f3b6167-e595-4781-9a77-a3d7f1b145aa	Error: Message failed: 553 Sender is not allowed to relay emails	POST	/auth/register/attendee	http://localhost:3000
+20251015	18:23:43	599a9df1-4d91-4b77-8707-d933d0e81fd5	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-01.png	https://eventra.cloud
+20251015	18:23:43	d327e432-a836-464e-a952-324abcaf5491	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-02.png	https://eventra.cloud
+20251015	18:23:43	b81adf6b-7eb9-4638-98b2-0e29548d5a22	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-03.png	https://eventra.cloud
+20251015	18:23:43	7cc2d227-e919-4c3a-ac75-6ae1ac851b23	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-04.png	https://eventra.cloud
+20251015	18:23:43	26e0ceef-9b2d-48e7-a3d2-0d8ae782dc1f	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-05.png	https://eventra.cloud
+20251015	18:23:43	870d335a-499a-41a9-826e-35d9eb5013c0	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-06.png	https://eventra.cloud
+20251015	18:23:43	3b14bc97-3f64-4861-b7e4-9b0541610cfa	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-07.png	https://eventra.cloud
+20251015	18:29:30	1d419231-6b0b-4ea1-99ed-133dacf02b4b	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-01.png	https://eventra.cloud
+20251015	18:29:30	90011fc7-df89-4c76-997e-59677ca8f5a9	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-02.png	https://eventra.cloud
+20251015	18:29:30	d8cafbb7-9df5-4085-a48c-7031d1b3d42b	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-03.png	https://eventra.cloud
+20251015	18:29:30	21b0a4f2-b9f9-4162-bd52-71c581b604ba	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-04.png	https://eventra.cloud
+20251015	18:29:30	04d88607-cdeb-45a3-9507-0f40af01ddd3	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-05.png	https://eventra.cloud
+20251015	18:29:30	1f7aec4d-a7c5-4da7-af2e-95da6caebb3d	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-06.png	https://eventra.cloud
+20251015	18:29:30	80e80c96-89b6-4248-b30c-d87e96ac0fd9	Error: Not allowed by CORS	OPTIONS	/uploads/images/admin/Orgnizer-07.png	https://eventra.cloud
+20251015	19:57:17	f489fdfe-827f-4ec6-9093-033025d9896c	MongoServerSelectionError: getaddrinfo ENOTFOUND ac-17njloz-shard-00-00.n4zvuoo.mongodb.net	POST	/events/event/mini	http://localhost:3000
+20251015	19:57:31	68e66918-7bfb-4982-a488-5adf9da2cabf	MongoServerSelectionError: getaddrinfo ENOTFOUND ac-17njloz-shard-00-00.n4zvuoo.mongodb.net	POST	/events/event/mini	http://localhost:3000
+20251015	19:57:57	6884d905-1fa3-4acc-813a-87645618fc15	MongoServerSelectionError: getaddrinfo ENOTFOUND ac-17njloz-shard-00-00.n4zvuoo.mongodb.net	POST	/events/event/mini	http://localhost:3000
+20251015	20:06:16	e29886bb-b36c-4caa-a465-4735b9a0e632	Error: Not allowed by CORS	GET	/uploads/default/IPDAYXGITS.png	chrome-extension://knohfebhibeknbfioecpdmdkjkjdnjnl
+20251015	20:06:16	25cb7d23-2a68-4c87-b694-e2c0558e3523	Error: Not allowed by CORS	GET	/uploads/images/2025/10/WhatsApp-Image-2025-10-08-at-15.35.54_61b53d0c-a3f6219f-63df-401e-9a4d-56a359df3247-1759934490541.jpg	chrome-extension://knohfebhibeknbfioecpdmdkjkjdnjnl
+20251015	20:06:16	3f19f141-166c-4497-9009-f6b7176d2231	Error: Not allowed by CORS	GET	/uploads/default/LOGO%20GITS%20COLOR.png	chrome-extension://knohfebhibeknbfioecpdmdkjkjdnjnl
+20251015	20:06:56	856a71cd-e8e0-4f93-9a6d-46badb990e92	Error: Message failed: 553 Sender is not allowed to relay emails	POST	/auth/register/attendee	http://localhost:3000
+20251015	20:17:26	e32db58c-7681-462b-87e7-6eb83c884056	Error: Message failed: 553 Sender is not allowed to relay emails	POST	/auth/register/attendee	http://localhost:3000
