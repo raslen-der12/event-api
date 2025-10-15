@@ -859,7 +859,7 @@ const html = `
     <br/><a href="${verifyLink}" style="font-weight:700;color:#2563eb">${verifyLink}</a>
   </p>
   ${sessionsHtml}
-  <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>GITS Team</p>
+  <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>IPDAYS X GITS 2025</p>
 `;
 
   const attachments = [{ filename: 'registration.pdf', content: pdf, contentType: 'application/pdf' }];
@@ -1129,7 +1129,7 @@ const html = `
     <br/><a href="${verifyLink}" style="font-weight:700;color:#2563eb">${verifyLink}</a>
   </p>
   ${sessionsHtml}
-  <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>GITS Team</p>
+  <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>IPDAYS X GITS 2025</p>
 `;
 
 
