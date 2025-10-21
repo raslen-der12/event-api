@@ -33,7 +33,7 @@ const eventSchema = new mongoose.Schema(
     startDate: { type: Date, required: true },
     endDate:   { type: Date, required: true },
     registrationDeadline: { type: Date },
-
+    b2bCapacity : { type : Number , default : 30},
     /* ─── Location ─────────────────────────────────────────────────────────── */
     venueName:  { type: String, trim: true, minlength: 3, maxlength: 100 },
     address:    { type: String, trim: true, minlength: 5, maxlength: 200 },
@@ -52,11 +52,12 @@ const eventSchema = new mongoose.Schema(
     /* ─── Status flags ─────────────────────────────────────────────────────── */
     isPublished: { type: Boolean, default: false },
     isCancelled: { type: Boolean, default: false },
-
+    
     /* ─── Metadata ─────────────────────────────────────────────────────────── */
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now }
   },
+
   {
     versionKey: false,
     toJSON: { virtuals: true },

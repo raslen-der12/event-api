@@ -23,16 +23,17 @@ const mongoose       = require('mongoose');
 const bcrypt       = require('bcrypt'); // for compare if you store hashed tokens later
 const { sendMail }   = require('../config/mailer');
 const Agenda       = require('agenda');
-
 const MeetRequest    = require('../models/meetRequest');
 const SlotIndex      = require('../models/meetSoltIndex');
+const MeetingSlot = require('../models/MeetingSlot');
 const Event          = require('../models/event');
 const ical         = require('ical-generator'); 
 const attendee  = require('../models/attendee');
 const Exhibitor = require('../models/exhibitor');
 const Speaker   = require('../models/speaker');
 const BusinessProfile = require('../models/BusinessProfile');
-
+const Schedule = require('../models/eventModels/schedule');
+const QRCode = require('qrcode');
 /* ─────────────────── helper maps ──────────────────── */
 const ROLE_MODEL = { attendee:attendee, exhibitor:Exhibitor, speaker:Speaker };
 function getEmail(doc, role){
@@ -274,150 +275,264 @@ function floorTo30UTC(isoOrDate) {
   out.setUTCSeconds(0, 0);
   return out;
 }
-exports.requestMeeting = asyncHandler(async (req, res) => {
-  const { eventId, receiverId, receiverRole, dateTimeISO, subject, message = '' } = req.body;
 
-  if (!eventId || !receiverId || !receiverRole || !dateTimeISO || !subject)
-    return res.status(400).json({ message:'Missing required fields' });
-  if (!mongoose.isValidObjectId(eventId) || !mongoose.isValidObjectId(receiverId))
-    return res.status(400).json({ message:'Bad IDs' });
-  if (!['attendee','exhibitor','speaker'].includes(receiverRole))
-    return res.status(400).json({ message:'Unknown receiverRole' });
 
-  const senderId   = req.user._id;
-  const senderRole = req.user.role;
-  if (senderId.toString() === receiverId && senderRole === receiverRole)
-    return res.status(400).json({ message:'Cannot book meeting with yourself' });
+function getModelByRole(role) {
+  const k = String(role || '').toLowerCase();
+  if (k === 'attendee') return Attendee;
+  if (k === 'exhibitor') return Exhibitor;
+  if (k === 'speaker')  return Speaker;
+  return null;
+}
 
-  const event = await Event.findById(eventId).lean();
-  if (!event) return res.status(404).json({ message:'Event not found' });
+function safeGet(obj, path) {
+  return path.split('.').reduce((o, k) => (o && o[k] != null ? o[k] : undefined), obj);
+}
 
-  // Calendar bounds in UTC (by day)
-  const evS = new Date(event.startDate), evE = new Date(event.endDate);
-  const calStartUTC = Date.UTC(evS.getUTCFullYear(), evS.getUTCMonth(), evS.getUTCDate());
-  const calEndUTC   = Date.UTC(evE.getUTCFullYear(), evE.getUTCMonth(), evE.getUTCDate());
+function displayFromDoc(role, doc = {}) {
+  const r = String(role || '').toLowerCase();
+  if (r === 'attendee') {
+    const p = doc.personal || {};
+    const o = doc.organization || {};
+    return {
+      name: p.fullName || '',
+      email: p.email || '',
+      photo: p.profilePic || '',
+      org: o.orgName || '',
+    };
+  }
+  if (r === 'exhibitor') {
+    const i = doc.identity || {};
+    return {
+      name: i.exhibitorName || i.orgName || '',
+      email: i.email || '',
+      photo: i.logo || '',
+      org: i.orgName || '',
+    };
+  }
+  // speaker
+  const p = doc.personal || {};
+  const o = doc.organization || {};
+  return {
+    name: p.fullName || '',
+    email: p.email || '',
+    photo: p.profilePic || '',
+    org: o.orgName || '',
+  };
+}
 
-  // Normalize to 30-min grid (UTC)
-  const slotStart = floorTo30UTC(dateTimeISO);
-  const slotISO   = slotStart.toISOString();
-  const slotDayUTC = Date.UTC(slotStart.getUTCFullYear(), slotStart.getUTCMonth(), slotStart.getUTCDate());
-  if (slotDayUTC < calStartUTC || slotDayUTC > calEndUTC)
-    return res.status(400).json({ message:'Slot day outside event' });
-
-  // Daily window from event times
-  const { dayStartUTC, dayEndUTC } = dailyWindowFromEvent(
-    event.startDate, event.endDate,
-    slotStart.getUTCFullYear(), slotStart.getUTCMonth()+1, slotStart.getUTCDate()
-  );
-  if (slotStart.getTime() < dayStartUTC || slotStart.getTime() >= dayEndUTC)
-    return res.status(409).json({ message:'Requested time outside daily window' });
-
-  // Fetch actors & openness
-  const SenderModel   = ROLE_MODEL[senderRole];
-  const ReceiverModel = ROLE_MODEL[receiverRole];
-  const [senderDoc, receiverDoc] = await Promise.all([
-    SenderModel.findById(senderId).lean(),
-    ReceiverModel.findById(receiverId).lean()
-  ]);
-  if (!receiverDoc) return res.status(404).json({ message:'Receiver not found' });
-  if (!isOpenToMeetings(receiverDoc, receiverRole))
-    return res.status(409).json({ message:'Receiver is not open to meetings' });
-  if (!isOpenToMeetings(senderDoc, senderRole))
-    return res.status(409).json({ message:'You are not open to meetings (edit profile to enable)' });
-
-  // Receiver availableDays check (if any)
-  const availDays = receiverDoc.matchingIntent?.availableDays || [];
-  if (availDays.length) {
-    const ymd = slotISO.slice(0,10);
-    const ok = availDays.some(d => {
-      try { return new Date(d).toISOString().slice(0,10) === ymd; } catch { return false; }
+function fmtDate(iso, timeZone) {
+  try {
+    return new Date(iso).toLocaleDateString(undefined, {
+      year: 'numeric', month: 'long', day: 'numeric',
+      timeZone: timeZone || 'UTC'
     });
-    if (!ok) return res.status(409).json({ message:'Receiver unavailable that day' });
+  } catch { return '—'; }
+}
+function fmtTime(iso, timeZone) {
+  try {
+    return new Date(iso).toLocaleTimeString(undefined, {
+      hour: '2-digit', minute: '2-digit', hour12: false,
+      timeZone: timeZone || 'UTC'
+    });
+  } catch { return '—'; }
+}
+
+function renderEmail({ title, intro, rows = [], ctaHref, ctaLabel = 'Open Meetings' }) {
+  const rowHtml = rows.map(([k,v]) => `
+    <tr>
+      <td style="padding:6px 8px;color:#334155">${k}</td>
+      <td style="padding:6px 8px;color:#0f172a;font-weight:600">${v || '—'}</td>
+    </tr>`).join('');
+  return `
+  <div style="font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f6f7f9;padding:24px">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden">
+      <tr><td style="padding:18px 20px;background:#0ea5e9;color:#fff;font-size:18px;font-weight:700">${title}</td></tr>
+      <tr><td style="padding:16px 20px;color:#334155">${intro}</td></tr>
+      <tr><td style="padding:0 20px 12px">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
+          ${rowHtml}
+        </table>
+      </td></tr>
+      <tr><td style="padding:16px 20px 20px">
+        <a href="${ctaHref}" style="display:inline-block;background:#0ea5e9;color:#fff;text-decoration:none;padding:10px 14px;border-radius:8px;font-weight:700">${ctaLabel}</a>
+      </td></tr>
+    </table>
+    <div style="max-width:640px;margin:12px auto 0;color:#64748b;font-size:12px">This is an automated message from GITS.</div>
+  </div>`;
+}
+exports.requestMeeting = asyncHandler(async (req, res) => {
+  // Body expected from your UI:
+  // { eventId, receiverId, receiverRole, dateTimeISO, subject, message }
+  const senderId    = req.user?._id;
+  const senderRole  = req.user?.role;
+  const eventId     = req.body?.eventId;
+  const receiverId  = req.body?.receiverId;
+  const receiverRole= req.body?.receiverRole;
+  const slotISO     = req.body?.dateTimeISO;     // 30-min ISO (UTC recommended)
+  const subject     = String(req.body?.subject || '').trim();
+  const message     = String(req.body?.message || '').trim();
+
+  if (!mongoose.isValidObjectId(senderId))   return res.status(401).json({ message: 'Auth required' });
+  if (!mongoose.isValidObjectId(eventId))    return res.status(400).json({ message: 'Bad eventId' });
+  if (!mongoose.isValidObjectId(receiverId)) return res.status(400).json({ message: 'Bad receiverId' });
+  if (!['attendee','exhibitor','speaker'].includes(String(receiverRole||'').toLowerCase()))
+    return res.status(400).json({ message: 'Bad receiverRole' });
+  if (!slotISO || Number.isNaN(new Date(slotISO).getTime()))
+    return res.status(400).json({ message: 'Bad dateTimeISO' });
+  if (!subject) return res.status(400).json({ message: 'Subject required' });
+
+  // Load sender / receiver docs for email & validation
+  const SenderModel   = getModelByRole(senderRole);
+  const ReceiverModel = getModelByRole(receiverRole);
+
+  if (!SenderModel || !ReceiverModel) {
+    return res.status(400).json({ message: 'Unsupported roles' });
   }
 
-  // 🔒 Clash check across BOTH participants for PENDING/ACCEPTED/RESCHEDULE
-  const statuses = ['pending', 'accepted', 'reschedule-proposed'];
-  const conflict = await MeetRequest.findOne({
-    eventId,
-    status: { $in: statuses },
-    $and: [
-      { $or: [
-        { senderId: senderId }, { receiverId: senderId },
-        { senderId: receiverId }, { receiverId: receiverId }
-      ]},
-      { $or: [
-        { requestedAt:   slotStart },   // exact 30-min stamp
-        { proposedNewAt: slotStart }
-      ]}
-    ]
-  }).lean();
-  if (conflict) return res.status(409).json({ message:'Slot already held by another request/meeting' });
+  const [senderDoc, receiverDoc] = await Promise.all([
+    SenderModel.findById(senderId).lean(),
+    ReceiverModel.findById(receiverId).lean(),
+  ]);
+  if (!senderDoc)   return res.status(404).json({ message: 'Sender not found' });
+  if (!receiverDoc) return res.status(404).json({ message: 'Receiver not found' });
 
-  // (Still keep accepted locks check for safety)
-  const acceptedLock = await SlotIndex.findOne({
+  // Prevent duplicate active thread for same pair + event
+  const activeStatuses = ['pending', 'confirmed', 'rescheduled'];
+  const existing = await MeetRequest.findOne({
     eventId,
-    actorId: { $in: [ senderId, receiverId ] },
-    slotISO: slotISO
+    $or: [
+      { senderId,   receiverId },
+      { senderId: receiverId, receiverId: senderId } // either direction
+    ],
+    status: { $in: activeStatuses }
   }).lean();
-  if (acceptedLock) return res.status(409).json({ message:'Slot already booked' });
 
-  // Create request (pending)
-  const reqDoc = await MeetRequest.create({
+  if (existing) {
+    return res.status(409).json({ message: 'Active meeting already exists for these participants and event' });
+  }
+
+  // Read capacity
+  let capMax =
+    Number(process.env.MEETING_SLOT_CAP) && Number(process.env.MEETING_SLOT_CAP) > 0
+      ? Number(process.env.MEETING_SLOT_CAP)
+      : 40;
+  if (EventModel) {
+    try {
+      const ev = await EventModel.findById(eventId).select('b2bCapacity timezone title name').lean();
+      if (Number(ev?.b2bCapacity) > 0) capMax = Number(ev.b2bCapacity);
+    } catch {}
+  }
+
+  // Check / upsert slot counter (atomic-ish)
+  let slotDoc = await MeetingSlot.findOne({ eventId, slotISO }).lean();
+  if (!slotDoc) {
+    try {
+      slotDoc = await MeetingSlot.create({ eventId, slotISO, used: 0, cap: capMax });
+    } catch (e) {
+      // race: created by another request; re-read
+      slotDoc = await MeetingSlot.findOne({ eventId, slotISO }).lean();
+    }
+  }
+
+  // If full, block (UI now disables, but race-proof here)
+  const used = Number(slotDoc?.used || 0);
+  const limit = Number(slotDoc?.cap || capMax);
+  if (used >= limit) {
+    return res.status(409).json({ message: 'Slot is full, please choose another time' });
+  }
+
+  // Create meeting
+  const created = await MeetRequest.create({
     eventId,
-    senderId, senderRole,
-    receiverId, receiverRole,
-    subject, message,
-    requestedAt : slotStart,
-    status      : 'pending',
-    history     : [{ actorId: senderId, action:'sent', note: slotISO }]
+    senderId,
+    senderRole,
+    receiverId,
+    receiverRole,
+    subject,
+    message,
+    requestedAt: new Date(),
+    status: 'pending',
+    slotISO,           // store selected slot
+    proposedNewAt: null,
   });
 
-  // ───────── Emails (same as before) ─────────
-  const nameOf = (doc, role) => role==='exhibitor'
-      ? (doc?.identity?.exhibitorName || doc?.identity?.orgName || 'Exhibitor')
-      : (doc?.personal?.fullName || 'User');
-  const emailOf = (doc, role) => role==='exhibitor' ? doc?.identity?.email : doc?.personal?.email;
+  // Increment the slot usage
+  await MeetingSlot.updateOne(
+    { eventId, slotISO },
+    { $inc: { used: 1 }, $set: { cap: limit || capMax } },
+    { upsert: true }
+  );
 
-  const senderName   = nameOf(senderDoc, senderRole);
-  const receiverName = nameOf(receiverDoc, receiverRole);
-  const senderEmail  = emailOf(senderDoc, senderRole);
-  const receiverEmail= emailOf(receiverDoc, receiverRole);
+  // Email both parties
+  const FRONT = (process.env.FRONTEND_URL || '').replace(/\/+$/,'');
+  let eventObj = null;
+  if (EventModel) {
+    try { eventObj = await EventModel.findById(eventId).select('title name city country timezone').lean(); } catch {}
+  }
+  const evTitle = eventObj?.title || eventObj?.name || 'Event';
+  const evTZ    = eventObj?.timezone || 'UTC';
 
-  const whenPretty = new Intl.DateTimeFormat('en-US', {
-    dateStyle:'full', timeStyle:'short', hour12:false, timeZone:'UTC'
-  }).format(slotStart);
+  const senderDisp   = displayFromDoc(senderRole, senderDoc);
+  const receiverDisp = displayFromDoc(receiverRole, receiverDoc);
 
-  const appBase = process.env.FRONTEND_URL?.replace(/\/+$/,'') || 'https://app.example.com';
-  const meetingsLink = `${appBase}/meetings`;
+  const prettyDate = fmtDate(slotISO, evTZ);
+  const prettyTime = fmtTime(slotISO, evTZ);
 
-  await Promise.all([
-    sendMail(
-      receiverEmail,
-      'New meeting request',
-      `
-        <p><strong>${senderName}</strong> wants to meet you.</p>
-        <p><strong>When:</strong> ${whenPretty} (UTC)</p>
-        <p><strong>Subject:</strong> ${subject}</p>
-        ${message ? `<p><strong>Message:</strong> ${String(message).slice(0,1000)}</p>` : ''}
-        <p>Manage requests in the app: <a href="${meetingsLink}">${meetingsLink}</a></p>
-      `
-    ),
-    sendMail(
-      senderEmail,
-      'Your meeting request was sent',
-      `
-        <p>You requested a meeting with <strong>${receiverName}</strong>.</p>
-        <p><strong>When:</strong> ${whenPretty} (UTC)</p>
-        <p><strong>Subject:</strong> ${subject}</p>
-        ${message ? `<p><strong>Message:</strong> ${String(message).slice(0,1000)}</p>` : ''}
-        <p>Track it here: <a href="${meetingsLink}">${meetingsLink}</a></p>
-      `
-    )
-  ]);
+  const rowsCommon = [
+    ['Event', evTitle],
+    ['Date',  prettyDate],
+    ['Time',  prettyTime + (evTZ ? ` (${evTZ})` : '')],
+    ['Subject', subject],
+  ];
 
-  return res.status(201).json({ success:true, data:{ requestId: reqDoc._id, status:'pending' } });
+  // Sender mail
+  const htmlSender = renderEmail({
+    title: 'Your meeting request was sent',
+    intro: `Thanks ${senderDisp.name || ''}! We sent your request to <b>${receiverDisp.name || 'participant'}</b>. You’ll receive an email when they respond.`,
+    rows: [
+      ...rowsCommon,
+      ['To', receiverDisp.name || receiverDisp.email || '—'],
+    ],
+    ctaHref: `${FRONT}/meetings`,
+    ctaLabel: 'Open my meetings',
+  });
+
+  // Receiver mail
+  const htmlReceiver = renderEmail({
+    title: 'You have a new meeting request',
+    intro: `Hello ${receiverDisp.name || ''}, you received a meeting request from <b>${senderDisp.name || 'a participant'}</b>.`,
+    rows: [
+      ...rowsCommon,
+      ['From', senderDisp.name || senderDisp.email || '—'],
+      ['Message', message || '(no message)'],
+    ],
+    ctaHref: `${FRONT}/meetings`,
+    ctaLabel: 'Review request',
+  });
+
+  const mailErrors = [];
+  try {
+    if (senderDisp.email) await sendMail(senderDisp.email, 'GITS · Request sent', htmlSender);
+  } catch (e) { mailErrors.push('sender'); }
+  try {
+    if (receiverDisp.email) await sendMail(receiverDisp.email, 'GITS · New meeting request', htmlReceiver);
+  } catch (e) { mailErrors.push('receiver'); }
+
+  return res.status(201).json({
+    success: true,
+    message: mailErrors.length ? 'Meeting created; some emails failed to send' : 'Meeting created and emails sent',
+    data: {
+      id: created._id,
+      status: created.status,
+      slotISO: created.slotISO,
+      sender: { id: senderId, role: senderRole },
+      receiver: { id: receiverId, role: receiverRole },
+      slotCounter: { used: used + 1, cap: limit }, // post-increment view
+    },
+    emailFailed: mailErrors,
+  });
 });
-
 
 
 
@@ -599,45 +714,979 @@ exports.confirmReschedule = exports.acceptMeeting;  // same logic as acceptMeeti
 
 
 
+
+
+
+function getModelByRole(role) {
+  const k = String(role || "").toLowerCase();
+  if (k === "attendee") return attendee;
+  if (k === "exhibitor") return Exhibitor;
+  if (k === "speaker") return Speaker;
+  return null;
+}
+
+function pick(obj, pathArr) {
+  for (const p of pathArr) {
+    const v = p.split(".").reduce((o, k) => (o ? o[k] : undefined), obj);
+    if (v !== undefined && v !== null && v !== "") return v;
+  }
+  return undefined;
+}
+
+function displayFromDoc(role, doc) {
+  if (!doc) return { name: "—", email: "", photo: "" };
+
+  if (role === "attendee") {
+    return {
+      name : pick(doc, ["personal.fullName"]) || "—",
+      email: pick(doc, ["personal.email"]) || "",
+      photo: pick(doc, ["personal.profilePic"]) || "",
+    };
+  }
+  if (role === "exhibitor") {
+    return {
+      name : pick(doc, ["identity.exhibitorName","identity.orgName"]) || "—",
+      email: pick(doc, ["identity.email"]) || "",
+      photo: pick(doc, ["identity.logo","logo"]) || "",
+    };
+  }
+  if (role === "speaker") {
+    return {
+      name : pick(doc, ["personal.fullName"]) || "—",
+      email: pick(doc, ["personal.email"]) || "",
+      photo: pick(doc, ["personal.profilePic"]) || "",
+    };
+  }
+  return { name: "—", email: "", photo: "" };
+}
+
+function computeAllowedActions(meet, actorId) {
+  const me = String(actorId);
+  const isSender   = String(meet.senderId)   === me;
+  const isReceiver = String(meet.receiverId) === me;
+
+  if (!isSender && !isReceiver) return [];
+
+  const st = String(meet.status || "").toLowerCase();
+  const proposedBy = meet.proposedBy ? String(meet.proposedBy) : null;
+
+  if (st === "pending") {
+    // sender: cancel | reschedule, receiver: confirm | reject | reschedule
+    return isSender
+      ? ["cancel", "reschedule"]
+      : ["confirm", "reject", "reschedule"];
+  }
+  if (st === "rescheduled") {
+    // who DIDN'T propose can confirm/reject; proposer can cancel/reschedule again
+    if (proposedBy && proposedBy === me) return ["cancel", "reschedule"];
+    return ["confirm", "reject", "reschedule"];
+  }
+  if (st === "confirmed") {
+    // both sides can reschedule or cancel
+    return ["reschedule", "cancel"];
+  }
+  // rejected/cancelled => no actions
+  return [];
+}
+
+async function attachParticipants(rows) {
+  // Build role+id → doc map with 1 batch fetch per role
+  const aIds = [], eIds = [], sIds = [];
+  rows.forEach(r => {
+    const push = (role, id) => {
+      if (!mongoose.isValidObjectId(id)) return;
+      if (role === "attendee")  aIds.push(String(id));
+      if (role === "exhibitor") eIds.push(String(id));
+      if (role === "speaker")   sIds.push(String(id));
+    };
+    push(r.senderRole,   r.senderId);
+    push(r.receiverRole, r.receiverId);
+  });
+
+  const uniq = (xs) => Array.from(new Set(xs));
+  const [A, E, S] = await Promise.all([
+    aIds.length ? attendee.find({ _id: { $in: uniq(aIds) }}).lean() : [],
+    eIds.length ? Exhibitor.find({ _id: { $in: uniq(eIds) }}).lean() : [],
+    sIds.length ? Speaker.find({ _id: { $in: uniq(sIds) }}).lean() : [],
+  ]);
+
+  const map = { attendee: new Map(), exhibitor: new Map(), speaker: new Map() };
+  A.forEach(d => map.attendee.set(String(d._id), d));
+  E.forEach(d => map.exhibitor.set(String(d._id), d));
+  S.forEach(d => map.speaker.set(String(d._id), d));
+
+  return rows.map(r => {
+    const sDoc = map[r.senderRole]?.get(String(r.senderId));
+    const rDoc = map[r.receiverRole]?.get(String(r.receiverId));
+    const sDisp = displayFromDoc(r.senderRole, sDoc);
+    const rDisp = displayFromDoc(r.receiverRole, rDoc);
+
+    return {
+      ...r,
+      id: r._id,
+      senderName : sDisp.name,
+      senderEmail: sDisp.email,
+      senderPhoto: sDisp.photo,
+      receiverName : rDisp.name,
+      receiverEmail: rDisp.email,
+      receiverPhoto: rDisp.photo,
+    };
+  });
+}
+
+function scoreMatch(me, them) {
+  // "AI-like" scoring based on overlap & intent — bounded 0..100
+  // We try to read common places across your 3 roles.
+  const getSet = (v) => {
+    if (!v) return new Set();
+    if (Array.isArray(v)) return new Set(v.map(String));
+    return new Set(String(v).split(",").map(s => s.trim()).filter(Boolean));
+  };
+
+  // Extract "interests" / "objectives" / "industry" / "languages"
+  const meIntents   = getSet(me?.matchingIntent?.objectives || me?.commercial?.lookingFor || me?.talk?.topicCategory);
+  const themIntents = getSet(them?.matchingIntent?.objectives || them?.commercial?.lookingFor || them?.talk?.topicCategory);
+
+  const meLang   = getSet(me?.personal?.preferredLanguages || me?.commercial?.languages || me?.talk?.language);
+  const themLang = getSet(them?.personal?.preferredLanguages || them?.commercial?.languages || them?.talk?.language);
+
+  const meInd   = getSet(me?.businessProfile?.primaryIndustry || me?.business?.industry);
+  const themInd = getSet(them?.businessProfile?.primaryIndustry || them?.business?.industry);
+
+  const overlap = (A, B) => {
+    const a = Array.from(A); if (!a.length) return 0;
+    let c = 0; a.forEach(x => { if (B.has(String(x))) c++; });
+    return c / Math.max(1, new Set([...A, ...B]).size);
+  };
+
+  let score = 0;
+  score += overlap(meIntents, themIntents) * 50;  // intent heavy
+  score += overlap(meLang, themLang) * 20;        // communication
+  score += overlap(meInd, themInd) * 20;          // industry
+  // small country boost
+  if (me?.personal?.country && them?.personal?.country && me.personal.country === them.personal.country) score += 5;
+  // receiver open to meetings
+  if (them?.matchingIntent?.openToMeetings || them?.b2bIntent?.openMeetings || them?.commercial?.availableMeetings) score += 5;
+
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+
 exports.getMyMeetings = asyncHandler(async (req, res) => {
-  const { eventId, status } = req.query;
   const meId   = req.user._id;
   const meRole = req.user.role;
+  const { eventId, status } = req.query || {};
 
   const q = {
-    eventId,
     $or: [
-      { senderId:meId,   senderRole:meRole },
-      { receiverId:meId, receiverRole:meRole }
+      { senderId: meId,   senderRole: meRole },
+      { receiverId: meId, receiverRole: meRole }
     ]
   };
-  if (status) q.status = status;
+  if (eventId) q.eventId = eventId;
+  if (status)  q.status  = status;
 
-  const rows = await MeetRequest.find(q).sort({ requestedAt:1 }).lean();
-  res.json({ success:true, count:rows.length, data:rows });
+  const rows = await MeetRequest.find(q).sort({ requestedAt: 1 }).lean();
+
+  const enriched = await attachParticipants(rows);
+  const data = enriched.map(m => ({
+    ...m,
+    allowedActions: computeAllowedActions(m, meId),
+  }));
+
+  return res.json({ success: true, count: data.length, data, actorId: meId });
 });
 
-/* ─────────────────────── GET /meets/agenda/:actorId ────────────────
- *  Admin helper to view any participant’s agenda
- */
+/* ───────────────────────── listActorAgenda (admin) ───────────────────────── */
+// GET /meets/agenda/:actorId?eventId=&status=
 exports.listActorAgenda = asyncHandler(async (req, res) => {
   if (req.user.role !== 'admin')
     return res.status(403).json({ message:'Admin only' });
 
-  const { actorId } = req.params;
-  const { eventId, status } = req.query;
+  const { actorId } = req.params || {};
+  const { eventId, status } = req.query || {};
   if (!mongoose.isValidObjectId(actorId))
     return res.status(400).json({ message:'Bad actorId' });
 
   const q = {
-    eventId,
-    $or:[ { senderId:actorId }, { receiverId:actorId } ]
+    $or: [{ senderId: actorId }, { receiverId: actorId }]
   };
-  if (status) q.status = status;
+  if (eventId) q.eventId = eventId;
+  if (status)  q.status  = status;
 
-  const rows = await MeetRequest.find(q).sort({ requestedAt:1 }).lean();
-  res.json({ success:true, count:rows.length, data:rows });
+  const rows = await MeetRequest.find(q).sort({ requestedAt: 1 }).lean();
+  const data = await attachParticipants(rows);
+  return res.json({ success:true, count:data.length, data });
 });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Meeting blacklist (keeps a small record so we can ignore/weight those threads)
+// ──────────────────────────────────────────────────────────────────────────────
+const MeetingBlacklist = mongoose.models.MeetingBlacklist || mongoose.model(
+  'MeetingBlacklist',
+  new mongoose.Schema({
+    meetingId: { type: mongoose.Schema.Types.ObjectId, index: true, unique: true },
+    eventId:   { type: mongoose.Schema.Types.ObjectId, index: true },
+    actors:    [{ type: mongoose.Schema.Types.ObjectId }],
+    reason:    { type: String, default: '' },
+    createdAt: { type: Date, default: Date.now },
+  }, { collection: 'meeting_blacklist' })
+);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────────────────────────
+const asStr = (x) => String(x || '');
+
+
+
+function whoAmI(meet, meId) {
+  const s = asStr(meet.senderId)   === asStr(meId);
+  const r = asStr(meet.receiverId) === asStr(meId);
+  return { isSender: s, isReceiver: r };
+}
+
+function computeAllowedActions(meet, meId, isAdmin=false) {
+  if (isAdmin) return ['confirm','reject','cancel','reschedule','delete'];
+
+  const st = String(meet.status || '').toLowerCase();
+  const { isSender, isReceiver } = whoAmI(meet, meId);
+  const proposedBy = asStr(meet.proposedBy || '');
+
+  // New matrix aligned with your current UI/states
+  if (st === 'pending') {
+    if (isReceiver) return ['confirm','reject','reschedule'];
+    if (isSender)   return ['cancel','reschedule'];
+    return [];
+  }
+  if (st === 'rescheduled') {
+    if (proposedBy && asStr(proposedBy) === asStr(meId)) {
+      // I proposed -> I can cancel or reject the thread
+      return ['cancel','reject'];
+    }
+    // Other side -> can confirm or reject
+    return ['confirm','reject'];
+  }
+  if (st === 'confirmed') {
+    // Either side can reschedule or cancel
+    return ['reschedule','cancel'];
+  }
+  if (st === 'rejected') {
+    // Only receiver gets "delete" per your rules
+    return isReceiver ? ['delete'] : [];
+  }
+  if (st === 'cancelled' || st === 'canceled') {
+    // You showed delete for receiver in UI, but your note restricts to rejected only
+    return [];
+  }
+  return [];
+}
+
+async function lockActors(eventId, slotISO, a, b) {
+  // SlotIndex is per-actor at that slot (prevents double bookings per person)
+  const docs = [
+    { eventId, actorId: a, slotISO },
+    { eventId, actorId: b, slotISO }
+  ];
+  // insert if not exists
+  for (const d of docs) {
+    await SlotIndex.updateOne(
+      { eventId: d.eventId, actorId: d.actorId, slotISO: d.slotISO },
+      { $setOnInsert: d },
+      { upsert: true }
+    );
+  }
+}
+
+async function unlockActors(eventId, slotISO, a, b) {
+  if (!slotISO) return;
+  await SlotIndex.deleteMany({
+    eventId,
+    actorId: { $in: [a, b] },
+    slotISO
+  });
+}
+
+async function ensureCapDoc(eventId, slotISO) {
+  const ev = await Event.findById(eventId).select('b2bCapacity').lean();
+  const capDefault = Number(ev?.b2bCapacity) > 0 ? Number(ev.b2bCapacity) : 30;
+  const doc = await MeetingSlot.findOneAndUpdate(
+    { eventId, slotISO },
+    { $setOnInsert: { eventId, slotISO, used: 0, cap: capDefault } },
+    { new: true, upsert: true }
+  ).lean();
+  return doc;
+}
+
+async function decCapIfExists(eventId, slotISO) {
+  if (!slotISO) return;
+  const row = await MeetingSlot.findOne({ eventId, slotISO }).lean();
+  if (!row) return;
+  const nextUsed = Math.max(0, Number(row.used || 0) - 1);
+  await MeetingSlot.updateOne({ eventId, slotISO }, { $set: { used: nextUsed } });
+}
+
+function getMeta(doc, role) {
+  const r = (role || '').toLowerCase();
+  if (r === 'exhibitor') {
+    return {
+      name:  doc?.identity?.exhibitorName || doc?.identity?.orgName || 'Exhibitor',
+      email: doc?.identity?.email || '',
+    };
+  }
+  return {
+    name:  doc?.personal?.fullName || 'User',
+    email: doc?.personal?.email || '',
+  };
+}
+
+async function sendConfirmEmailsWithQR(meet, finalISO) {
+  // Load both actors
+  const [senderDoc, receiverDoc] = await Promise.all([
+    ROLE_MODEL[meet.senderRole].findById(meet.senderId).lean(),
+    ROLE_MODEL[meet.receiverRole].findById(meet.receiverId).lean(),
+  ]);
+  const s = getMeta(senderDoc, meet.senderRole);
+  const r = getMeta(receiverDoc, meet.receiverRole);
+
+  const appBase = (process.env.FRONTEND_URL || '').replace(/\/+$/,'');
+  const urlFor = (actorId) => `${appBase}/admin/marking?meetId=${meet._id}&actorId=${actorId}`;
+
+  // QR PNG buffers (embedded inline via CID)
+  const [qrS, qrR] = await Promise.all([
+    QRCode.toBuffer(urlFor(meet.senderId), { type:'png', errorCorrectionLevel:'M', scale: 8, margin: 1 }),
+    QRCode.toBuffer(urlFor(meet.receiverId), { type:'png', errorCorrectionLevel:'M', scale: 8, margin: 1 })
+  ]);
+
+  const whenLocal = new Date(finalISO).toLocaleString(undefined, {
+    dateStyle:'full', timeStyle:'short'
+  });
+
+  const htmlFor = (who, otherName, cid) => `
+    <div style="font-family:Inter,Segoe UI,Arial,sans-serif;max-width:640px;margin:0 auto;color:#0f172a">
+      <div style="padding:16px 0">
+        <h2 style="margin:0 0 8px">Your meeting is confirmed ✅</h2>
+        <p style="margin:0;color:#334155">You’re meeting with <strong>${otherName}</strong>.</p>
+        <p style="margin:12px 0 0;color:#334155"><strong>When:</strong> ${whenLocal}</p>
+        <p style="margin:2px 0 16px;color:#334155"><strong>Subject:</strong> ${meet.subject || '—'}</p>
+        <div style="border:1px solid #e2e8f0;border-radius:12px;padding:16px;display:flex;gap:16px;align-items:center">
+          <img src="cid:${cid}" alt="Check-in QR" width="164" height="164" style="display:block;border-radius:8px;border:1px solid #e5e7eb"/>
+          <div style="color:#475569">
+            <p style="margin:0 0 8px"><strong>Show this QR at the B2B desk</strong> to check in.</p>
+            <ul style="margin:0 0 0 16px;padding:0">
+              <li>Keep this email handy.</li>
+              <li>Each attendee has a unique QR.</li>
+              <li>Arrive 5 minutes before your slot.</li>
+            </ul>
+          </div>
+        </div>
+        <p style="margin:16px 0 0;color:#64748b;font-size:12px">This QR is only for check-in scanning inside the venue.</p>
+      </div>
+    </div>
+  `;
+
+  await Promise.all([
+    sendMail(
+      s.email,
+      'Meeting confirmed',
+      htmlFor('sender', r.name, 'qr-s'),
+      { attachments: [{ filename: 'checkin.png', content: qrS, contentType:'image/png', cid: 'qr-s' }] }
+    ),
+    sendMail(
+      r.email,
+      'Meeting confirmed',
+      htmlFor('receiver', s.name, 'qr-r'),
+      { attachments: [{ filename: 'checkin.png', content: qrR, contentType:'image/png', cid: 'qr-r' }] }
+    )
+  ]);
+}
+
+async function existsBusyAt(eventId, slotISO, actorIds=[]) {
+  if (!actorIds?.length) return false;
+  // SlotIndex lock means confirmed/held
+  const lock = await SlotIndex.findOne({ eventId, actorId: { $in: actorIds }, slotISO }).lean();
+  if (lock) return true;
+
+  // Also avoid clashes with pending/confirmed/rescheduled threads on that exact slot
+  const req = await MeetRequest.findOne({
+    eventId,
+    status: { $in: ['pending','rescheduled','confirmed'] },
+    $and: [
+      { $or: [{ senderId: { $in: actorIds } }, { receiverId: { $in: actorIds } }] },
+      { $or: [{ requestedAt: new Date(slotISO) }, { proposedNewAt: new Date(slotISO) }, { slotISO: new Date(slotISO) }] }
+    ]
+  }).lean();
+  return !!req;
+}
+
+// Enrich participants for UI (keep whatever you already had)
+async function attachParticipants(rows) {
+  // you already have this in your codebase; keeping a stub to avoid breaking:
+  return rows;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MAIN: makeMeetingAction
+// ──────────────────────────────────────────────────────────────────────────────
+exports.makeMeetingAction = asyncHandler(async (req, res) => { 
+  // normalize to ISO (minute precision)
+const slotKeyT = (dt) => {
+  const d = new Date(dt);
+  d.setSeconds(0, 0);
+  return d.toISOString();
+};
+  const { meetingId, action, actorId, proposedNewAt } = req.body || {};
+  if (!mongoose.isValidObjectId(meetingId))
+    return res.status(400).json({ message: "Bad meetingId" });
+
+  // security: only the logged user can act for themselves (unless admin)
+  const meId = String(req.user._id);
+  const meRole = String(req.user.role || '').toLowerCase();
+  const meIsAdmin = meRole === "admin";
+  if (!meIsAdmin && actorId && String(actorId) !== meId)
+    return res.status(403).json({ message: "Forbidden" });
+
+  const meet = await MeetRequest.findById(meetingId).lean();
+  if (!meet) return res.status(404).json({ message: "Meeting not found" });
+
+  const { isSender, isReceiver } = whoAmI(meet, meId);
+  if (!isSender && !isReceiver && !meIsAdmin)
+    return res.status(403).json({ message: "Forbidden" });
+
+  const st = String(meet.status || "").toLowerCase();
+  const act = String(action || '').toLowerCase();
+
+  // Permission matrix based on current state & side
+  const allowed = computeAllowedActions(meet, meId, meIsAdmin);
+  if (!allowed.includes(act)) {
+    return res.status(400).json({ message: "Action not allowed for this user/state" });
+  }
+
+  const now = new Date();
+  const $set   = { updatedAt: now };
+  const $unset = {};
+  let finalISO = null;
+  let touchedSlotForUnlock = null;
+
+  // ────────────────── confirm (accept) ──────────────────
+  if (act === 'confirm') {
+    // Decide final slot:
+    finalISO = st === 'rescheduled' && meet.proposedNewAt
+      ? slotKeyT(meet.proposedNewAt)
+      : slotKeyT(meet.requestedAt || meet.slotISO);
+
+    // reject if no slot available
+    if (!finalISO) return res.status(400).json({ message: 'No slot to confirm' });
+
+    // clash check for both actors
+    const actorIds = [ meet.senderId, meet.receiverId ].map(String);
+    const busy = await existsBusyAt(meet.eventId, finalISO, actorIds);
+    if (busy) return res.status(409).json({ message: 'One of the participants is busy at that time' });
+
+    // ensure cap doc exists (no increment here; you already incremented on request creation)
+    await ensureCapDoc(meet.eventId, finalISO);
+
+    // set fields
+    $set.status      = 'confirmed';
+    $set.acceptedAt  = now;
+    $set.slotISO     = new Date(finalISO);
+    $unset.proposedNewAt = 1;
+    $unset.proposedBy    = 1;
+
+    // lock actors for that slot
+    await lockActors(meet.eventId, finalISO, meet.senderId, meet.receiverId);
+  }
+
+  // ────────────────── reject ──────────────────
+  if (act === 'reject') {
+    $set.status     = 'rejected';
+    $set.rejectedAt = now;
+    $set.rejectedBy = req.user._id;
+
+    // no SlotIndex unlock here (only confirmed meetings are locked)
+    // if you incremented MeetingSlot used on request, you may want to decCapIfExists here:
+    // await decCapIfExists(meet.eventId, slotKeyT(meet.requestedAt));
+  }
+
+  // ────────────────── cancel ──────────────────
+  if (act === 'cancel') {
+    $set.status      = 'cancelled';
+    $set.cancelledAt = now;
+    $set.cancelledBy = req.user._id;
+
+    // remove any actor locks tied to this meeting (current or proposed)
+    const slotA = meet.slotISO ? slotKeyT(meet.slotISO) : null;
+    const slotB = meet.requestedAt ? slotKeyT(meet.requestedAt) : null;
+    const slotC = meet.proposedNewAt ? slotKeyT(meet.proposedNewAt) : null;
+    const uniq = Array.from(new Set([slotA, slotB, slotC].filter(Boolean)));
+    for (const iso of uniq) {
+      await unlockActors(meet.eventId, iso, meet.senderId, meet.receiverId);
+      // if you counted capacity at request time, also release it:
+      // await decCapIfExists(meet.eventId, iso);
+    }
+
+    // blacklist the meeting id (avoid resurfacing this exact thread)
+    await MeetingBlacklist.updateOne(
+      { meetingId: meet._id },
+      { $setOnInsert: {
+          meetingId: meet._id,
+          eventId: meet.eventId,
+          actors: [ meet.senderId, meet.receiverId ],
+          reason: 'cancelled',
+          createdAt: now
+        }
+      },
+      { upsert: true }
+    );
+  }
+
+  // ────────────────── reschedule (propose new time) ──────────────────
+  if (act === 'reschedule') {
+    const t = new Date(proposedNewAt);
+    if (!proposedNewAt || isNaN(t.getTime()))
+      return res.status(400).json({ message: "proposedNewAt must be a valid ISO datetime" });
+
+    const iso = slotKeyT(t);
+    // clash check for both actors at proposed time
+    const actorIds = [ meet.senderId, meet.receiverId ].map(String);
+    const busy = await existsBusyAt(meet.eventId, iso, actorIds);
+    if (busy) return res.status(409).json({ message:'One of the participants is busy at the proposed time' });
+
+    // ensure cap doc exists (no increment on proposal)
+    await ensureCapDoc(meet.eventId, iso);
+
+    $set.status        = 'rescheduled';
+    $set.proposedNewAt = new Date(iso);
+    $set.proposedBy    = req.user._id;
+  }
+
+  // ────────────────── delete (receiver only when rejected) ──────────────────
+  if (act === 'delete') {
+    if (!(st === 'rejected' && isReceiver) && !meIsAdmin) {
+      return res.status(400).json({ message: 'Delete allowed only to receiver when status is rejected' });
+    }
+    // best-effort unlock (usually nothing for rejected)
+    const slotA = meet.slotISO ? slotKeyT(meet.slotISO) : null;
+    const slotB = meet.requestedAt ? slotKeyT(meet.requestedAt) : null;
+    const slotC = meet.proposedNewAt ? slotKeyT(meet.proposedNewAt) : null;
+    const uniq = Array.from(new Set([slotA, slotB, slotC].filter(Boolean)));
+    for (const iso of uniq) {
+      await unlockActors(meet.eventId, iso, meet.senderId, meet.receiverId);
+      // capacity release if you counted on request:
+      // await decCapIfExists(meet.eventId, iso);
+    }
+
+    await MeetingBlacklist.updateOne(
+      { meetingId: meet._id },
+      { $setOnInsert: {
+          meetingId: meet._id,
+          eventId: meet.eventId,
+          actors: [ meet.senderId, meet.receiverId ],
+          reason: 'deleted',
+          createdAt: now
+        }
+      },
+      { upsert: true }
+    );
+
+    await MeetRequest.deleteOne({ _id: meet._id });
+    return res.json({ success: true, message: "Deleted" });
+  }
+
+  // Apply update
+  await MeetRequest.updateOne(
+    { _id: meetingId },
+    { $set, ...(Object.keys($unset).length ? { $unset } : {}) }
+  );
+
+  const updated = await MeetRequest.findById(meetingId).lean();
+
+  // On acceptance, email + QR to both
+  if (act === 'confirm') {
+    try {
+      await sendConfirmEmailsWithQR(updated, slotKeyT(updated.slotISO));
+    } catch (e) {
+      // don't fail the request because of email
+      console.error('QR email error:', e);
+    }
+  }
+
+  // Attach display + allowedActions for convenience
+  const [enriched] = await attachParticipants([updated]);
+  const payload = {
+    ...enriched,
+    allowedActions: computeAllowedActions(updated, meId, meIsAdmin),
+  };
+
+  return res.json({ success: true, message: "OK", data: payload });
+});
+
+
+// GET /meets/suggested?actorId=...&eventId=...&limit=20&pool=50&search=...&role=attendee|exhibitor|speaker&lang=en&country=TN&open=1
+exports.getSuggestedList = asyncHandler(async (req, res) => {
+  const meId = req.user?._id || req.query.actorId;
+  if (!mongoose.isValidObjectId(meId)) {
+    return res.status(400).json({ message: 'Bad actorId' });
+  }
+
+  // ---- helpers ---------------------------------------------------
+  const toStr = (v) => (v == null ? '' : String(v));
+  const norm = (s) => toStr(s).trim().toLowerCase();
+  const getp = (obj, path) => path.split('.').reduce((o, k) => (o && o[k] != null ? o[k] : undefined), obj);
+  const arrify = (x) => (Array.isArray(x) ? x.filter(Boolean) : x ? [x] : []);
+  const uniq = (a) => Array.from(new Set((a || []).filter(Boolean)));
+  const words = (x) =>
+    uniq(
+      arrify(x)
+        .flatMap((s) => String(s).split(/[,;/|]+|\s+/g))
+        .map(norm)
+        .filter((t) => t && t.length >= 2 && t !== 'and' && t !== 'or')
+    );
+  const langAliases = {
+    en: 'english', eng: 'english', english: 'english',
+    fr: 'french', french: 'french',
+    ar: 'arabic', arabic: 'arabic',
+    es: 'spanish', spanish: 'spanish',
+    de: 'german', german: 'german',
+    it: 'italian', italian: 'italian',
+  };
+  const langTokens = (x) => uniq(words(x).map((t) => langAliases[t] || t));
+
+  const DEFAULT_PHOTO_RX = /\/default\/photodef\.png$/i;
+
+  const getModelByRole = (role) => {
+    const r = String(role || '').toLowerCase();
+    if (r === 'attendee') return attendee;
+    if (r === 'exhibitor') return Exhibitor;
+    if (r === 'speaker') return Speaker;
+    return null;
+  };
+
+  const displayFromDoc = (role, doc) => {
+    const r = String(role || '').toLowerCase();
+    if (r === 'attendee') {
+      return {
+        name: getp(doc, 'personal.fullName') || '',
+        photo: getp(doc, 'personal.profilePic') || '',
+      };
+    }
+    if (r === 'exhibitor') {
+      return {
+        name: getp(doc, 'identity.exhibitorName') || getp(doc, 'identity.orgName') || getp(doc, 'identity.contactName') || '',
+        photo: getp(doc, 'identity.logo') || '',
+      };
+    }
+    // speaker
+    return {
+      name: getp(doc, 'personal.fullName') || '',
+      photo: getp(doc, 'personal.profilePic') || '',
+    };
+  };
+
+  // vector extraction per role (keep light & robust)
+  const VECTORS = {
+    attendee: {
+      langs: ['personal.preferredLanguages'],
+      industry: ['businessProfile.primaryIndustry'],
+      offering: ['businessProfile.offering'],
+      looking: ['matchingIntent.objectives'],
+      regions: [],
+      openFlag: ['matchingIntent.openToMeetings'],
+      event: ['id_event'],
+    },
+    exhibitor: {
+      langs: ['identity.preferredLanguages'],
+      industry: ['business.industry'],
+      offering: ['commercial.offering'],
+      looking: ['commercial.lookingFor'],
+      regions: ['commercial.regionInterest'],
+      openFlag: ['commercial.availableMeetings'],
+      event: ['id_event'],
+    },
+    speaker: {
+      langs: ['personal.preferredLanguages', 'talk.language'],
+      industry: ['b2bIntent.businessSector'],
+      offering: ['b2bIntent.offering'],
+      looking: ['b2bIntent.lookingFor'],
+      regions: ['b2bIntent.regionsInterest'],
+      openFlag: ['b2bIntent.openMeetings'],
+      event: ['id_event'],
+    },
+  };
+
+  const pickFirst = (doc, paths) => {
+    for (const p of paths || []) {
+      const v = getp(doc, p);
+      if (v != null && v !== '') return v;
+    }
+    return undefined;
+  };
+
+  const extractVectors = (role, doc) => {
+    const v = VECTORS[role];
+    const eventId = pickFirst(doc, v.event) || null;
+    const looking = words(v.looking.flatMap((p) => arrify(getp(doc, p))));
+    const offering = words(v.offering.flatMap((p) => arrify(getp(doc, p))));
+    const regions = words(v.regions.flatMap((p) => arrify(getp(doc, p)))).map(norm);
+    const industries = words(v.industry.flatMap((p) => arrify(getp(doc, p)))).map(norm);
+    const languages = uniq(langTokens(v.langs.flatMap((p) => arrify(getp(doc, p)))));
+    const open = v.openFlag.length ? v.openFlag.some((p) => !!getp(doc, p)) : false;
+    return { eventId, looking, offering, regions, industries, languages, open };
+  };
+
+  const scorePair = (meV, otherV) => {
+    let s = 0;
+    // intent complementarity
+    const lxo = meV.looking.filter((t) => otherV.offering.includes(t)).length; s += lxo * 5;
+    const oxl = meV.offering.filter((t) => otherV.looking.includes(t)).length; s += oxl * 4;
+    // context overlaps
+    const reg = meV.regions.filter((t) => otherV.regions.includes(t)).length; s += reg * 2;
+    const ind = meV.industries.filter((t) => otherV.industries.includes(t)).length; s += ind * 3;
+    const lng = meV.languages.filter((t) => otherV.languages.includes(t)).length; s += lng * 1.5;
+    return s; // raw semantic score
+  };
+
+  // ---- locate "me" & event context --------------------------------
+  const qEvent = toStr(req.query.eventId || '');
+  let meDoc = null, meRole = null, eventId = qEvent || null;
+
+  for (const role of ['attendee', 'exhibitor', 'speaker']) {
+    const M = getModelByRole(role);
+    const d = await M.findById(meId).lean().catch(() => null);
+    if (d) {
+      meDoc = d; meRole = role;
+      if (!eventId) {
+        const ev = extractVectors(role, d).eventId;
+        if (ev) eventId = String(ev);
+      }
+      break;
+    }
+  }
+  if (!meDoc) return res.status(404).json({ message: 'Actor not found' });
+  if (!eventId) return res.status(400).json({ message: 'eventId is required (could not infer)' });
+
+  const meV = extractVectors(meRole, meDoc);
+  if (String(meV.eventId) !== String(eventId)) {
+    // enforce matching within the specified event
+    meV.eventId = eventId;
+  }
+
+  // ---- build exclusions: existing threads + blocks -----------------
+  const existing = await MeetRequest.find({
+    eventId,
+    $or: [{ senderId: meId }, { receiverId: meId }],
+  }).select('senderId receiverId').lean();
+
+  const excludedIds = new Set([String(meId)]);
+  existing.forEach((m) => {
+    excludedIds.add(String(m.senderId));
+    excludedIds.add(String(m.receiverId));
+  });
+
+  // optional: respect blocks if model exists
+  let BlockModel = null;
+  try { BlockModel = Block; } catch { BlockModel = null; }
+  if (BlockModel?.find) {
+    const bl = await BlockModel.find({ $or: [{ blockerId: meId }, { blockedId: meId }] })
+      .select('blockerId blockedId').lean();
+    for (const b of bl) {
+      if (String(b.blockerId) === String(meId)) excludedIds.add(String(b.blockedId));
+      if (String(b.blockedId) === String(meId)) excludedIds.add(String(b.blockerId));
+    }
+  }
+
+  // ---- request parameters / filters --------------------------------
+  const limit = Math.max(5, Math.min(50, Number(req.query.limit) || 20));
+  const poolCap = Math.max(limit, Math.min(200, Number(req.query.pool) || 50));
+
+  const roleFilter = (req.query.role || '').toString().toLowerCase(); // optional single role
+  const search = toStr(req.query.search || '');
+  const rx = search ? new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') : null;
+
+  const countryF = toStr(req.query.country || '').toUpperCase(); // optional ISO key
+  const langsF = uniq(arrify(req.query.lang).map((x) => norm(x))); // ?lang=en&lang=fr or lang=en,fr
+
+  const openOnly = ['1', 'true', 'yes', 'y'].includes(norm(req.query.open || '1')); // default: true
+
+  // ---- pull per-role candidates ------------------------------------
+  const roleOrder = roleFilter ? [roleFilter] : ['attendee', 'exhibitor', 'speaker'];
+
+  const baseFindFor = (role) => {
+    // verified + adminVerified (for non-speakers) + event + open flag + search/country/lang filters
+    const Model = getModelByRole(role);
+    if (!Model) return { Model: null, q: null, proj: null };
+
+    const v = VECTORS[role];
+
+    const orAdmin = role === 'speaker'
+      ? [{}] // speakers may not always carry adminVerified in your DB
+      : [{ adminVerified: 'yes' }, { adminVerified: true }];
+
+    const q = {
+      id_event: eventId,
+      _id: { $nin: Array.from(excludedIds) },
+      $and: [{ $or: orAdmin }],
+    };
+
+    if (openOnly && v.openFlag.length) {
+      q.$and.push({ $or: v.openFlag.map((p) => ({ [p]: true })) });
+    }
+
+    if (rx) {
+      const nameOr = (
+        role === 'attendee' ? ['personal.fullName'] :
+        role === 'exhibitor' ? ['identity.exhibitorName', 'identity.orgName', 'identity.contactName'] :
+        ['personal.fullName']
+      ).map((p) => ({ [p]: rx }));
+      q.$and.push({ $or: nameOr });
+    }
+
+    if (countryF) {
+      const cPath =
+        role === 'exhibitor' ? 'identity.country' : 'personal.country';
+      q.$and.push({ [cPath]: countryF });
+    }
+
+    if (langsF.length) {
+      const lPaths = role === 'exhibitor'
+        ? ['identity.preferredLanguages']
+        : ['personal.preferredLanguages', ...(role === 'speaker' ? ['talk.language'] : [])];
+      q.$and.push({
+        $or: lPaths.map((p) => ({ [p]: { $in: langsF } })),
+      });
+    }
+
+    // projection: fields used by display & scoring
+    const proj = {
+      createdAt: 1, updatedAt: 1, verified: 1, adminVerified: 1,
+      // attendee
+      'personal.fullName': 1, 'personal.profilePic': 1, 'personal.email': 1, 'personal.country': 1, 'personal.preferredLanguages': 1,
+      'businessProfile.primaryIndustry': 1, 'businessProfile.offering': 1,
+      'matchingIntent.objectives': 1, 'matchingIntent.openToMeetings': 1,
+      // exhibitor
+      'identity.exhibitorName': 1, 'identity.orgName': 1, 'identity.contactName': 1, 'identity.email': 1,
+      'identity.country': 1, 'identity.logo': 1, 'identity.preferredLanguages': 1,
+      'business.industry': 1, 'commercial.offering': 1, 'commercial.lookingFor': 1, 'commercial.regionInterest': 1, 'commercial.availableMeetings': 1,
+      // speaker
+      'talk.language': 1, 'b2bIntent.businessSector': 1, 'b2bIntent.offering': 1, 'b2bIntent.lookingFor': 1, 'b2bIntent.regionsInterest': 1, 'b2bIntent.openMeetings': 1,
+      id_event: 1,
+    };
+
+    return { Model, q, proj };
+  };
+
+  const candidates = [];
+  for (const r of roleOrder) {
+    const { Model, q, proj } = baseFindFor(r);
+    if (!Model) continue;
+    const rows = await Model.find(q, proj).limit(400).lean(); // hard cap per role
+    for (const d of rows) candidates.push({ role: r, doc: d });
+  }
+
+  if (!candidates.length) {
+    return res.json({ success: true, count: 0, data: [], eventId });
+  }
+
+  // ---- scoring -----------------------------------------------------
+  const now = Date.now();
+  const normScore = (x, min, max) => {
+    if (!Number.isFinite(x)) return 0;
+    if (max <= min) return 1;
+    return (x - min) / (max - min);
+  };
+
+  const scored = candidates.map(({ role, doc }) => {
+    const disp = displayFromDoc(role, doc);
+    const vec = extractVectors(role, doc);
+
+    const semantic = scorePair(meV, vec); // 0..~
+
+    // trust / completeness / recency
+    const hasPhoto = !!disp.photo && !DEFAULT_PHOTO_RX.test(String(disp.photo || ''));
+    const verifiedBoost = (doc.verified ? 1 : 0) + ((doc.adminVerified === 'yes' || doc.adminVerified === true) ? 0.5 : 0);
+    const completeness =
+      // 0..1 roughly: count filled buckets
+      [
+        disp.name,
+        role === 'exhibitor' ? getp(doc, 'commercial.offering') : getp(doc, 'businessProfile.offering') || getp(doc, 'b2bIntent.offering'),
+        getp(doc, role === 'exhibitor' ? 'business.industry' : 'businessProfile.primaryIndustry') || getp(doc, 'b2bIntent.businessSector'),
+        (vec.languages || []).length ? 'x' : '',
+        (vec.looking || []).length ? 'x' : '',
+        (vec.offering || []).length ? 'x' : '',
+      ].filter(Boolean).length / 6;
+
+    const updated = new Date(doc.updatedAt || doc.createdAt || now).getTime();
+    const recency = 0.5 + 0.5 * Math.exp(-(now - updated) / (1000 * 60 * 60 * 24 * 60)); // ~60d half-life
+
+    // combine:
+    let score =
+      semantic * 1.0 +
+      verifiedBoost * 2.0 +
+      completeness * 3.0 +
+      recency * 1.0;
+
+    // Photo weighting: penalize default; slight bonus for real photo
+    score *= hasPhoto ? 1.05 : 0.72;
+
+    // tiny jitter so equal scores shuffle
+    score *= (0.97 + Math.random() * 0.06); // 0.97..1.03
+
+    // tag guess
+    const rawTag =
+      toStr(getp(doc, 'commercial.lookingFor')) ||
+      toStr(getp(doc, 'matchingIntent.objectives')) ||
+      toStr(getp(doc, 'talk.topicCategory')) ||
+      '';
+    const tag = (rawTag.match(/\bB2[BCG]\b/i) || [null])[0] || '';
+
+    return {
+      id: String(doc._id),
+      role,
+      name: disp.name || '',
+      photo: disp.photo || '',
+      tag,
+      matchPct: Math.round(Math.max(0, Math.min(100, score))), // clamp to 0..100
+      _score: Math.max(1e-6, score),
+    };
+  });
+
+  // ---- build pool & weighted random  -------------------------------
+  // take the top poolCap by score, then do weighted sampling without replacement (Efraimidis-Spirakis)
+  scored.sort((a, b) => b._score - a._score);
+  const pool = scored.slice(0, Math.min(poolCap, scored.length));
+
+  // Compute keys k = u^(1/w) equivalently key = -ln(u)/w and take smallest keys
+  const keyed = pool.map((p) => {
+    const u = Math.random();
+    const key = -Math.log(u) / p._score;
+    return { key, p };
+  }).sort((a, b) => a.key - b.key);
+
+  const out = keyed.slice(0, limit).map(({ p }) => ({
+    id: p.id,
+    role: p.role,
+    name: p.name,
+    photo: p.photo,
+    tag: p.tag,
+    matchPct: p.matchPct,
+  }));
+
+  // small final shuffle so order changes across refreshes
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+
+  return res.json({
+    success: true,
+    eventId,
+    me: { id: String(meId), role: meRole },
+    meta: { poolSize: pool.length, totalCandidates: scored.length },
+    count: out.length,
+    data: out,
+  });
+});
+
 
 /* ───────────────────── GET /events/:eventId/available-slots ───────
  *  Checks 09:00-17:00 (inclusive) in 30-min steps for a given date.
@@ -647,79 +1696,186 @@ function pad2(n){ return String(n).padStart(2, '0'); }
 function toLocalIso(Y, M /*0-based*/, D, h, m){
   return `${Y}-${pad2(M+1)}-${pad2(D)}T${pad2(h)}:${pad2(m)}:00`;
 }
-
+function pickTime(doc, ...keys) {
+  for (const k of keys) {
+    const v = doc?.[k];
+    const d = v instanceof Date ? v : (v ? new Date(v) : null);
+    if (d && !Number.isNaN(d.getTime())) return d;
+  }
+  return null;
+}
 // ───────────────────── GET /events/:eventId/available-slots ───────
 // Query: ?actorId=<receiverId>&date=YYYY-MM-DD// GET /events/:eventId/available-slots?actorId=<receiverId>&date=YYYY-MM-DD
 // GET /events/:eventId/available-slots?actorId=<receiverId>&date=YYYY-MM-DD
 exports.listAvailableSlots = asyncHandler(async (req, res) => {
-  const { eventId } = req.params;
-  const { actorId, date } = req.query;
-  const senderId = req.user._id;
+  const { eventId } = req.params || {};
+  const dateParam   = req.query?.date || req.params?.date; // YYYY-MM-DD
+  const receiverId  = req.query?.actorId || req.query?.receiverId;
+  console.log('eventId',eventId,'\n receiverId',receiverId,'\n dateParam',dateParam);
 
-  if (!actorId || !date) return res.status(400).json({ message: 'actorId and date required' });
-  if (!mongoose.isValidObjectId(actorId)) return res.status(400).json({ message: 'Bad actorId' });
+  if (!mongoose.isValidObjectId(eventId)) {
+    return res.status(400).json({ message: 'Bad eventId' });
+  }
+  if (!receiverId || !mongoose.isValidObjectId(receiverId)) {
+    return res.status(400).json({ message: 'actorId (receiver) is required and must be an ObjectId' });
+  }
+  if (!dateParam || !/^\d{4}-\d{2}-\d{2}$/.test(String(dateParam))) {
+    return res.status(400).json({ message: 'date is required as YYYY-MM-DD (UTC day)' });
+  }
 
-  const event = await Event.findById(eventId).lean();
-  if (!event) return res.status(404).json({ message: 'Event not found' });
+  const senderId = req.user?._id;
+  if (!senderId) return res.status(401).json({ message: 'Unauthorized' });
+  console.log("senderId :",senderId);
 
-  // Check calendar day within event days (UTC-by-day)
-  const evS = new Date(event.startDate), evE = new Date(event.endDate);
-  const calStartUTC = Date.UTC(evS.getUTCFullYear(), evS.getUTCMonth(), evS.getUTCDate());
-  const calEndUTC   = Date.UTC(evE.getUTCFullYear(), evE.getUTCMonth(), evE.getUTCDate());
-  const day = new Date(`${date}T00:00:00.000Z`);
-  const dayUTC = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate());
-  if (dayUTC < calStartUTC || dayUTC > calEndUTC)
-    return res.status(400).json({ message: 'Date outside event' });
+  // Optional: read event capacity
+  let capDefault = 30;
+  if (Event) {
+    try {
+      const ev = await Event.findById(eventId).select('b2bCapacity').lean();
+      if (Number(ev?.b2bCapacity) > 0) capDefault = Number(ev.b2bCapacity);
+    } catch { /* ignore */ }
+  }
+  console.log("capDefault",capDefault);
 
-  const { dayStartUTC, dayEndUTC } = dailyWindowFromEvent(
-    event.startDate, event.endDate,
-    day.getUTCFullYear(), day.getUTCMonth() + 1, day.getUTCDate()
-  );
-  const dayStartISO = new Date(dayStartUTC).toISOString();
-  const dayEndISO   = new Date(dayEndUTC).toISOString();
+  if (!Schedule) {
+    return res.status(500).json({ message: 'Schedule model not found on server' });
+  }
 
-  // 1) Busy from ACCEPTED locks (SlotIndex)
-  const acceptedLocks = await SlotIndex.find({
-    eventId,
-    actorId: { $in: [senderId, actorId] }, // either participant
-    slotISO: { $gte: dayStartISO, $lt: dayEndISO }
-  }).lean();
+  // Day bounds in UTC
+  const dayStart  = new Date(`${dateParam}T00:00:00.000Z`);
+  const dayEndEx  = new Date(`${dateParam}T24:00:00.000Z`); // exclusive
+  const dayStartMs = dayStart.getTime();
+  const dayEndMs   = dayEndEx.getTime();
+  const STEP       = 30 * 60 * 1000;
 
-  // 2) Busy from MeetRequest in statuses pending/accepted/reschedule-proposed
-  const statuses = ['pending', 'accepted', 'reschedule-proposed'];
-  const pendingReqs = await MeetRequest.find({
-    eventId,
-    status: { $in: statuses },
+  // 1) Load ALL B2B sessions overlapping that UTC day
+  const b2bRx = /b2b/i;
+  const sessions = await Schedule.find({
     $and: [
-      { $or: [
-        { senderId: senderId }, { receiverId: senderId },
-        { senderId: actorId  }, { receiverId: actorId  }
-      ]},
-      { $or: [
-        { requestedAt : { $gte: new Date(dayStartUTC), $lt: new Date(dayEndUTC) } },
-        { proposedNewAt: { $gte: new Date(dayStartUTC), $lt: new Date(dayEndUTC) } }
-      ]}
+      { $or: [{ id_event: eventId }, { eventId }] },
+      { track: { $regex: b2bRx } },
+      {
+        $or: [
+          // Support startTime/endTime (your log shows those)
+          { $and: [ { startTime: { $lt: dayEndEx } }, { endTime: { $gt: dayStart } } ] },
+          // Also support startAt/endAt or start/end if present
+          { $and: [ { startAt:   { $lt: dayEndEx } }, { endAt:   { $gt: dayStart } } ] },
+          { $and: [ { start:     { $lt: dayEndEx } }, { end:     { $gt: dayStart } } ] },
+        ]
+      }
     ]
-  }).lean();
+  })
+  .select('track startTime endTime startAt endAt start end')
+  .lean();
+
+  console.log("sessions found:", Array.isArray(sessions) ? sessions.length : 0);
+  if (!sessions || sessions.length === 0) {
+    return res.json({ success: true, count: 0, data: [], tz: 'UTC' });
+  }
+
+  // 2) Build 30-min grid inside each session and union them
+  const slotSet = new Set();
+  for (const s of sessions) {
+    const S = pickTime(s, 'startTime','startAt','start');
+    const E = pickTime(s, 'endTime','endAt','end');
+    if (!S || !E) continue;
+
+    // Intersect with requested day
+    const segStart = Math.max(S.getTime(), dayStartMs);
+    const segEnd   = Math.min(E.getTime(), dayEndMs);
+    if (segEnd - segStart < STEP) continue;
+
+    // Round up segStart to 30min grid
+    let t = Math.ceil(segStart / STEP) * STEP;
+    for (; t < segEnd; t += STEP) {
+      slotSet.add(new Date(t).toISOString());
+    }
+  }
+
+  console.log("raw slots in B2B sessions:", slotSet.size);
+  if (!slotSet.size) {
+    return res.json({ success: true, count: 0, data: [], tz: 'UTC' });
+  }
+
+  // 3) Busy set for BOTH participants:
+  const dayStartISO = dayStart.toISOString();
+  const dayEndISO   = dayEndEx.toISOString();
+
+  const [locks, requests] = await Promise.all([
+    // Accepted/confirmed locks
+    SlotIndex.find({
+      eventId,
+      actorId: { $in: [ senderId, receiverId ] },
+      slotISO: { $gte: dayStartISO, $lt: dayEndISO }
+    }).select('slotISO').lean(),
+
+    // Requests occupying that day (either participant)
+    MeetRequest.find({
+      eventId,
+      status: { $in: ['pending','accepted','confirmed','reschedule-proposed','rescheduled'] },
+      $and: [
+        { $or: [
+          { senderId: senderId }, { receiverId: senderId },
+          { senderId: receiverId }, { receiverId: receiverId }
+        ]},
+        { $or: [
+          { requestedAt  : { $gte: dayStart, $lt: dayEndEx } },
+          { proposedNewAt: { $gte: dayStart, $lt: dayEndEx } }
+        ]}
+      ]
+    }).select('requestedAt proposedNewAt').lean()
+  ]);
 
   const busy = new Set([
-    ...acceptedLocks.map(b => b.slotISO),
-    ...pendingReqs.flatMap(r => {
+    ...locks.map(b => new Date(b.slotISO).toISOString()),
+    ...requests.flatMap(r => {
       const out = [];
       if (r.requestedAt)   out.push(new Date(r.requestedAt).toISOString());
       if (r.proposedNewAt) out.push(new Date(r.proposedNewAt).toISOString());
       return out;
     })
   ]);
+  console.log("busy slots for sender/receiver:", busy.size);
 
-  // Generate 30-min grid and filter out busy
-  const slots = [];
-  for (let t = dayStartUTC; t < dayEndUTC; t += 30 * 60000) {
-    const iso = new Date(t).toISOString();
-    if (!busy.has(iso)) slots.push(iso);
+  // 4) Filter out busy slots
+  const grid = Array.from(slotSet).filter(iso => !busy.has(iso));
+  console.log("free slots after busy filtering:", grid.length);
+
+  if (!grid.length) {
+    return res.json({ success: true, count: 0, data: [], tz: 'UTC' });
   }
 
-  return res.json({ success: true, count: slots.length, data: slots });
+  // 5) Attach capacity from MeetingSlot (if the model exists)
+  let countMap = new Map();
+  if (MeetingSlot) {
+    try {
+      const msRows = await MeetingSlot.find({
+        eventId,
+        slotISO: { $in: grid.map(iso => new Date(iso)) }
+      }).select('slotISO used cap').lean();
+
+      countMap = new Map(
+        msRows.map(r => [
+          new Date(r.slotISO).toISOString(),
+          { used: Number(r.used || 0), cap: Number(r.cap || capDefault) }
+        ])
+      );
+    } catch (e) {
+      console.warn('[listAvailableSlots] MeetingSlot read failed:', e?.message);
+    }
+  }
+
+  const data = grid
+    .sort()
+    .map(iso => {
+      const info = countMap.get(iso);
+      const used = info?.used ?? 0;
+      const cap  = info?.cap  ?? capDefault;
+      const isCap = (used < cap) && (used < 30); // enforce your 30 hard ceiling
+      return { iso, used, cap, isCap };
+    });
+
+  return res.json({ success: true, count: data.length, data, tz: 'UTC' });
 });
 
 
@@ -850,14 +2006,14 @@ exports.initMeetingReminderEngine = (app) => {
   });
 
   agenda.on('ready', () => agenda.start());
-  app.locals.agenda = agenda;
+  app.locals.agenda = agenda; 
 };
 
 /* ────────────────── helper to schedule one reminder ──────────────── */
 exports.scheduleMeetingReminder = async (meetDoc) => {
   if (!agenda) return;                       // ensure init called
 
-  /* Fire 60 min before meeting start */
+  /* F  ire 60 min before meeting start */
   const runAt = new Date(new Date(meetDoc.requestedAt).getTime() - 60*60*1000);
   if (runAt <= Date.now()) return;           // meeting in < 1h : skip
 

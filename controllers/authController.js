@@ -386,7 +386,7 @@ async function buildRegistrationPdf({ event, actor, role, sessions }) {
   doc.moveDown(1);
   doc.fontSize(10).fillColor('#555')
      .text('Best regards,')
-     .text('GITS Team');
+     .text('IPDAYS X GITS 2025');
 
   doc.end();
   return done;
@@ -491,12 +491,12 @@ exports.login = asyncHandler(async (req, res) => {
   }
 
   if (!foundUser)
-    return res.status(403).json({ message: 'Incorrect credentials' });
+    return res.status(403).json({ message: 'Incorrect email or password' });
 
   /* 3️⃣  Password check */
   const ok = await bcrypt.compare(pwd, foundUser.pwd);
   if (!ok)
-    return res.status(403).json({ message: 'Incorrect credentials' });
+    return res.status(403).json({ message: 'Incorrect email or password ' });
 
   /* 4️⃣  JWTs */
   const accessToken = jwt.sign(
@@ -1136,7 +1136,7 @@ const html = `
     <br/><a href="${verifyLink}" style="font-weight:700;color:#2563eb">${verifyLink}</a>
   </p>
   ${sessionsHtml}
-  <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>GITS Team</p>
+  <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>IPDAYS X GITS 2025</p>
 `;
 
 

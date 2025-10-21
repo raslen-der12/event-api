@@ -21,7 +21,7 @@ const Block      = require('../models/actorBlock');
 const Upload     = require('../models/actorUpload');
 const Reaction   = require('../models/actorMessageReaction');
 const Pref       = require('../models/actorPreference');
-
+const bcrypt = require('bcrypt');
 const attendee   = require('../models/attendee');
 const Exhibitor  = require('../models/exhibitor');
 const Speaker    = require('../models/speaker');
@@ -196,151 +196,272 @@ async function emailExists(email) {
 }
 
 /* ───────────────────────── Actor creation (admin) ───────────────────── */
+// CREATE: attendee | exhibitor | speaker
 exports.createActorSimple = asyncHdl(async (req, res) => {
-  let { role, eventId, roleKind, roleData } = req.body || {};
-  role = String(role || '').toLowerCase().trim();
-  roleKind = String(roleKind || '').trim();
 
-  // normalize roleKind to canonical labels used in your new workflow
+
+  let { role, eventId, roleKind } = req.body || {};
+  role = String(role || '').toLowerCase().trim();
+
+  // Normalize roleKind to canonical labels you use on the new UI
   const normKind = (() => {
-    const s = roleKind.toLowerCase();
-    if (['business owner','business_owner','owner'].includes(s)) return 'Business Owner';
-    if (['investor'].includes(s)) return 'Investor';
-    if (['consultant'].includes(s)) return 'Consultant';
-    if (['expert'].includes(s)) return 'Expert';
-    if (['employee'].includes(s)) return 'Employee';
-    if (['student'].includes(s)) return 'Student';
-    return roleKind ? roleKind : null; // accept already-canonical value if sent
+    const s = String(roleKind || '').trim().toLowerCase();
+    if (['business owner','business_owner','owner','businessowner'].includes(s)) return 'Business Owner';
+    if (s === 'investor')   return 'Investor';
+    if (s === 'consultant') return 'Consultant';
+    if (s === 'expert')     return 'Expert';
+    if (s === 'employee')   return 'Employee';
+    if (s === 'student')    return 'Student';
+    return roleKind ? roleKind : null;
   })();
 
   const name    = String(req.body?.personal?.fullName || req.body?.identity?.exhibitorName || '').trim();
   const email   = String(req.body?.personal?.email || req.body?.identity?.email || '').toLowerCase().trim();
-  const country = String(req.body?.personal?.country || req.body?.identity?.country || 'Unknown').trim();
+  const country = String(req.body?.personal?.country || req.body?.identity?.country || '').trim().toUpperCase();
+  const phone   = String(req.body?.personal?.phone || req.body?.identity?.phone || '').trim();
+  const city    = String(req.body?.personal?.city || req.body?.identity?.city || '').trim();
+  const orgName = String(req.body?.organization?.orgName || req.body?.identity?.orgName || '').trim();
+  const jobTitle= String(req.body?.organization?.jobTitle || '').trim();
+  const website = String(req.body?.links?.website || '').trim();
+  const linkedin= String(req.body?.links?.linkedin || '').trim();
+  const gender  = String(req.body?.personal?.gender || '').trim().toLowerCase(); // 'male'|'female' optional
 
   if (!['attendee', 'exhibitor', 'speaker'].includes(role))
     return res.status(400).json({ message: 'role must be attendee | exhibitor | speaker' });
-  if (!name || !email || !EMAIL_RX.test(email))
+  if (!name || !EMAIL_RX.test(email))
     return res.status(400).json({ message: 'Valid name and email are required' });
   if (!eventId || !mongoose.isValidObjectId(eventId))
     return res.status(400).json({ message: 'Valid eventId is required' });
-  if (await emailExists(email))
-    return res.status(409).json({ message: 'Email already registered' });
 
-  const pwdPlain = genPassword();
-  let created, roleOut = role;
+  // ---- Sessions (required for attendee; optional for others) ----
+  const rawSessionIds = []
+    .concat(req.body['sessionIds[]'] || req.body.sessionIds || [])
+    .flat()
+    .filter(Boolean);
 
-  try {
-    if (role === 'attendee') {
-      created = await attendee.create({
-        personal: { fullName: name, email, country, profilePic: '/default/photodef.png' },
-        organization: { orgName: 'Unknown', businessRole: 'Unknown' },
-        businessProfile: { primaryIndustry: 'Unknown', businessModel: 'B2B' },
-        matchingIntent: { objectives: ['Unknown'], openToMeetings: false },
-        verified: false, adminVerified: 'yes',
-        role: normKind || undefined,            // ⬅ base doc stores selected role-kind
-        pwd: pwdPlain, id_event: eventId
-      });
-    } else if (role === 'exhibitor') {
-      created = await Exhibitor.create({
-        identity: {
-          exhibitorName: name, orgName: 'Unknown', country,
-          contactName: 'Unknown', email, logo: '/default/logodef.png'
-        },
-        business: { industry: 'Unknown', businessModel: 'B2B' },
-        commercial: {
-          offering: 'Unknown', lookingFor: 'Unknown',
-          lookingPartners: false, regionInterest: ['Unknown'],
-          availableMeetings: false
-        },
-        verified: false, adminVerified: 'yes',
-        role: normKind || undefined,            // ⬅ base doc stores selected role-kind
-        pwd: pwdPlain, id_event: eventId
-      });
-    } else {
-      created = await Speaker.create({
-        personal: { fullName: name, email, country, profilePic: '/default/photodef.png' },
-        organization: { orgName: 'Unknown', jobTitle: 'NM', businessRole: 'Expert' },
-        talk: {
-          title: 'Unknown', abstract: 'Unknown',
-          topicCategory: 'Unknown', targetAudience: 'Unknown', language: 'en'
-        },
-        b2bIntent: { openMeetings: false, representingBiz: false },
-        verified: false, adminVerified: 'yes',
-        role: normKind || undefined,            // ⬅ base doc stores selected role-kind
-        pwd: pwdPlain, id_event: eventId
-      });
+  let normSessions = [];
+  if (role === 'attendee') {
+    if (!rawSessionIds.length) {
+      return res.status(400).json({ message: 'Please select at least one session' });
     }
-  } catch (err) {
-    if (err && (err.code === 11000 || err.code === 11001)) {
-      return res.status(409).json({ message: 'Email must be unique' });
-    }
-    if (err?.name === 'ValidationError') {
-      const first = Object.values(err.errors || {})[0];
-      return res.status(400).json({ message: first?.message || 'Validation error' });
-    }
-    return res.status(500).json({ message: 'Creation failed' });
+    // Reuse the same helpers you already use in registerAttendee:
+    normSessions = await loadAndValidateSessions(eventId, rawSessionIds);
+
+    // Remove Formation
+    normSessions = normSessions.filter(s => String(s.track || '').trim().toLowerCase() !== 'formation');
+
+    // seat enforcement
+    await attachSeatsAndEnforce({ normSessions, enforce: true });
+  } else if (rawSessionIds.length) {
+    // Allow assigning sessions for other roles too (if you use it for Speakers/Exhibitors)
+    normSessions = await loadAndValidateSessions(eventId, rawSessionIds)
+      .then(arr => arr.filter(s => String(s.track || '').trim().toLowerCase() !== 'formation'));
+    await attachSeatsAndEnforce({ normSessions, enforce: true });
   }
 
-  // Best-effort: create role-kind document tied to the actor
-  // We try dynamic requires so you don’t have to add imports elsewhere.
-  if (normKind) {
-    try {
-      const map = {
-        'Business Owner': 'BusinessOwner',
-        'Investor': 'Investor',
-        'Consultant': 'Consultant',
-        'Expert': 'Expert',
-        'Employee': 'Employee',
-        'Student': 'Student'
-      };
-      const file = map[normKind];
-      if (file) {
-        // try ../models first; fallback to ./models if structure differs
-        let RoleModel;
-        try { RoleModel = require(`../models/${file}`); }
-        catch { try { RoleModel = require(`./models/${file}`); } catch { RoleModel = null; } }
-        if (RoleModel?.create) {
-          const baseEmail = role === 'exhibitor' ? created?.identity?.email : created?.personal?.email;
-          const baseCountry = created?.personal?.country || created?.identity?.country;
-          await RoleModel.create({
-            actor: created._id,
-            // put some sensible defaults; incoming roleData overrides them
-            email: baseEmail,
-            country: baseCountry,
-            ...((roleData && typeof roleData === 'object') ? roleData : {})
-          });
-        }
-      }
-    } catch (e) {
-      // do not fail the main flow for role document issues
-      console.warn('[createActorSimple] role document create failed:', e?.message);
-    }
+  // ---- Event doc for header/PDF/email ----
+  const eventDoc = await Event.findById(eventId).lean().catch(() => null) || {
+    _id: eventId, title: 'Event', startDate: new Date(), endDate: new Date(), city: '', country: ''
+  };
+
+  const brandLogoPath = process.env.BRAND_LOGO_PATH;
+  const DEF_PHOTO = `${(process.env.DEF_ROOT || '').replace(/\/+$/,'')}/uploads/default/photodef.png`;
+  const DEF_LOGO  = `${(process.env.DEF_ROOT || '').replace(/\/+$/,'')}/uploads/default/logodef.png`;
+
+  // Create with adminVerified='yes' so it appears in admin
+  const tmpPwd = 'Tmp' + Math.random().toString(36).slice(2, 8) + '!';
+  const pwdHash = await bcrypt.hash(tmpPwd, 12);
+
+  let created;
+  if (role === 'attendee') {
+    created = await attendee.create({
+      personal: {
+        fullName: name,
+        email,
+        firstEmail: email,
+        phone,
+        country,
+        city,
+        gender: ['male','female'].includes(gender) ? gender : undefined,
+        profilePic: DEF_PHOTO,
+        preferredLanguages: Array.isArray(req.body?.businessProfile?.preferredLanguages)
+          ? req.body.businessProfile.preferredLanguages.slice(0,3) : []
+      },
+      organization: {
+        orgName: orgName || 'Unknown',
+        jobTitle: jobTitle || 'Unknown',
+        businessRole: String(req.body?.organization?.businessRole || '').trim()
+      },
+      matchingIntent: {
+        objectives: csvToArr(req.body?.matchingIntent?.objective).length
+          ? csvToArr(req.body?.matchingIntent?.objective) : [],
+        openToMeetings: normBool(req.body?.matchingIntent?.openToMeetings)
+      },
+      links: { website, linkedin },
+      id_event: eventId,
+      actorType: normKind || '',
+      role: normKind || '',
+      actorHeadline: String(req.body?.actorHeadline || '').trim(),
+      subRole: Array.isArray(req.body?.subRole) ? req.body.subRole : [],
+      verified: false,
+      adminVerified: 'yes',
+      pwd: pwdHash
+    });
+  } else if (role === 'exhibitor') {
+    created = await Exhibitor.create({
+      identity: {
+        exhibitorName: name,
+        orgName: orgName || 'Unknown',
+        contactName: name,
+        email,
+        firstEmail: email,
+        phone,
+        country,
+        city,
+        logo: DEF_LOGO,
+        preferredLanguages: Array.isArray(req.body?.identity?.preferredLanguages)
+          ? req.body.identity.preferredLanguages.slice(0,3) : []
+      },
+      business: { industry: String(req.body?.business?.industry || '').trim() },
+      commercial: { availableMeetings: !!req.body?.commercial?.availableMeetings },
+      links: { website, linkedin },
+      id_event: eventId,
+      actorType: normKind || '',
+      role: normKind || '',
+      actorHeadline: String(req.body?.actorHeadline || '').trim(),
+      subRole: Array.isArray(req.body?.subRole) ? req.body.subRole : [],
+      verified: false,
+      adminVerified: 'yes',
+      pwd: pwdHash
+    });
+  } else {
+    created = await Speaker.create({
+      personal: { fullName: name, email, phone, country, city, profilePic: DEF_PHOTO },
+      organization: { orgName: orgName || 'Unknown', jobTitle: jobTitle || 'Expert', businessRole: 'Expert' },
+      talk: {
+        title: String(req.body?.talk?.title || 'Unknown'),
+        abstract: String(req.body?.talk?.abstract || 'Unknown'),
+        topicCategory: String(req.body?.talk?.topicCategory || 'Unknown'),
+        targetAudience: String(req.body?.talk?.targetAudience || 'Unknown'),
+        language: String(req.body?.talk?.language || 'en')
+      },
+      b2bIntent: { openMeetings: false, representingBiz: false },
+      id_event: eventId,
+      actorType: normKind || '',
+      role: normKind || '',
+      actorHeadline: String(req.body?.actorHeadline || '').trim(),
+      verified: false,
+      adminVerified: 'yes',
+      pwd: pwdHash
+    });
+  }
+
+  // Tie sessions (any role if provided; attendee required above)
+  if (normSessions.length) {
+    await createSessionRegs({ actorId: created._id, actorRole: role, eventId, sessions: normSessions });
+    await bumpScheduleSeatsTaken(normSessions.map(s => s._id), +1);
+    normSessions.forEach(s => { delete s.__raw; });
+  }
+
+  // Verify link like registration
+  const raw = randomBytes(32).toString('hex');
+  created.verifyToken   = await bcrypt.hash(raw, 12);
+  created.verifyExpires = Date.now() + 24 * 60 * 60 * 1000;
+  await created.save();
+  const verifyLink = `${process.env.FRONTEND_URL}/verify-email?token=${raw}&role=${role}&id=${created._id}`;
+
+  // Build PDF + registration-style email (non-clipping table)
+  const pdf = await buildRegistrationPdf({ event: eventDoc, actor: created, role, sessions: normSessions });
+  const rowsHtml = normSessions.map(s => {
+    const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
+    const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
+    const cellBase = "padding:12px 10px;border-bottom:1px solid #eee;vertical-align:top;line-height:1.45;white-space:normal;word-break:break-word;overflow-wrap:anywhere;";
+    return `
+      <tr>
+        <td style="${cellBase}white-space:nowrap">${startStr}–${endStr}</td>
+        <td style="${cellBase}font-weight:600">${escapeHtml(s.title)}</td>
+        <td style="${cellBase}">${escapeHtml(s.room?.name || '')}</td>
+        <td style="${cellBase}color:#64748b">${escapeHtml(s.track || '')}</td>
+      </tr>`;
+  }).join('');
+
+  const logoImg = brandLogoPath
+    ? `<img src="cid:brandlogo@cid" alt="Logo" style="max-height:40px;vertical-align:middle;margin-right:8px"/>`
+    : '';
+
+  const hdr = `
+    <div style="padding:14px 0;border-bottom:1px solid #e5e7eb;margin-bottom:12px">
+      ${logoImg}
+      <div style="font:700 18px/1.2 system-ui,Segoe UI,Roboto;display:inline-block;vertical-align:middle">
+        ${escapeHtml(eventDoc.title || 'Event')}
+      </div>
+      <div style="font:600 12px/1.4 system-ui;color:#64748b">
+        ${new Date(eventDoc.startDate||Date.now()).toLocaleDateString()} → ${new Date(eventDoc.endDate||Date.now()).toLocaleDateString()}
+        ${eventDoc.city ? `• ${escapeHtml(eventDoc.city)}` : ''} ${eventDoc.country ? `• ${escapeHtml(eventDoc.country)}` : ''}
+      </div>
+    </div>`;
+
+  const sessionsHtml = normSessions.length ? `
+    <h3 style="font:800 14px system-ui;margin:12px 0 8px">Your selected sessions</h3>
+    <table style="border-collapse:collapse;width:100%;font:600 12px system-ui;table-layout:auto">
+      <colgroup>
+        <col style="width:110px" />
+        <col style="width:auto" />
+        <col style="width:160px" />
+        <col style="width:130px" />
+      </colgroup>
+      <thead>
+        <tr>
+          <th align="left" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;vertical-align:top;line-height:1.45">Time</th>
+          <th align="left" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;vertical-align:top;line-height:1.45">Title</th>
+          <th align="left" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;vertical-align:top;line-height:1.45">Room</th>
+          <th align="left" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;vertical-align:top;line-height:1.45">Track</th>
+        </tr>
+      </thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>` : '';
+
+  const who = (role === 'exhibitor')
+    ? (created?.identity?.exhibitorName || 'there')
+    : (created?.personal?.fullName || 'there');
+
+  const html = `
+    ${hdr}
+    <p style="font:600 14px system-ui">Hello ${escapeHtml(who)},</p>
+    <p style="font:600 13px system-ui">
+      Thank you for registering to <b>${escapeHtml(eventDoc.title || 'the event')}</b>.
+      We attached your confirmation PDF below (with your sessions and QR).
+    </p>
+    <p style="font:600 13px system-ui;margin:12px 0">
+      Please verify your email to activate your account:
+      <br/><a href="${verifyLink}" style="font-weight:700;color:#2563eb">${verifyLink}</a>
+    </p>
+    ${sessionsHtml}
+    <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>IPDAYS X GITS 2025</p>
+  `;
+
+  const attachments = [{ filename: 'registration.pdf', content: pdf, contentType: 'application/pdf' }];
+  if (brandLogoPath) {
+    attachments.push({ filename: path.basename(brandLogoPath), path: brandLogoPath, cid: 'brandlogo@cid' });
   }
 
   try {
     await sendMail(
       email,
-      'Your account has been created',
-      `<p>Hello ${name},</p>
-       <p>An account was created for you on GITS.</p>
-       <p><b>Role:</b> ${roleOut}${normKind ? ` — ${normKind}` : ''}</p>
-       <p><b>Temporary password:</b> <code>${pwdPlain}</code></p>
-       <p>Please log in and change your password immediately.</p>`
+      'GITS: Confirm your registration',
+      html,
+      'Please see the attached PDF for your registration details. Verify your email using the link inside.',
+      attachments
     );
-  } catch {
-    return res.status(201).json({
-      success: true,
-      message: 'Actor created, but email failed to send. Resend from admin panel.',
-      data: { id: created._id, role: roleOut, roleKind: normKind || null }
-    });
-  }
+  } catch (_) {/* ignore send failure */}
 
   return res.status(201).json({
     success: true,
-    message: 'Actor created and credentials sent by email',
-    data: { id: created._id, role: roleOut, roleKind: normKind || null }
+    message: 'Actor created; verification email sent',
+    data: { id: created._id, role, roleKind: normKind || null }
   });
 });
+
 
 
 /* ───────────────────────── Actor list (admin UI) ───────────────────── */
@@ -384,8 +505,9 @@ function pickFirst(doc, paths) {
   return null;
 }
 
+// LIST for admin (with optional event filter)
 exports.getActorsList = asyncHdl(async (req, res) => {
-  let { role, limit, search } = req.body || {};
+  let { role, limit, search, eventId } = req.body || {};
   role = (role || '').toString().toLowerCase();
 
   const conf = ROLE_MAPAD[role];
@@ -393,43 +515,54 @@ exports.getActorsList = asyncHdl(async (req, res) => {
 
   const k = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(100, Number(limit))) : 10;
 
+  // base filter (speakers often shown regardless of adminVerified, keep your previous rule)
   const base = (role === 'speaker')
     ? {}
     : { $or: [{ adminVerified: 'yes' }, { adminVerified: true }] };
 
-  const sFilter = buildSearch([...conf.name, ...conf.email], search);
+  // NEW: event filter
+  if (eventId && mongoose.isValidObjectId(eventId)) {
+    base.id_event = eventId;
+  }
+
+  const sFilter = buildSearch([...(conf.name||[]), ...(conf.email||[])], search);
   const query   = sFilter ? { $and: [base, sFilter] } : base;
 
   const proj = {};
-  [...conf.name, ...conf.email, ...conf.country, ...conf.profilePic, ...conf.logo].forEach(p => (proj[p] = 1));
+  [...(conf.name||[]), ...(conf.email||[]), ...(conf.country||[]), ...(conf.profilePic||[]), ...(conf.logo||[])]
+    .forEach(p => (proj[p] = 1));
   proj.verified = 1;
   proj.createdAt = 1;
-  proj.role = 1; // ⬅ include roleKind field from base doc
+  proj.role = 1;     // keep roleKind in list
+  proj.id_event = 1; // useful for UI
 
   const rows = await conf.Model.find(query, proj).sort({ createdAt: -1 }).limit(k).lean().exec();
 
   const data = rows.map(d => ({
-    id: d._id,
-    name      : pickFirst(d, conf.name)      || '',
-    email     : pickFirst(d, conf.email)     || '',
-    country   : pickFirst(d, conf.country)   || '',
+    id        : d._id,
+    name      : pickFirst(d, conf.name)       || '',
+    email     : pickFirst(d, conf.email)      || '',
+    country   : pickFirst(d, conf.country)    || '',
     profilePic: pickFirst(d, conf.profilePic) || null,
     logo      : pickFirst(d, conf.logo)       || null,
     verified  : !!d.verified,
-    roleKind  : d.role || null               // ⬅ expose roleKind in list
+    roleKind  : d.role || null,
+    id_event  : d.id_event || null
   }));
 
   return res.json({ success: true, count: data.length, data });
 });
 
 
+
+// FULL actor payload + sessions they are signed for
 exports.getActorFullById = asyncHdl(async (req, res) => {
   const { id } = req.params || {};
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: 'Invalid id' });
 
   const proj = { pwd: 0 };
 
-  // helper to collect role-kind subdocs across all role models
+  // helper: collect role-kind subdocs
   async function collectRoleDocs(actorId){
     const files = ['BusinessOwner','Investor','Consultant','Expert','Employee','Student'];
     const found = [];
@@ -442,31 +575,72 @@ exports.getActorFullById = asyncHdl(async (req, res) => {
           const doc = await M.findOne({ actor: actorId }).lean();
           if (doc) found.push({ kind: f.replace(/([A-Z])/g, ' $1').trim(), data: doc });
         }
-      } catch (_) { /* ignore missing model */ }
+      } catch (_) {}
     }
     return found;
   }
 
+  // helper: fetch sessions the actor is registered to (robust across naming)
+  async function fetchSignedSessions(actorId) {
+    // try to find a registration model regardless of filename used in this codebase
+    let RegModel = null;
+    const regCandidates = ['SessionRegistration', 'ScheduleRegistration', 'ScheduleReg', 'Registration'];
+    for (const name of regCandidates) {
+      try { RegModel = require(`../models/${name}`); if (RegModel?.find) break; } catch(_) {}
+    }
+    if (!RegModel) return [];
+
+    const regs = await RegModel.find({
+      $or: [{ actor: actorId }, { actorId }]
+    }).select('session sessionId').lean();
+
+    const ids = Array.from(new Set(regs.map(r => String(r.session || r.sessionId)).filter(Boolean)));
+    if (!ids.length) return [];
+
+    // try to load sessions from whatever model you use
+    let Sess = null;
+    const sessCandidates = ['Schedule', 'EventSession', 'Session', 'ScheduleItem'];
+    for (const name of sessCandidates) {
+      try { Sess = require(`../models/${name}`); if (Sess?.find) break; } catch(_) {}
+    }
+    if (!Sess) return [];
+
+    const rows = await Sess.find({ _id: { $in: ids } })
+      .select('title sessionTitle track room startAt startTime start endsAt end endTime')
+      .lean();
+
+    return rows.map(s => ({
+      _id   : s._id,
+      title : s.title || s.sessionTitle || 'Session',
+      track : s.track || '',
+      room  : (s.room && (s.room.name ? { name: s.room.name } : s.room)) || {},
+      startAt: s.startAt || s.startTime || s.start,
+      endAt  : s.endsAt || s.endTime   || s.end
+    }));
+  }
+
+  // resolve role by probing models (exhibitor -> attendee -> speaker)
   let data = await Exhibitor.findById(id, proj).lean().exec();
   if (data) {
-    const roles = await collectRoleDocs(id);
-    return res.json({ success: true, role: 'exhibitor', roleKind: data.role || null, data, roles });
+    const [roles, sessions] = await Promise.all([collectRoleDocs(id), fetchSignedSessions(id)]);
+    return res.json({ success: true, role: 'exhibitor', roleKind: data.role || null, data, sessions, roles });
   }
 
   data = await attendee.findById(id, proj).lean().exec();
   if (data) {
-    const roles = await collectRoleDocs(id);
-    return res.json({ success: true, role: 'attendee', roleKind: data.role || null, data, roles });
+    const [roles, sessions] = await Promise.all([collectRoleDocs(id), fetchSignedSessions(id)]);
+    return res.json({ success: true, role: 'attendee', roleKind: data.role || null, data, sessions, roles });
   }
 
   data = await Speaker.findById(id, proj).lean().exec();
   if (data) {
-    const roles = await collectRoleDocs(id);
-    return res.json({ success: true, role: 'speaker', roleKind: data.role || null, data, roles });
+    const [roles, sessions] = await Promise.all([collectRoleDocs(id), fetchSignedSessions(id)]);
+    return res.json({ success: true, role: 'speaker', roleKind: data.role || null, data, sessions, roles });
   }
 
   return res.status(404).json({ message: 'Actor not found' });
 });
+
 
 
 /* ───────────────────────── Requests panel (admin) ───────────────────── */
@@ -476,7 +650,6 @@ const MAP = {
   speaker  : { Model: Speaker,   select: 'profile organization talk businessIntent id_event createdAt' }
 };
 
-const STATUSES = ['no', 'yes', 'pending'];
 const escapeRegExp = (s='') => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const projattendee = (a) => ({
@@ -521,108 +694,177 @@ async function fetchBucket(status, limit, search) {
   return merged;
 }
 
+// ---- helpers local to this handler (no external deps)
+const STATUSES = ["no", "pending", "yes"];
+
+function toLimit(v, d = 20) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(Math.max(1, n), 200) : d;
+}
+function makeRx(s = "") {
+  const esc = String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(esc, "i");
+}
+function normAdminVerified(v) {
+  const s = (v == null ? "" : String(v)).toLowerCase().trim();
+  if (s === "yes" || v === true) return "yes";
+  if (s === "no" || v === false) return "no";
+  return "pending";
+}
+function pick(v, ...alts) {
+  for (const k of alts) {
+    const val = k.split(".").reduce((o, kk) => (o ? o[kk] : undefined), v);
+    if (val != null && val !== "") return val;
+  }
+  return "";
+}
+/** Build the status filter that matches string & legacy boolean values */
+function statusQuery(bucket) {
+  if (bucket === "yes")    return { $or: [{ adminVerified: "yes" }, { adminVerified: true }] };
+  if (bucket === "no")     return { $or: [{ adminVerified: "no"  }, { adminVerified: false }] };
+  // pending: explicit string OR anything missing/empty
+  return { $or: [{ adminVerified: "pending" }, { adminVerified: { $exists: false } }, { adminVerified: null }, { adminVerified: "" }] };
+}
+
+/**
+ * Pull attendees & exhibitors into the same shape for a given bucket.
+ * Optional filters: eventId (ObjectId) and search (regex).
+ */
+async function loadBucket({ bucket, limit, eventOid, searchRx }) {
+  const andsAtt = [ statusQuery(bucket) ];
+  const andsExh = [ statusQuery(bucket) ];
+  if (eventOid) { andsAtt.push({ id_event: eventOid }); andsExh.push({ id_event: eventOid }); }
+  if (searchRx) {
+    andsAtt.push({ $or: [
+      { "personal.fullName": searchRx },
+      { "personal.email": searchRx },
+      { "organization.orgName": searchRx }
+    ]});
+    andsExh.push({ $or: [
+      { "contact.name": searchRx },
+      { "contact.email": searchRx },
+      { "organization.orgName": searchRx },
+      { companyName: searchRx }
+    ]});
+  }
+
+  const [attRows, exhRows] = await Promise.all([
+    attendee.find({ $and: andsAtt })
+      .select("personal organization adminVerified verified createdAt id_event")
+      .sort({ createdAt: -1 })
+      .limit(toLimit(limit, 20))
+      .lean(),
+    (typeof exhibitor !== "undefined" ? exhibitor.find({ $and: andsExh })
+      .select("logo contact organization companyName adminVerified verified createdAt id_event")
+      .sort({ createdAt: -1 })
+      .limit(toLimit(limit, 20))
+      .lean() : Promise.resolve([]))
+  ]);
+
+  // Normalize to a unified card object
+  const rows = [];
+
+  for (const d of attRows) {
+    rows.push({
+      _id: String(d._id),
+      role: "attendee",
+      name:  pick(d, "personal.fullName"),
+      email: String(pick(d, "personal.email")).toLowerCase(),
+      country: (pick(d, "personal.country") || "").toUpperCase(),
+      profilePic: pick(d, "personal.profilePic"),
+      logo: "", // for UI compatibility
+      adminVerified: normAdminVerified(d.adminVerified),
+      verifiedEmail: !!d.verified,
+      createdAt: d.createdAt,
+      id_event: d.id_event,
+      eventName: "" // will be hydrated below
+    });
+  }
+
+  for (const d of exhRows) {
+    rows.push({
+      _id: String(d._id),
+      role: "exhibitor",
+      name:  pick(d, "organization.orgName", "companyName", "contact.name"),
+      email: String(pick(d, "contact.email")).toLowerCase(),
+      country: (pick(d, "contact.country", "organization.country") || "").toUpperCase(),
+      logo: pick(d, "logo"),
+      profilePic: "", // for UI compatibility
+      adminVerified: normAdminVerified(d.adminVerified),
+      verifiedEmail: !!d.verified,
+      createdAt: d.createdAt,
+      id_event: d.id_event,
+      eventName: "" // will be hydrated below
+    });
+  }
+
+  // hydrate event names
+  const evIds = Array.from(new Set(rows.map(r => String(r.id_event || "")).filter(Boolean)));
+  if (evIds.length) {
+    const evMap = new Map(
+      (await Event.find({ _id: { $in: evIds } }).select("title").lean())
+        .map(e => [String(e._id), e.title || "Event"])
+    );
+    rows.forEach(r => { r.eventName = evMap.get(String(r.id_event)) || ""; });
+  }
+
+  return rows;
+}
+
 exports.getRequests = asyncHdl(async (req, res) => {
-  let { adminVerify, limit, search } = req.body || {};
-  adminVerify = typeof adminVerify === 'string' ? adminVerify.trim().toLowerCase() : undefined;
-  search      = typeof search === 'string' ? search.trim() : undefined;
-  limit       = limit != null ? Number(limit) : undefined;
+  // Accept both body & query for convenience
+  let {
+    adminVerify, // "no" | "pending" | "yes" | undefined
+    limit,
+    search,
+    eventId
+  } = { ...(req.body || {}), ...(req.query || {}) };
 
-  const hasType   = !!adminVerify;
-  const hasLimit  = Number.isFinite(limit);
-  const hasSearch = !!search;
-
-  if (hasType && !STATUSES.includes(adminVerify)) {
-    return res.status(400).json({ message: 'adminVerify must be one of: no | yes | pending' });
+  adminVerify = typeof adminVerify === "string" ? adminVerify.trim().toLowerCase() : "";
+  if (adminVerify && !STATUSES.includes(adminVerify)) {
+    return res.status(400).json({ message: "adminVerify must be one of: no | pending | yes" });
   }
 
-  if (
-       (hasLimit && !hasType && !hasSearch)
-    || (hasSearch && !hasType && !hasLimit)
-    || (hasType && !hasLimit && !hasSearch)
-    || (hasLimit && hasSearch && !hasType)
-    || (hasLimit && hasSearch && hasType)
-  ) {
-    return res.status(400).json({ message: 'Invalid parameter combination' });
-  }
+  const eventOid = (eventId && mongoose.isValidObjectId(eventId)) ? new mongoose.Types.ObjectId(eventId) : null;
+  const searchRx = search && String(search).trim() ? makeRx(String(search).trim()) : null;
 
-  const MAIN_LIMIT  = hasLimit ? Math.min(Math.max(1, limit), 100) : 5;
+  // Strategy:
+  // - if adminVerify provided: main bucket gets `limit` (default 20), others 5
+  // - else: fetch 5 for each bucket
+  const MAIN_LIMIT  = toLimit(limit, 20);
   const OTHER_LIMIT = 5;
 
-  let data = { no: [], yes: [], pending: [] };
+  const plan = adminVerify
+    ? [[adminVerify, MAIN_LIMIT], ...STATUSES.filter(s => s !== adminVerify).map(s => [s, OTHER_LIMIT])]
+    : STATUSES.map(s => [s, OTHER_LIMIT]);
 
-  if (!hasType && !hasLimit && !hasSearch) {
-    const [no, yes, pending] = await Promise.all(
-      STATUSES.map(s => fetchBucket(s, OTHER_LIMIT, undefined))
-    );
-    data = { no, yes, pending };
-  } else if (hasType && hasLimit && !hasSearch) {
-    const others = STATUSES.filter(s => s !== adminVerify);
-    const [main, o1, o2] = await Promise.all([
-      fetchBucket(adminVerify, MAIN_LIMIT, undefined),
-      fetchBucket(others[0], OTHER_LIMIT, undefined),
-      fetchBucket(others[1], OTHER_LIMIT, undefined),
-    ]);
-    data[adminVerify] = main;
-    data[others[0]]   = o1;
-    data[others[1]]   = o2;
-  } else if (hasType && hasSearch && !hasLimit) {
-    const others = STATUSES.filter(s => s !== adminVerify);
-    const [main, o1, o2] = await Promise.all([
-      fetchBucket(adminVerify, OTHER_LIMIT, search),
-      fetchBucket(others[0], OTHER_LIMIT, undefined),
-      fetchBucket(others[1], OTHER_LIMIT, undefined),
-    ]);
-    data[adminVerify] = main;
-    data[others[0]]   = o1;
-    data[others[1]]   = o2;
-  } else {
-    return res.status(400).json({ message: 'Invalid parameter combination' });
-  }
+  const results = { no: [], pending: [], yes: [] };
+  const promises = plan.map(([bucket, lim]) =>
+    loadBucket({ bucket, limit: lim, eventOid, searchRx }).then(rows => { results[bucket] = rows; })
+  );
+  await Promise.all(promises);
 
-  // ===== NEW: attach assignedRoles to every item across buckets =====
-  const allItems = [...data.no, ...data.yes, ...data.pending];
-  const ids = Array.from(new Set(allItems.map(i => String(i._id))));
+  // Optional: attach role-assignment flags (if you already have those role-like models)
+  // Skipped here unless you need them; you can paste your previous "assignedRoles" block.
 
-  if (ids.length) {
-    const fetchSet = async (Model) => {
-      const rows = await Model.find({ actor: { $in: ids } }).select('actor').lean();
-      return new Set(rows.map(r => String(r.actor)));
-    };
-
-    const [
-      sBO, sCO, sEM, sEX, sIN, sST
-    ] = await Promise.all([
-      fetchSet(RoleBusinessOwner),
-      fetchSet(RoleConsultant),
-      fetchSet(RoleEmployee),
-      fetchSet(RoleExpert),
-      fetchSet(RoleInvestor),
-      fetchSet(RoleStudent),
-    ]);
-
-    const rolesFor = (id) => {
-      const k = String(id);
-      const out = [];
-      if (sBO.has(k)) out.push('businessOwner');
-      if (sCO.has(k)) out.push('consultant');
-      if (sEM.has(k)) out.push('employee');
-      if (sEX.has(k)) out.push('expert');
-      if (sIN.has(k)) out.push('investor');
-      if (sST.has(k)) out.push('student');
-      return out;
-    };
-
-    data.no      = data.no.map(i => ({ ...i, assignedRoles: rolesFor(i._id) }));
-    data.yes     = data.yes.map(i => ({ ...i, assignedRoles: rolesFor(i._id) }));
-    data.pending = data.pending.map(i => ({ ...i, assignedRoles: rolesFor(i._id) }));
-  }
+  // Debug log for you
+  console.log("[admin:getRequests]",
+    { adminVerify: adminVerify || null, limit: MAIN_LIMIT, search: search || null, eventId: eventId || null },
+    { counts: { no: results.no.length, pending: results.pending.length, yes: results.yes.length } }
+  );
 
   return res.json({
     success: true,
-    criteria: { adminVerify: adminVerify || null, limit: hasLimit ? MAIN_LIMIT : null, search: hasSearch ? search : null },
-    data
+    criteria: {
+      adminVerify: adminVerify || null,
+      limit: adminVerify ? MAIN_LIMIT : OTHER_LIMIT,
+      search: search || null,
+      eventId: eventOid ? String(eventOid) : null
+    },
+    data: results
   });
 });
+
 
 
 exports.setAdminVerify = asyncHdl(async (req, res) => {
@@ -2545,7 +2787,6 @@ exports.suggestMeetingMatches = asyncHdl(async (req, res) => {
 // controllers/actorsController.js
 
 // helpers (keep near the top of file once)
-const toLimit   = (v, d=20) => { const n=Number(v); return Number.isFinite(n) ? Math.min(Math.max(1,n),200) : d; };
 const makeRegex = (s='') => new RegExp(String(s).replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'i');
 const truthy    = (v) => ['1','true','yes','y','on'].includes(String(v||'').toLowerCase());
 

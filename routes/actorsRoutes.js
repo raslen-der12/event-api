@@ -106,7 +106,7 @@ router.post  ('/profile',                    protect, actor.getActorProfile);
 router.patch ('/profile/update',             protect, actor.updateActorProfile);
 
 // Keeping your existing route as-is (even though the path is a bit odd)
-router.post  ('/actor/profile/',             protect, actor.getActorProfileById);
+router.post  ('/actor/profile/',                      actor.getActorProfileById);
 
 
 

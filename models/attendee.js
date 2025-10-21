@@ -13,6 +13,11 @@ const PersonalSchema = new mongoose.Schema({
   phone    : { type: String, trim: true },
   country  : { type: String, trim: true, uppercase: true, required: true }, // ISO2 (TN, FR…)
   city     : { type: String, trim: true },
+  gender: {
+  type: String,
+  enum: ['male', 'female'],
+  set: v => (typeof v === 'string' ? v.trim().toLowerCase() : v),
+  },
   profilePic: { type: String, trim: true }, // /uploads/... set by multer
   preferredLanguages: {
     type: [String], // e.g. ['en','fr','ar'] – max 3 (enforced in controller)
@@ -47,7 +52,7 @@ const AttendeeSchema = new mongoose.Schema({
   // Auth / verification (compatible with old flows)
   pwd          : { type: String, select: false },               // hashed if you keep password login
   verified     : { type: Boolean, default: false },             // email verified
-  adminVerified: { type: mongoose.Schema.Types.Mixed, default: 'yes' }, // 'yes'|'no'|true|false (kept for older admin code)
+  adminVerified: { type: mongoose.Schema.Types.Mixed, default: 'pending' }, // 'yes'|'no'|true|false (kept for older admin code)
 
   verifyToken  : { type: String, select: false },
   verifyExpires: { type: Date,  select: false },
