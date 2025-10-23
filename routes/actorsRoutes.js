@@ -26,6 +26,7 @@ router.post('/suggestions',  protect, actor.getSuggestedActors);
 router.post('/profile/picture', protect, actor.uploadProfilePic);
 // routes/actorRoutes.js
 router.get('/meetings/suggest', protect, actor.suggestMeetingMatches);
+router.get('/attendees/for-meeting', actor.getAttendeesForMeeting);
 
 /* ───────────────────  CHAT – DMs & Groups  ───────────────────── */
 // Ensure / create a DM

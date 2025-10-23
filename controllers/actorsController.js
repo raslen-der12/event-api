@@ -3170,3 +3170,86 @@ exports.listSpeakersForEvent = asyncHdl(async (req, res) => {
   res.json({ success: true, count: data.length, data });
 });
 
+exports.getAttendeesForMeeting = asyncHdl(async (req, res) => {
+  const { eventId, country, q } = req.query || {};
+  const onlyOpen = String(req.query?.onlyOpen ?? 'true').toLowerCase() !== 'false'; // default true
+
+  const match = {};
+
+  if (eventId && mongoose.isValidObjectId(eventId)) {
+    match.id_event = new mongoose.Types.ObjectId(eventId);
+  }
+
+  if (country && String(country).trim()) {
+    match['personal.country'] = String(country).trim().toUpperCase();
+  }
+
+  if (onlyOpen) {
+    match['matchingIntent.openToMeetings'] = true;
+  }
+
+  // text search (case-insensitive) over common attendee fields
+  if (q && String(q).trim()) {
+    const rx = new RegExp(String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    match.$or = [
+      { 'personal.fullName': rx },
+      { 'organization.orgName': rx },
+      { 'organization.jobTitle': rx },
+      { 'matchingIntent.objectives': rx },
+      { 'links.linkedin': rx },
+      { 'links.website': rx },
+      { 'personal.preferredLanguages': rx },
+      { 'personal.email': rx },
+    ];
+  }
+
+  // limit safeguard (page groups client-side)
+  const limit = Math.min(Math.max(parseInt(req.query.limit || '500', 10) || 500, 20), 2000);
+
+  const rows = await attendee.aggregate([
+    { $match: match },
+    { $sort: { id_event: 1, 'personal.fullName': 1 } },
+    {
+      $project: {
+        _id: 1,
+        id_event: 1,
+        verified: { $ifNull: ['$verified', false] },
+        links: {
+          linkedin: { $ifNull: ['$links.linkedin', ''] },
+          website:  { $ifNull: ['$links.website',  '' ] },
+        },
+        personal: {
+          fullName: { $ifNull: ['$personal.fullName', ''] },
+          email:    { $ifNull: ['$personal.email', '' ] },
+          country:  { $ifNull: ['$personal.country', '' ] },
+          city:     { $ifNull: ['$personal.city', '' ] },
+          profilePic: { $ifNull: ['$personal.profilePic', '' ] },
+          preferredLanguages: {
+            $cond: [
+              { $isArray: '$personal.preferredLanguages' },
+              '$personal.preferredLanguages',
+              []
+            ]
+          }
+        },
+        organization: {
+          orgName: { $ifNull: ['$organization.orgName', '' ] },
+          jobTitle:{ $ifNull: ['$organization.jobTitle', '' ] },
+        },
+        matchingIntent: {
+          openToMeetings: { $toBool: { $ifNull: ['$matchingIntent.openToMeetings', false] } },
+          objectives: {
+            $cond: [
+              { $isArray: '$matchingIntent.objectives' },
+              '$matchingIntent.objectives',
+              []
+            ]
+          }
+        },
+      }
+    },
+    { $limit: limit }
+  ]);
+
+  return res.json({ success: true, data: rows });
+});

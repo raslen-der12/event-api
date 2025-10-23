@@ -1518,7 +1518,6 @@ async function buildMeetingPDF({ meet, eventObj, actor, other, qrPngBuffer }) {
       doc.moveDown(0.5);
       const FRONT = (process.env.FRONTEND_URL || '').replace(/\/+$/, '');
       const checkinUrl = `${FRONT || '#'}\/admin/marking?meetId=${meet._id}&actorId=${actor._id}`;
-      doc.fontSize(10).fillColor('#333').text(`Scan at the B2B desk or open: ${checkinUrl}`);
     } catch (e) {
       doc.fontSize(10).fillColor('red').text(`QR render failed: ${e?.message || e}`);
     }
