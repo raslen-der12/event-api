@@ -30,7 +30,9 @@ const path       = require('path');
 const fs         = require('fs');
 const multer     = require('multer');
 const mime       = require('mime-types');
-
+const Schedule = require('../models/eventModels/schedule');                // sessions/program items
+const ProgramRoom = require('../models/programRoom');          // rooms (capacity)
+const SessionRegistration = require('../models/sessionRegistration');   // attendee↔session regs (whatever you named it)
 const { randomBytes } = require('crypto');
 const { sendMail }   = require('../config/mailer');
 const {
@@ -186,15 +188,161 @@ function genPassword(){
   return base + symbols[randomBytes(1)[0] % symbols.length];
 }
 
-async function emailExists(email) {
-  const [a, e, s] = await Promise.all([
-    attendee.exists({ 'personal.email': email }),
-    Exhibitor.exists({ 'identity.email': email }),
-    Speaker.exists({ 'personal.email': email }),
-  ]);
-  return !!(a || e || s);
+const isObjId  = (v) => mongoose.isValidObjectId(v);
+const asObjId  = (v) => new mongoose.Types.ObjectId(v);
+const toArr    = (x) => (Array.isArray(x) ? x : x ? [x] : []);
+const sameDay  = (a,b) => new Date(a).toDateString() === new Date(b).toDateString();
+
+// Families: masterclass / atelier parallel, everything else 'other'
+function trackFamily(track) {
+  const t = String(track || '').toLowerCase();
+  if (t.includes('masterclass')) return 'masterclass';
+  if (t.includes('atelier'))     return 'atelier';
+  return 'other';
 }
 
+/**
+ * Load sessions by ids, ensure they belong to the event, hydrate room,
+ * normalize shape, and enforce the "1 per slot-family" rule.
+ */
+async function loadAndValidateSessions(eventId, rawSessionIds = []) {
+  const ids = toArr(rawSessionIds)
+    .map(String)
+    .filter(isObjId)
+    .map(asObjId);
+
+  if (!ids.length) return [];
+
+  const rows = await Schedule.aggregate([
+    { $match: { _id: { $in: ids }, id_event: asObjId(eventId) } },
+    {
+      $lookup: {
+        from: 'programrooms',
+        localField: 'roomId',
+        foreignField: '_id',
+        as: 'roomDoc'
+      }
+    },
+    { $addFields: { roomDoc: { $first: '$roomDoc' } } },
+  ]);
+
+  if (!rows.length) return [];
+
+  // Normalize and basic sanity
+  const norm = rows.map(s => ({
+    __raw: s,
+    _id: s._id,
+    id: s._id,
+    title: s.sessionTitle || s.title || 'Session',
+    track: s.track || '',
+    startAt: s.startTime || s.startAt || s.start || null,
+    endAt:   s.endTime   || s.endAt   || s.end   || null,
+    room: s.roomId ? {
+      _id: s.roomId,
+      name: s.roomDoc?.name || s.roomName || '',
+      location: s.roomDoc?.location || '',
+      capacity: Number(s.roomDoc?.capacity || 0)
+    } : null,
+    seatsTaken: Number(s.seatsTaken || 0),
+  })).filter(s => s.startAt && s.endAt);
+
+  // Enforce the "one selection per (exact start time) & family"
+  // masterclass + atelier are allowed in same slot; otherwise only one.
+  const seen = new Map(); // key = `${startAt}|${family}`
+  for (const s of norm) {
+    const fam = trackFamily(s.track);
+    const key = `${new Date(s.startAt).toISOString()}|${fam}`;
+    if (seen.has(key)) {
+      const dup = seen.get(key);
+      const err = new Error('CONFLICT_SAME_SLOT_FAMILY');
+      err.code = 'CONFLICT_SAME_SLOT_FAMILY';
+      err.slot = s.startAt;
+      err.sessionId = s._id;
+      err.conflictWith = dup._id;
+      throw err;
+    }
+    seen.set(key, s);
+  }
+
+  return norm;
+}
+
+/**
+ * Make sure all sessions have capacity. If enforce=true, throws on the first full one.
+ * Returns a copy of sessions (no DB writes here).
+ * Error code: 'SESSION_FULL' with { sessionId }
+ */
+async function attachSeatsAndEnforce({ normSessions, enforce = true }) {
+  for (const s of normSessions) {
+    const cap = Number(s.room?.capacity || 0);
+    const taken = Number(s.seatsTaken || 0);
+    if (cap > 0 && taken >= cap) {
+      if (enforce) {
+        const e = new Error('SESSION_FULL');
+        e.message = 'SESSION_FULL';
+        e.sessionId = s._id;
+        throw e;
+      }
+    }
+  }
+  return normSessions;
+}
+
+/**
+ * Create attendee↔session registrations. Idempotent (skips if already exists).
+ * `actorRole` is stored so you can query later (attendee|exhibitor|speaker).
+ */
+async function createSessionRegs({ actorId, actorRole, eventId, sessions }) {
+  const docs = [];
+  for (const s of sessions) {
+    const exists = await SessionRegistration.findOne({
+      actorId: asObjId(actorId),
+      actorRole,
+      sessionId: asObjId(s._id),
+      eventId: asObjId(eventId),
+    }).lean();
+    if (!exists) {
+      docs.push({
+        actorId: asObjId(actorId),
+        actorRole,
+        sessionId: asObjId(s._id),
+        eventId: asObjId(eventId),
+        status: 'registered',
+        createdAt: new Date(),
+      });
+    }
+  }
+  if (docs.length) await SessionRegistration.insertMany(docs);
+}
+
+/**
+ * Increment or decrement seatsTaken on each session.
+ * delta: +1 to reserve seat; -1 to release.
+ */
+async function bumpScheduleSeatsTaken(sessionIds = [], delta = 0) {
+  const ids = toArr(sessionIds).map(asObjId);
+  if (!ids.length || !delta) return;
+  await Schedule.updateMany(
+    { _id: { $in: ids } },
+    { $inc: { seatsTaken: delta } }
+  );
+}
+const csvToArr = (v) => {
+  if (Array.isArray(v)) {
+    return v.map(x => String(x || '').trim()).filter(Boolean);
+  }
+  const s = String(v || '').trim();
+  if (!s) return [];
+  // split on comma, semicolon, pipe, or newline
+  return s.split(/[,\n;|]+/).map(t => t.trim()).filter(Boolean);
+};
+const normBool = (v) => {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v !== 0;
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return ['true','1','yes','y','on','ok'].includes(s);
+};
 /* ───────────────────────── Actor creation (admin) ───────────────────── */
 // CREATE: attendee | exhibitor | speaker
 exports.createActorSimple = asyncHdl(async (req, res) => {
@@ -562,7 +710,7 @@ exports.getActorFullById = asyncHdl(async (req, res) => {
 
   const proj = { pwd: 0 };
 
-  // helper: collect role-kind subdocs
+  // ---- helper: gather role-kind docs (kept as-is) ----
   async function collectRoleDocs(actorId){
     const files = ['BusinessOwner','Investor','Consultant','Expert','Employee','Student'];
     const found = [];
@@ -580,66 +728,87 @@ exports.getActorFullById = asyncHdl(async (req, res) => {
     return found;
   }
 
-  // helper: fetch sessions the actor is registered to (robust across naming)
-  async function fetchSignedSessions(actorId) {
-    // try to find a registration model regardless of filename used in this codebase
-    let RegModel = null;
-    const regCandidates = ['SessionRegistration', 'ScheduleRegistration', 'ScheduleReg', 'Registration'];
-    for (const name of regCandidates) {
-      try { RegModel = require(`../models/${name}`); if (RegModel?.find) break; } catch(_) {}
-    }
-    if (!RegModel) return [];
-
-    const regs = await RegModel.find({
-      $or: [{ actor: actorId }, { actorId }]
-    }).select('session sessionId').lean();
-
-    const ids = Array.from(new Set(regs.map(r => String(r.session || r.sessionId)).filter(Boolean)));
-    if (!ids.length) return [];
-
-    // try to load sessions from whatever model you use
-    let Sess = null;
-    const sessCandidates = ['Schedule', 'EventSession', 'Session', 'ScheduleItem'];
-    for (const name of sessCandidates) {
-      try { Sess = require(`../models/${name}`); if (Sess?.find) break; } catch(_) {}
-    }
-    if (!Sess) return [];
-
-    const rows = await Sess.find({ _id: { $in: ids } })
-      .select('title sessionTitle track room startAt startTime start endsAt end endTime')
+  // ---- helper: fetch sessions registered by the actor (using your imports) ----
+  async function fetchRegisteredSessions(actorId) {
+    // sessionRegistration may store the actor in different fields; cover the common ones
+    const regs = await SessionRegistration.find({
+      $or: [
+        { actor: actorId },
+        { actorId },
+        { attendee: actorId },
+        { attendeeId: actorId },
+        { user: actorId },
+        { userId: actorId },
+      ]
+    })
+      .select('session sessionId id_session')
       .lean();
 
-    return rows.map(s => ({
-      _id   : s._id,
-      title : s.title || s.sessionTitle || 'Session',
-      track : s.track || '',
-      room  : (s.room && (s.room.name ? { name: s.room.name } : s.room)) || {},
-      startAt: s.startAt || s.startTime || s.start,
-      endAt  : s.endsAt || s.endTime   || s.end
-    }));
+    const idSet = new Set();
+    for (const r of regs) {
+      // tolerate any possible key
+      const sid = r.session || r.sessionId || r.id_session;
+      if (sid) idSet.add(String(sid));
+    }
+    const sessionIds = Array.from(idSet).map(s => new mongoose.Types.ObjectId(s));
+    if (!sessionIds.length) return [];
+
+    // load sessions from your Schedule model
+    const sessRows = await Schedule.find({ _id: { $in: sessionIds } })
+      .select('sessionTitle track room roomId startTime endTime')
+      .lean();
+
+    // resolve room names (roomId → programRoom), fallback to string "room"
+    const roomIds = Array.from(
+      new Set(sessRows.map(s => s.roomId).filter(Boolean).map(x => String(x)))
+    ).map(s => new mongoose.Types.ObjectId(s));
+
+    const rooms = roomIds.length
+      ? await ProgramRoom.find({ _id: { $in: roomIds } })
+          .select('name location capacity')
+          .lean()
+      : [];
+
+    const roomMap = new Map(rooms.map(r => [String(r._id), r]));
+
+    // normalize to what the frontend expects
+    return sessRows.map(s => {
+      const rm = s.roomId ? roomMap.get(String(s.roomId)) : null;
+      return {
+        _id: s._id,
+        title: s.sessionTitle || 'Session',
+        track: s.track || '',
+        room: rm
+          ? { name: rm.name, location: rm.location, capacity: rm.capacity }
+          : (s.room ? { name: s.room } : {}), // when schedule.room is a plain string
+        startAt: s.startTime,
+        endAt: s.endTime,
+      };
+    });
   }
 
-  // resolve role by probing models (exhibitor -> attendee -> speaker)
+  // try exhibitor → attendee → speaker (keep your order/shape)
   let data = await Exhibitor.findById(id, proj).lean().exec();
   if (data) {
-    const [roles, sessions] = await Promise.all([collectRoleDocs(id), fetchSignedSessions(id)]);
+    const [roles, sessions] = await Promise.all([collectRoleDocs(id), fetchRegisteredSessions(id)]);
     return res.json({ success: true, role: 'exhibitor', roleKind: data.role || null, data, sessions, roles });
   }
 
   data = await attendee.findById(id, proj).lean().exec();
   if (data) {
-    const [roles, sessions] = await Promise.all([collectRoleDocs(id), fetchSignedSessions(id)]);
+    const [roles, sessions] = await Promise.all([collectRoleDocs(id), fetchRegisteredSessions(id)]);
     return res.json({ success: true, role: 'attendee', roleKind: data.role || null, data, sessions, roles });
   }
 
   data = await Speaker.findById(id, proj).lean().exec();
   if (data) {
-    const [roles, sessions] = await Promise.all([collectRoleDocs(id), fetchSignedSessions(id)]);
+    const [roles, sessions] = await Promise.all([collectRoleDocs(id), fetchRegisteredSessions(id)]);
     return res.json({ success: true, role: 'speaker', roleKind: data.role || null, data, sessions, roles });
   }
 
   return res.status(404).json({ message: 'Actor not found' });
 });
+
 
 
 

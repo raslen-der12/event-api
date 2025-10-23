@@ -159,13 +159,15 @@ exports.listSessionsRegister = asyncHdl(async (req, res) => {
         cover: { $ifNull: ['$coverImage', ''] },
         track: { $ifNull: ['$track', ''] },
         tags: { $ifNull: ['$tags', []] },
+        
         speakers: { $ifNull: ['$speakers', []] },
+        seatsTaken: { $ifNull: ['$seatsTaken', { $ifNull: ['$seats_taken', 0] }] },
         // embedded minimal room
         room: {
           _id: '$roomId',
           name: { $ifNull: ['$roomDoc.name', null] },
           location: { $ifNull: ['$roomDoc.location', null] },
-          capacity: { $ifNull: ['$roomDoc.capacity', 0] }
+          capacity: { $ifNull: ['$roomDoc.capacity', 0] },
         }
       }
     }

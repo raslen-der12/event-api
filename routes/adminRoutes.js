@@ -48,6 +48,7 @@ router.get('/audit',                     protect, isAdmin, adminCtrl.getAuditLog
 /* ───────────────  NOTIFICATIONS  ─────────────── */
 router.post ('/notifs/broadcast',        protect, isAdmin, adminCtrl.broadcastNotification);
 router.patch('/notifs/:id/read',         protect, isAdmin, adminCtrl.markNotificationRead);
+router.get('/stats/attendees',protect,isAdmin, isSuper, adminCtrl.getAttendeeStats);
 
 /* ───────────────  CHAT ROOMS & MSGS  ─────────── */
 // router.post ('/chat/room',               protect

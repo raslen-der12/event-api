@@ -39,7 +39,7 @@ const AdminChatRoom  = require('../models/adminChatRoom');
 const AdminChatMsg   = require('../models/adminChatMessage');
 const AdminCal       = require('../models/adminCalendar');
 const AdminNotif     = require('../models/adminNotification');
-
+const Reg      = require('../models/sessionRegistration');
 /* ────────────────────── small helpers ─────────────────────────── */
 const ACTOR_MODEL = { attendee:attendee, exhibitor:Exhibitor, speaker:Speaker };
 
@@ -672,3 +672,570 @@ exports.setSettings = asyncHandler(async (req, res) => {
   await logAdminAction(admin,'setSetting','setting',s._id,{ key });
   res.json({ success:true, data:s });
 });
+
+exports.getAttendeeStats = asyncHandler(async (req, res) => {
+  const { eventId } = req.query || {};
+
+  // optional multi-select filter: ?countries=TN,FR,US
+  let countries = [];
+  if (req.query && typeof req.query.countries === 'string' && req.query.countries.trim()) {
+    countries = req.query.countries
+      .split(',')
+      .map(s => String(s || '').trim().toUpperCase())
+      .filter(Boolean);
+  }
+
+  const match = {};
+  if (eventId && mongoose.isValidObjectId(eventId)) {
+    match.id_event = new mongoose.Types.ObjectId(eventId);
+  }
+  if (countries.length) {
+    match['personal.country'] = { $in: countries };
+  }
+
+  // time windows
+  const now = new Date();
+  const start7d  = new Date(now.getTime() - 7  * 24 * 60 * 60 * 1000);
+  const start30d = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  const prev30dStart = new Date(start30d.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+  const [row] = await attendee.aggregate([
+    { $match: match },
+
+    // Coalesce/normalize creation date into __created (handles Date/string/legacy created_at)
+    {
+      $addFields: {
+        __rawCreated: { $ifNull: ['$createdAt', '$created_at'] }
+      }
+    },
+    {
+      $addFields: {
+        __created: {
+          $switch: {
+            branches: [
+              { case: { $eq: [{ $type: '$__rawCreated' }, 'date'] }, then: '$__rawCreated' },
+              { case: { $eq: [{ $type: '$__rawCreated' }, 'string'] }, then: { $toDate: '$__rawCreated' } }
+            ],
+            default: '$__rawCreated'
+          }
+        }
+      }
+    },
+
+    {
+      $facet: {
+        // KPIs
+        totals: [
+          {
+            $group: {
+              _id: null,
+              total: { $sum: 1 },
+              verified: { $sum: { $cond: [{ $eq: ['$verified', true] }, 1, 0] } },
+              orgsSet: { $addToSet: '$organization.orgName' },
+              countriesSet: { $addToSet: '$personal.country' },
+              langsSet: { $addToSet: '$personal.preferredLanguages' }, // array of arrays
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              total: 1,
+              verified: 1,
+              orgsCount: {
+                $size: {
+                  $filter: {
+                    input: '$orgsSet',
+                    as: 'o',
+                    cond: {
+                      $and: [
+                        { $ne: ['$$o', null] },
+                        { $ne: [{ $type: '$$o' }, 'missing'] },
+                        { $ne: [{ $strLenCP: { $ifNull: ['$$o', ''] } }, 0] },
+                      ],
+                    },
+                  },
+                },
+              },
+              countriesCount: {
+                $size: {
+                  $filter: {
+                    input: '$countriesSet',
+                    as: 'c',
+                    cond: {
+                      $and: [
+                        { $ne: ['$$c', null] },
+                        { $ne: [{ $type: '$$c' }, 'missing'] },
+                        { $ne: [{ $strLenCP: { $ifNull: ['$$c', ''] } }, 0] },
+                      ],
+                    },
+                  },
+                },
+              },
+              languagesCount: {
+                $size: {
+                  $setUnion: {
+                    $reduce: {
+                      input: '$langsSet',
+                      initialValue: [],
+                      in: { $setUnion: ['$$value', { $ifNull: ['$$this', []] }] },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        ],
+
+        // new registrations (use __created)
+        new7d:  [{ $match: { __created: { $gte: start7d } } },  { $count: 'n' }],
+        new30d: [{ $match: { __created: { $gte: start30d } } }, { $count: 'n' }],
+
+        // registrations over time (daily) (use __created)
+        registrationsOverTime: [
+          {
+            $group: {
+              _id: { y: { $year: '$__created' }, m: { $month: '$__created' }, d: { $dayOfMonth: '$__created' } },
+              count: { $sum: 1 },
+            },
+          },
+          { $sort: { '_id.y': 1, '_id.m': 1, '_id.d': 1 } },
+          {
+            $project: {
+              _id: 0,
+              date: {
+                $dateToString: {
+                  format: '%Y-%m-%d',
+                  date: { $dateFromParts: { year: '$_id.y', month: '$_id.m', day: '$_id.d' } },
+                },
+              },
+              count: 1,
+            },
+          },
+        ],
+
+        // languages breakdown
+        languages: [
+          { $unwind: { path: '$personal.preferredLanguages', preserveNullAndEmptyArrays: false } },
+          { $group: { _id: { $toLower: '$personal.preferredLanguages' }, value: { $sum: 1 } } },
+          { $sort: { value: -1 } },
+          { $project: { _id: 0, label: '$_id', value: 1 } },
+        ],
+
+        // demographics
+        topCountries: [
+          { $group: { _id: { $toUpper: { $ifNull: ['$personal.country', ''] } }, value: { $sum: 1 } } },
+          { $match: { _id: { $ne: '' } } },
+          { $sort: { value: -1 } },
+          { $limit: 10 },
+          { $project: { _id: 0, label: '$_id', value: 1 } },
+        ],
+        topCities: [
+          { $group: { _id: { $ifNull: ['$personal.city', ''] }, value: { $sum: 1 } } },
+          { $match: { _id: { $ne: '' } } },
+          { $sort: { value: -1 } },
+          { $limit: 10 },
+          { $project: { _id: 0, label: '$_id', value: 1 } },
+        ],
+
+        // professional data
+        actorTypes: [
+          { $group: { _id: { $ifNull: ['$actorType', ''] }, value: { $sum: 1 } } },
+          { $match: { _id: { $ne: '' } } },
+          { $sort: { value: -1 } },
+          { $project: { _id: 0, label: '$_id', value: 1 } },
+        ],
+        jobTitles: [
+          { $group: { _id: { $ifNull: ['$organization.jobTitle', ''] }, value: { $sum: 1 } } },
+          { $match: { _id: { $ne: '' } } },
+          { $sort: { value: -1 } },
+          { $limit: 10 },
+          { $project: { _id: 0, label: '$_id', value: 1 } },
+        ],
+        topOrgs: [
+          { $group: { _id: { $ifNull: ['$organization.orgName', ''] }, value: { $sum: 1 } } },
+          { $match: { _id: { $ne: '' } } },
+          { $sort: { value: -1 } },
+          { $limit: 10 },
+          { $project: { _id: 0, label: '$_id', value: 1 } },
+        ],
+
+        // links coverage
+        linksCoverage: [
+          {
+            $group: {
+              _id: null,
+              total: { $sum: 1 },
+              linkedin: { $sum: { $cond: [{ $gt: [{ $strLenCP: { $ifNull: ['$links.linkedin', ''] } }, 0] }, 1, 0] } },
+              website:  { $sum: { $cond: [{ $gt: [{ $strLenCP: { $ifNull: ['$links.website',  '' ] } }, 0] }, 1, 0] } },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              linkedinPct: {
+                $cond: [{ $gt: ['$total', 0] },
+                  { $round: [{ $multiply: [{ $divide: ['$linkedin', '$total'] }, 100] }, 0] }, 0],
+              },
+              websitePct: {
+                $cond: [{ $gt: ['$total', 0] },
+                  { $round: [{ $multiply: [{ $divide: ['$website', '$total'] }, 100] }, 0] }, 0],
+              },
+            },
+          },
+        ],
+
+        // engagement
+        engagement: [
+          { $group: { _id: null, total: { $sum: 1 }, open: { $sum: { $cond: [{ $eq: ['$matchingIntent.openToMeetings', true] }, 1, 0] } } } },
+          {
+            $project: {
+              _id: 0,
+              openToMeetingsPct: {
+                $cond: [{ $gt: ['$total', 0] },
+                  { $round: [{ $multiply: [{ $divide: ['$open', '$total'] }, 100] }, 0] }, 0],
+              },
+            },
+          },
+        ],
+        objectives: [
+          { $unwind: { path: '$matchingIntent.objectives', preserveNullAndEmptyArrays: false } },
+          { $group: { _id: { $toLower: '$matchingIntent.objectives' }, value: { $sum: 1 } } },
+          { $sort: { value: -1 } },
+          { $project: { _id: 0, label: '$_id', value: 1 } },
+        ],
+
+        // verification/admin
+        verification: [
+          {
+            $group: {
+              _id: null,
+              total: { $sum: 1 },
+              verified:       { $sum: { $cond: [{ $eq: ['$verified', true] }, 1, 0] } },
+              adminVerified:  { $sum: { $cond: [{ $eq: ['$adminVerified', 'yes'] }, 1, 0] } },
+              adminPending:   { $sum: { $cond: [{ $eq: ['$adminVerified', 'pending'] }, 1, 0] } },
+              adminRejected:  { $sum: { $cond: [{ $eq: ['$adminVerified', 'no'] }, 1, 0] } },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              total: 1,
+              verified: 1,
+              unverified: { $subtract: ['$total', '$verified'] },
+              adminVerified: 1,
+              adminPending: 1,
+              adminRejected: 1,
+            },
+          },
+        ],
+
+        // data completeness (photo/org/langs/links-both)
+        dataCompleteness: [
+  {
+    $addFields: {
+      // support both personal.profilePic and personal.profilePicUrl
+      __profilePicAny: {
+        $ifNull: ['$personal.profilePic', '$personal.profilePicUrl']
+      },
+      __linkedin: { $ifNull: ['$links.linkedin', ''] },
+      __website:  { $ifNull: ['$links.website',  '' ] },
+      __orgName:  { $ifNull: ['$organization.orgName', '' ] },
+      __langsArr: { $ifNull: ['$personal.preferredLanguages', []] }
+    }
+  },
+  {
+    $group: {
+      _id: null,
+      total: { $sum: 1 },
+
+      // non-empty photo (string not equal to '')
+            withPhoto: {
+        $sum: {
+          $cond: [
+            {
+              $and: [
+                { $gt: [{ $strLenCP: { $ifNull: ['$personal.profilePic', ''] } }, 0] },
+                {
+                  $not: [
+                    {
+                      $regexMatch: {
+                        input: { $ifNull: ['$personal.profilePic', ''] },
+                        regex: /\/default\/photodef\.png$/i
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            1,
+            0
+          ]
+        }
+      },
+
+      // non-empty org
+      withOrg: {
+  $sum: {
+    $cond: [
+      {
+        $and: [
+          // non-empty photo AND not the default placeholder
+          { $gt: [{ $strLenCP: { $ifNull: ['$personal.profilePic', ''] } }, 0] },
+          {
+            $not: [
+              {
+                $regexMatch: {
+                  input: { $ifNull: ['$personal.profilePic', ''] },
+                  regex: /\/default\/photodef\.png$/i
+                }
+              }
+            ]
+          },
+          // has at least one link
+          {
+            $or: [
+              { $gt: [{ $strLenCP: { $ifNull: ['$links.linkedin', ''] } }, 0] },
+              { $gt: [{ $strLenCP: { $ifNull: ['$links.website',  '' ] } }, 0] }
+            ]
+          },
+          // has at least one objective
+          { $gt: [ { $size: { $ifNull: ['$matchingIntent.objectives', []] } }, 0 ] }
+        ]
+      },
+      1,
+      0
+    ]
+  }
+},
+
+      // at least one preferred language
+      withLangs: {
+        $sum: {
+          $cond: [
+            { $gt: [ { $size: '$__langsArr' }, 0 ] },
+            1, 0
+          ]
+        }
+      },
+
+      // both links present (linkedin AND website non-empty)
+      withBothLinks: {
+        $sum: {
+          $cond: [
+            {
+              $and: [
+                { $ne: [ '$__linkedin', '' ] },
+                { $ne: [ '$__website',  '' ] },
+              ]
+            },
+            1, 0
+          ]
+        }
+      }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      photoPct: {
+        $cond: [
+          { $gt: ['$total', 0] },
+          { $round: [{ $multiply: [{ $divide: ['$withPhoto', '$total'] }, 100] }, 0] },
+          0
+        ]
+      },
+      orgPct: {
+        $cond: [
+          { $gt: ['$total', 0] },
+          { $round: [{ $multiply: [{ $divide: ['$withOrg', '$total'] }, 100] }, 0] },
+          0
+        ]
+      },
+      langsPct: {
+        $cond: [
+          { $gt: ['$total', 0] },
+          { $round: [{ $multiply: [{ $divide: ['$withLangs', '$total'] }, 100] }, 0] },
+          0
+        ]
+      },
+      linksBothPct: {
+        $cond: [
+          { $gt: ['$total', 0] },
+          { $round: [{ $multiply: [{ $divide: ['$withBothLinks', '$total'] }, 100] }, 0] },
+          0
+        ]
+      }
+    }
+  }
+],
+
+        // events overview
+        attendeesPerEvent: [
+          { $group: { _id: '$id_event', value: { $sum: 1 } } },
+          { $sort: { value: -1 } },
+          { $lookup: { from: 'events', localField: '_id', foreignField: '_id', as: 'ev' } },
+          { $addFields: { ev: { $first: '$ev' } } },
+          {
+            $project: {
+              _id: 0,
+              eventId: '$_id',
+              label: { $ifNull: ['$ev.title', { $toString: '$_id' }] },
+              value: 1,
+            },
+          },
+        ],
+
+        // growth per event (recent 30d vs previous 30d) — using __created
+        growthPerEventPct: [
+          {
+            $group: {
+              _id: '$id_event',
+              recent: { $sum: { $cond: [{ $gte: ['$__created', start30d] }, 1, 0] } },
+              prev:   { $sum: { $cond: [{ $and: [{ $gte: ['$__created', prev30dStart] }, { $lt: ['$__created', start30d] }] }, 1, 0] } },
+            },
+          },
+          { $lookup: { from: 'events', localField: '_id', foreignField: '_id', as: 'ev' } },
+          { $addFields: { ev: { $first: '$ev' } } },
+          {
+            $project: {
+              _id: 0,
+              eventId: '$_id',
+              label: { $ifNull: ['$ev.title', { $toString: '$_id' }] },
+              // prev=0 -> if recent>0 => 100, else 0
+              value: {
+                $cond: [
+                  { $gt: ['$prev', 0] },
+                  { $round: [{ $multiply: [{ $divide: [{ $subtract: ['$recent', '$prev'] }, '$prev'] }, 100] }, 0] },
+                  { $cond: [{ $gt: ['$recent', 0] }, 100, 0] }
+                ],
+              },
+            },
+          },
+          { $sort: { value: -1 } },
+        ],
+
+        // retention: emails that also appear in any other event
+        retentionPct: [
+          { $group: { _id: { event: '$id_event', email: { $toLower: '$personal.email' } }, n: { $sum: 1 } } },
+          { $group: { _id: '$_id.event', emails: { $addToSet: '$_id.email' }, total: { $sum: '$n' } } },
+          {
+            $lookup: {
+              from: 'attendees',
+              let: { ev: '$_id', emails: '$emails' },
+              pipeline: [
+                {
+                  $match: {
+                    $expr: {
+                      $and: [
+                        { $ne: ['$id_event', '$$ev'] },
+                        { $in: [{ $toLower: '$personal.email' }, '$$emails'] },
+                      ],
+                    },
+                  },
+                },
+                { $group: { _id: { $toLower: '$personal.email' }, n: { $sum: 1 } } },
+              ],
+              as: 'repeats',
+            },
+          },
+          { $project: { _id: 0, eventId: '$_id', total: 1, repeatsCount: { $size: '$repeats' } } },
+          { $lookup: { from: 'events', localField: 'eventId', foreignField: '_id', as: 'ev' } },
+          { $addFields: { ev: { $first: '$ev' } } },
+          {
+            $project: {
+              _id: 0,
+              eventId: 1,
+              label: { $ifNull: ['$ev.title', { $toString: '$eventId' }] },
+              value: {
+                $cond: [{ $gt: ['$total', 0] },
+                  { $round: [{ $multiply: [{ $divide: ['$repeatsCount', '$total'] }, 100] }, 0] }, 0],
+              },
+            },
+          },
+          { $sort: { value: -1 } },
+        ],
+      },
+    },
+    {
+      $project: {
+        totals: { $ifNull: [{ $arrayElemAt: ['$totals', 0] }, { total: 0, verified: 0, orgsCount: 0, countriesCount: 0, languagesCount: 0 }] },
+        new7d:  { $ifNull: [{ $arrayElemAt: ['$new7d.n', 0] }, 0] },
+        new30d: { $ifNull: [{ $arrayElemAt: ['$new30d.n', 0] }, 0] },
+        registrationsOverTime: 1,
+        languages: 1,
+        topCountries: 1,
+        topCities: 1,
+        actorTypes: 1,
+        jobTitles: 1,
+        topOrgs: 1,
+        linksCoverage: { $ifNull: [{ $arrayElemAt: ['$linksCoverage', 0] }, { linkedinPct: 0, websitePct: 0 }] },
+        engagementRaw: { $ifNull: [{ $arrayElemAt: ['$engagement', 0] }, { openToMeetingsPct: 0 }] },
+        objectives: 1,
+        verification: { $ifNull: [{ $arrayElemAt: ['$verification', 0] }, { total: 0, verified: 0, unverified: 0, adminVerified: 0, adminPending: 0, adminRejected: 0 }] },
+        attendeesPerEvent: 1,
+        growthPerEventPct: 1,
+        retentionPct: 1,
+        dataCompleteness: { $ifNull: [{ $arrayElemAt: ['$dataCompleteness', 0] }, { photoPct: 0, orgPct: 0, langsPct: 0, linksBothPct: 0 }] },
+      },
+    },
+  ]);
+
+  const totals = row?.totals || { total: 0, verified: 0, orgsCount: 0, countriesCount: 0, languagesCount: 0 };
+
+  const payload = {
+    total: totals.total || 0,
+    verified: totals.verified || 0,
+    orgsCount: totals.orgsCount || 0,
+    countriesCount: totals.countriesCount || 0,
+    languagesCount: totals.languagesCount || 0,
+    new7d: row?.new7d || 0,
+    new30d: row?.new30d || 0,
+    registrationsOverTime: row?.registrationsOverTime || [],
+    languages: row?.languages || [],
+    topCountries: row?.topCountries || [],
+    topCities: row?.topCities || [],
+    actorTypes: row?.actorTypes || [],
+    jobTitles: row?.jobTitles || [],
+    topOrgs: row?.topOrgs || [],
+    verification: {
+      verified: row?.verification?.verified || 0,
+      unverified: row?.verification?.unverified || 0,
+      adminVerified: row?.verification?.adminVerified || 0,
+      adminPending: row?.verification?.adminPending || 0,
+      adminRejected: row?.verification?.adminRejected || 0,
+    },
+    engagement: {
+      openToMeetingsPct: row?.engagementRaw?.openToMeetingsPct || 0,
+      objectives: row?.objectives || [],
+    },
+    linksCoverage: row?.linksCoverage || { linkedinPct: 0, websitePct: 0 },
+    eventsOverview: {
+      attendeesPerEvent: row?.attendeesPerEvent || [],
+      growthPerEventPct: row?.growthPerEventPct || [],
+      retentionPct: row?.retentionPct || [],
+    },
+    // For the card
+    dataCompleteness: row?.dataCompleteness || { photoPct: 0, orgPct: 0, langsPct: 0, linksBothPct: 0 },
+  };
+
+  // Provide single values for selected event so cards can read directly
+  if (eventId && mongoose.isValidObjectId(eventId)) {
+    const eid = String(eventId);
+    const growthArr = payload.eventsOverview.growthPerEventPct || [];
+    const retenArr  = payload.eventsOverview.retentionPct || [];
+    const findVal = (arr) => {
+      const x = arr.find(i => String(i.eventId) === eid);
+      return x ? Number(x.value) || 0 : 0;
+      // Note: if you store ObjectId in eventId property inside the array,
+      // String(i.eventId) will still stringify fine.
+    };
+    payload.eventsOverview.single = {
+      eventId: eid,
+      growthPct: findVal(growthArr),
+      retentionPct: findVal(retenArr),
+    };
+  }
+
+  return res.json({ success: true, data: payload });
+});
+
