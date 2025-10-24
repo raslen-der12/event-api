@@ -63,7 +63,7 @@ function normalizeMailOptions(opts = {}) {
   const out = { ...opts };
 
   // sender
-  out.from = out.from || `"Event Portal" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`;
+  out.from = out.from || `"Eventra Portal" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`;
 
   // recipients: nodemailer accepts string or string[]
   if (Array.isArray(out.to)) {

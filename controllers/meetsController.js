@@ -482,6 +482,11 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
   if (!receiverDoc)
     return res.status(404).json({ message: "Receiver not found" });
 
+
+  const senderVirtual = !!senderDoc.virtualMeet;
+  const receiverVirtual = !!receiverDoc.virtualMeet;
+  const bothVirtual = senderVirtual && receiverVirtual;
+  const halfVirtual = senderVirtual !== receiverVirtual;
   // Prevent duplicate active thread for same pair + event
   const activeStatuses = ["pending", "confirmed", "rescheduled"];
   const existing = await MeetRequest.findOne({
@@ -502,12 +507,12 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
       });
   }
 
-  // Read capacity
+  // Read capacity (always, but we will use it only if not both virtual)
   let capMax =
     Number(process.env.MEETING_SLOT_CAP) &&
     Number(process.env.MEETING_SLOT_CAP) > 0
       ? Number(process.env.MEETING_SLOT_CAP)
-      : 40;
+      : 30;
   if (Event) {
     try {
       const ev = await Event.findById(eventId)
@@ -517,30 +522,38 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
     } catch {}
   }
 
-  // Check / upsert slot counter (atomic-ish)
-  let slotDoc = await MeetingSlot.findOne({ eventId, slotISO }).lean();
-  if (!slotDoc) {
-    try {
-      slotDoc = await MeetingSlot.create({
-        eventId,
-        slotISO,
-        used: 0,
-        cap: capMax,
-      });
-    } catch (e) {
-      // race: created by another request; re-read
-      slotDoc = await MeetingSlot.findOne({ eventId, slotISO }).lean();
+  // === PATCH START: skip MeetingSlot when both are virtual ===
+  let used = 0;
+  let limit = capMax;
+
+  if (!bothVirtual) {
+    // Check / upsert slot counter (atomic-ish)
+    let slotDoc = await MeetingSlot.findOne({ eventId, slotISO }).lean();
+    if (!slotDoc) {
+      try {
+        slotDoc = await MeetingSlot.create({
+          eventId,
+          slotISO,
+          used: 0,
+          cap: capMax,
+        });
+      } catch (e) {
+        // race: created by another request; re-read
+        slotDoc = await MeetingSlot.findOne({ eventId, slotISO }).lean();
+      }
+    }
+
+    // If full, block (UI now disables, but race-proof here)
+    used = Number(slotDoc?.used || 0);
+    limit = Number(slotDoc?.cap || capMax);
+    if (used >= limit) {
+      return res
+        .status(409)
+        .json({ message: "Slot is full, please choose another time" });
     }
   }
+  // === PATCH END ===
 
-  // If full, block (UI now disables, but race-proof here)
-  const used = Number(slotDoc?.used || 0);
-  const limit = Number(slotDoc?.cap || capMax);
-  if (used >= limit) {
-    return res
-      .status(409)
-      .json({ message: "Slot is full, please choose another time" });
-  }
 
   // Create meeting
   const created = await MeetRequest.create({
@@ -558,11 +571,13 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
   });
 
   // Increment the slot usage
-  await MeetingSlot.updateOne(
-    { eventId, slotISO },
-    { $inc: { used: 1 }, $set: { cap: limit || capMax } },
-    { upsert: true }
-  );
+  if (!bothVirtual) {
+    await MeetingSlot.updateOne(
+      { eventId, slotISO },
+      { $inc: { used: 1 }, $set: { cap: limit || capMax } },
+      { upsert: true }
+    );
+  }
 
   // Email both parties
   const FRONT = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
@@ -589,37 +604,65 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
     ["Time", prettyTime + (evTZ ? ` (${evTZ})` : "")],
     ["Subject", subject],
   ];
+  const modeLabel = bothVirtual
+    ? "Online (virtual for both)"
+    : halfVirtual
+      ? (senderVirtual ? "Hybrid (you virtual, receiver in-person)" : "Hybrid (you in-person, receiver virtual)")
+      : "In-person (both in venue)";
 
+  const rowsSender = [
+    ...rowsCommon,
+    ["Mode", modeLabel],
+  ];
+
+  // Receiver sees it from their POV too (swap the hybrid text if needed)
+  const modeLabelReceiver = bothVirtual
+    ? "Online (virtual for both)"
+    : halfVirtual
+      ? (receiverVirtual ? "Hybrid (you virtual, sender in-person)" : "Hybrid (you in-person, sender virtual)")
+      : "In-person (both in venue)";
+
+  const rowsReceiver = [
+    ...rowsCommon,
+    ["Mode", modeLabelReceiver],
+  ];
+
+  const introSenderExtra = bothVirtual
+    ? " This meeting is online (virtual for both)."
+    : (halfVirtual ? " This meeting will be hybrid (one side virtual)." : "");
+
+  const introReceiverExtra = bothVirtual
+    ? " This meeting is online (virtual for both)."
+    : (halfVirtual ? " This meeting will be hybrid (one side virtual)." : "");
   // Sender mail
   const htmlSender = renderEmail({
     title: "Your meeting request was sent",
     intro: `Thanks ${senderDisp.name || ""}! We sent your request to <b>${
       receiverDisp.name || "participant"
-    }</b>. You’ll receive an email when they respond.`,
+    }</b>. You’ll receive an email when they respond.${introSenderExtra}`,
     rows: [
-      ...rowsCommon,
+      ...rowsSender,
       ["To", receiverDisp.name || receiverDisp.email || "—"],
     ],
     ctaHref: `${FRONT}/meetings`,
     ctaLabel: "Open my meetings",
   });
-
-  // Receiver mail
   const htmlReceiver = renderEmail({
     title: "You have a new meeting request",
     intro: `Hello ${
       receiverDisp.name || ""
     }, you received a meeting request from <b>${
       senderDisp.name || "a participant"
-    }</b>.`,
+    }</b>.${introReceiverExtra}`,
     rows: [
-      ...rowsCommon,
+      ...rowsReceiver,
       ["From", senderDisp.name || senderDisp.email || "—"],
       ["Message", message || "(no message)"],
     ],
     ctaHref: `${FRONT}/meetings`,
     ctaLabel: "Review request",
   });
+
 
   const mailErrors = [];
   try {
@@ -650,7 +693,7 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
       slotISO: created.slotISO,
       sender: { id: senderId, role: senderRole },
       receiver: { id: receiverId, role: receiverRole },
-      slotCounter: { used: used + 1, cap: limit }, // post-increment view
+      slotCounter: bothVirtual ? null : { used: used + 1, cap: limit }, // no room usage for online
     },
     emailFailed: mailErrors,
   });
@@ -1217,6 +1260,7 @@ exports.getMyMeetings = asyncHandler(async (req, res) => {
   }
 
   // Collect ONLY the "other side" ids we need to hydrate
+    // Collect BOTH participants so we can compute virtual flags
   const buckets = {
     attendee: new Set(),
     exhibitor: new Set(),
@@ -1224,13 +1268,17 @@ exports.getMyMeetings = asyncHandler(async (req, res) => {
   };
 
   for (const m of rows) {
-    const iAmSender = String(m.senderId) === meId;
-    const otherRole = iAmSender ? m.receiverRole : m.senderRole;
-    const otherId = iAmSender ? m.receiverId : m.senderId;
-    if (ROLE_MODEL[otherRole] && mongoose.isValidObjectId(otherId)) {
-      buckets[otherRole].add(String(otherId));
+    const pairs = [
+      [String(m.senderRole), String(m.senderId)],
+      [String(m.receiverRole), String(m.receiverId)],
+    ];
+    for (const [r, id] of pairs) {
+      if (ROLE_MODEL[r] && mongoose.isValidObjectId(id)) {
+        buckets[r].add(String(id));
+      }
     }
   }
+
 
   // Batch fetch by role
   const cache = new Map(); // key: `${role}:${id}` -> doc
@@ -1241,8 +1289,8 @@ exports.getMyMeetings = asyncHandler(async (req, res) => {
     const docs = await M.find({ _id: { $in: ids } })
       .select(
         roleKey === "exhibitor"
-          ? "identity.logo identity.exhibitorName identity.orgName identity.contactName identity.email"
-          : "personal.fullName personal.email personal.profilePic enrichments.profilePic"
+          ? "identity.logo identity.exhibitorName identity.orgName identity.contactName identity.email virtualMeet"
+          : "personal.fullName personal.email personal.profilePic enrichments.profilePic virtualMeet"
       )
       .lean();
     for (const d of docs) cache.set(`${roleKey}:${String(d._id)}`, d);
@@ -1256,8 +1304,13 @@ exports.getMyMeetings = asyncHandler(async (req, res) => {
     const otherId = iAmSender ? m.receiverId : m.senderId;
     const otherDoc = cache.get(`${otherRole}:${String(otherId)}`) || {};
     const otherMeta = metaFromDoc(otherRole, otherDoc);
-
+    const senderDoc = cache.get(`${String(m.senderRole)}:${String(m.senderId)}`) || {};
+    const receiverDoc = cache.get(`${String(m.receiverRole)}:${String(m.receiverId)}`) || {};
+    const senderVirtual = !!senderDoc.virtualMeet;
+    const receiverVirtual = !!receiverDoc.virtualMeet;
     return {
+      senderVirtual,
+      receiverVirtual,
       // meeting fields (keep original ids/roles)
       id: String(m._id),
       _id: m._id, // if your frontend still reads `_id`
@@ -1754,6 +1807,7 @@ exports.makeMeetingAction = asyncHandler(async (req, res) => {
   };
 
   const { meetingId, action, actorId, proposedNewAt } = req.body || {};
+  
   if (!mongoose.isValidObjectId(meetingId)) {
     console.error('[makeMeetingAction] Bad meetingId', meetingId);
     return res.status(400).json({ message: 'Bad meetingId' });
@@ -1974,7 +2028,16 @@ exports.getSuggestedList = asyncHandler(async (req, res) => {
   if (!mongoose.isValidObjectId(meId)) {
     return res.status(400).json({ message: "Bad actorId" });
   }
-
+  console.log("[getSuggestedList] START", {
+    meId: String(meId),
+    qEventId: String(req.query.eventId || ""),
+    qRole: String(req.query.role || ""),
+    qLimit: String(req.query.limit || ""),
+    qPool: String(req.query.pool || ""),
+    qOpen: String(req.query.open || ""),
+    qLang: req.query.lang,
+    qCountry: req.query.country
+  });
   // ---- helpers ---------------------------------------------------
   const toStr = (v) => (v == null ? "" : String(v));
   const norm = (s) => toStr(s).trim().toLowerCase();
@@ -2105,10 +2168,15 @@ exports.getSuggestedList = asyncHandler(async (req, res) => {
   const scorePair = (meV, otherV) => {
     let s = 0;
     // intent complementarity
-    const lxo = meV.looking.filter((t) => otherV.offering.includes(t)).length;
-    s += lxo * 5;
-    const oxl = meV.offering.filter((t) => otherV.looking.includes(t)).length;
-    s += oxl * 4;
+        const syn = (t)=>({partners:"partnership",partner:"partnership",investment:"investor",invest:"investor",hire:"recruitment",recruit:"recruitment"}[t]||t);
+    const meL = meV.looking.map(syn), meO = meV.offering.map(syn);
+    const otL = otherV.looking.map(syn), otO = otherV.offering.map(syn);
+
+    const lxo = meL.filter((t) => otO.includes(t)).length;
+    s += lxo * 5.5; // +10%
+    const oxl = meO.filter((t) => otL.includes(t)).length;
+    s += oxl * 4.5; // +12.5%
+
     // context overlaps
     const reg = meV.regions.filter((t) => otherV.regions.includes(t)).length;
     s += reg * 2;
@@ -2275,6 +2343,7 @@ exports.getSuggestedList = asyncHandler(async (req, res) => {
       updatedAt: 1,
       verified: 1,
       adminVerified: 1,
+      virtualMeet: 1, 
       // attendee
       "personal.fullName": 1,
       "personal.profilePic": 1,
@@ -2315,7 +2384,12 @@ exports.getSuggestedList = asyncHandler(async (req, res) => {
   for (const r of roleOrder) {
     const { Model, q, proj } = baseFindFor(r);
     if (!Model) continue;
+    console.log("[getSuggestedList] Query role", r, {
+      q,
+      projKeys: Object.keys(proj || {})
+    });
     const rows = await Model.find(q, proj).limit(400).lean(); // hard cap per role
+    console.log("[getSuggestedList] Pulled", rows.length, "docs for role", r);
     for (const d of rows) candidates.push({ role: r, doc: d });
   }
 
@@ -2332,69 +2406,81 @@ exports.getSuggestedList = asyncHandler(async (req, res) => {
   };
 
   const scored = candidates.map(({ role, doc }) => {
-    const disp = displayFromDoc(role, doc);
-    const vec = extractVectors(role, doc);
+  const disp = displayFromDoc(role, doc);
+  const vec = extractVectors(role, doc);
 
-    const semantic = scorePair(meV, vec); // 0..~
+  const semantic = scorePair(meV, vec);
 
-    // trust / completeness / recency
-    const hasPhoto =
-      !!disp.photo && !DEFAULT_PHOTO_RX.test(String(disp.photo || ""));
-    const verifiedBoost =
-      (doc.verified ? 1 : 0) +
-      (doc.adminVerified === "yes" || doc.adminVerified === true ? 0.5 : 0);
-    const completeness =
-      // 0..1 roughly: count filled buckets
-      [
-        disp.name,
+  const hasPhoto =
+    !!disp.photo && !DEFAULT_PHOTO_RX.test(String(disp.photo || ""));
+  const verifiedBoost =
+    (doc.verified ? 1 : 0) +
+    (doc.adminVerified === "yes" || doc.adminVerified === true ? 0.5 : 0);
+  const completeness =
+    [
+      disp.name,
+      role === "exhibitor"
+        ? getp(doc, "commercial.offering")
+        : getp(doc, "businessProfile.offering") || getp(doc, "b2bIntent.offering"),
+      getp(
+        doc,
         role === "exhibitor"
-          ? getp(doc, "commercial.offering")
-          : getp(doc, "businessProfile.offering") ||
-            getp(doc, "b2bIntent.offering"),
-        getp(
-          doc,
-          role === "exhibitor"
-            ? "business.industry"
-            : "businessProfile.primaryIndustry"
-        ) || getp(doc, "b2bIntent.businessSector"),
-        (vec.languages || []).length ? "x" : "",
-        (vec.looking || []).length ? "x" : "",
-        (vec.offering || []).length ? "x" : "",
-      ].filter(Boolean).length / 6;
+          ? "business.industry"
+          : "businessProfile.primaryIndustry"
+      ) || getp(doc, "b2bIntent.businessSector"),
+      (vec.languages || []).length ? "x" : "",
+      (vec.looking || []).length ? "x" : "",
+      (vec.offering || []).length ? "x" : "",
+    ].filter(Boolean).length / 6;
 
-    const updated = new Date(doc.updatedAt || doc.createdAt || now).getTime();
-    const recency =
-      0.5 + 0.5 * Math.exp(-(now - updated) / (1000 * 60 * 60 * 24 * 60)); // ~60d half-life
+  const updated = new Date(doc.updatedAt || doc.createdAt || now).getTime();
+  const recency =
+    0.5 + 0.5 * Math.exp(-(now - updated) / (1000 * 60 * 60 * 24 * 60));
 
-    // combine:
-    let score =
-      semantic * 1.0 + verifiedBoost * 2.0 + completeness * 3.0 + recency * 1.0;
+  let score =
+    semantic * 1.0 + verifiedBoost * 2.0 + completeness * 3.0 + recency * 1.0;
 
-    // Photo weighting: penalize default; slight bonus for real photo
-    score *= hasPhoto ? 1.05 : 0.72;
+  score *= hasPhoto ? 1.05 : 0.72;
+  score *= 0.97 + Math.random() * 0.06;
 
-    // tiny jitter so equal scores shuffle
-    score *= 0.97 + Math.random() * 0.06; // 0.97..1.03
+  const rawTag =
+    toStr(getp(doc, "commercial.lookingFor")) ||
+    toStr(getp(doc, "matchingIntent.objectives")) ||
+    toStr(getp(doc, "talk.topicCategory")) ||
+    "";
+  const tag = (rawTag.match(/\bB2[BCG]\b/i) || [null])[0] || "";
 
-    // tag guess
-    const rawTag =
-      toStr(getp(doc, "commercial.lookingFor")) ||
-      toStr(getp(doc, "matchingIntent.objectives")) ||
-      toStr(getp(doc, "talk.topicCategory")) ||
-      "";
-    const tag = (rawTag.match(/\bB2[BCG]\b/i) || [null])[0] || "";
+  return {
+    id: String(doc._id),
+    role,
+    name: disp.name || "",
+    photo: disp.photo || "",
+    tag,
+    virtual: !!doc.virtualMeet,   // <<< keep for UI badge
+    _score: Math.max(1e-6, score) // raw (pre-normalization)
+  };
+});
 
-    return {
-      id: String(doc._id),
-      role,
-      name: disp.name || "",
-      photo: disp.photo || "",
-      tag,
-      matchPct: Math.round(Math.max(0, Math.min(100, score))), // clamp to 0..100
-      _score: Math.max(1e-6, score),
-    };
+    // scoring summary
+  const min = Math.min(...scored.map(x => x._score));
+  const max = Math.max(...scored.map(x => x._score));
+  const avg = scored.reduce((a,b)=>a+b._score,0)/(scored.length||1);
+  console.log("[getSuggestedList] Scoring stats", {
+    candidates: scored.length,
+    scoreMin: Number.isFinite(min)?min:0,
+    scoreMax: Number.isFinite(max)?max:0,
+    scoreAvg: avg
   });
-
+  const rangeMin = Number.isFinite(min) ? min : 0;
+const rangeMax = Number.isFinite(max) ? max : 1;
+for (const p of scored) {
+  const pct = normScore(p._score, rangeMin, rangeMax); // 0..1
+  p.matchPct = Math.round(pct * 100);                  // 0..100 for UI
+}
+console.log("[getSuggestedList] Normalization", {
+  min: rangeMin, max: rangeMax,
+  sampleTop3: scored.slice(0,3).map(x => ({id:x.id, role:x.role, raw:x._score, pct:x.matchPct}))
+});
   // ---- build pool & weighted random  -------------------------------
   // take the top poolCap by score, then do weighted sampling without replacement (Efraimidis-Spirakis)
   scored.sort((a, b) => b._score - a._score);
@@ -2415,8 +2501,15 @@ exports.getSuggestedList = asyncHandler(async (req, res) => {
     name: p.name,
     photo: p.photo,
     tag: p.tag,
+    virtual: !!p.virtual, 
     matchPct: p.matchPct,
   }));
+
+  console.log("[getSuggestedList] Pool/meta", {
+    poolSize: pool.length,
+    returned: out.length,
+    sampleTop3: out.slice(0,3).map(x => ({id:x.id, role:x.role, match:x.matchPct, virtual:x.virtual}))
+  });
 
   // small final shuffle so order changes across refreshes
   for (let i = out.length - 1; i > 0; i--) {
@@ -2453,8 +2546,6 @@ function pickTime(doc, ...keys) {
   return null;
 }
 // ───────────────────── GET /events/:eventId/available-slots ───────
-// Query: ?actorId=<receiverId>&date=YYYY-MM-DD// GET /events/:eventId/available-slots?actorId=<receiverId>&date=YYYY-MM-DD
-// GET /events/:eventId/available-slots?actorId=<receiverId>&date=YYYY-MM-DD
 exports.listAvailableSlots = asyncHandler(async (req, res) => {
   const { eventId } = req.params || {};
   const dateParam = req.query?.date || req.params?.date; // YYYY-MM-DD
@@ -2487,6 +2578,23 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
   const senderId = req.user?._id;
   if (!senderId) return res.status(401).json({ message: "Unauthorized" });
   console.log("senderId :", senderId);
+  const loadActor = async (id) => {
+    const opts = { lean: true, projection: { virtualMeet: 1 } };
+    let doc = null;
+    try { doc = await (global.Attendee || Attendee)?.findById(id, opts.projection).lean(); } catch {}
+    if (!doc) { try { doc = await (global.Exhibitor || Exhibitor)?.findById(id, opts.projection).lean(); } catch {} }
+    if (!doc) { try { doc = await (global.Speaker || Speaker)?.findById(id, opts.projection).lean(); } catch {} }
+    return doc;
+  };
+
+  const [senderDoc, receiverDoc] = await Promise.all([
+    loadActor(senderId),
+    loadActor(receiverId),
+  ]);
+
+  const senderVirtual = !!senderDoc?.virtualMeet;
+  const receiverVirtual = !!receiverDoc?.virtualMeet;
+  const bothVirtual = senderVirtual && receiverVirtual;
 
   // Optional: read event capacity
   let capDefault = 30;
@@ -2513,65 +2621,57 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
   const dayEndMs = dayEndEx.getTime();
   const STEP = 30 * 60 * 1000;
 
-  // 1) Load ALL B2B sessions overlapping that UTC day
-  const b2bRx = /b2b/i;
-  const sessions = await Schedule.find({
-    $and: [
-      { $or: [{ id_event: eventId }, { eventId }] },
-      { track: { $regex: b2bRx } },
-      {
-        $or: [
-          // Support startTime/endTime (your log shows those)
-          {
-            $and: [
-              { startTime: { $lt: dayEndEx } },
-              { endTime: { $gt: dayStart } },
-            ],
-          },
-          // Also support startAt/endAt or start/end if present
-          {
-            $and: [
-              { startAt: { $lt: dayEndEx } },
-              { endAt: { $gt: dayStart } },
-            ],
-          },
-          { $and: [{ start: { $lt: dayEndEx } }, { end: { $gt: dayStart } }] },
-        ],
-      },
-    ],
-  })
-    .select("track startTime endTime startAt endAt start end")
-    .lean();
+  let slotSet = new Set();
 
-  console.log("sessions found:", Array.isArray(sessions) ? sessions.length : 0);
-  if (!sessions || sessions.length === 0) {
-    return res.json({ success: true, count: 0, data: [], tz: "UTC" });
-  }
-
-  // 2) Build 30-min grid inside each session and union them
-  const slotSet = new Set();
-  for (const s of sessions) {
-    const S = pickTime(s, "startTime", "startAt", "start");
-    const E = pickTime(s, "endTime", "endAt", "end");
-    if (!S || !E) continue;
-
-    // Intersect with requested day
-    const segStart = Math.max(S.getTime(), dayStartMs);
-    const segEnd = Math.min(E.getTime(), dayEndMs);
-    if (segEnd - segStart < STEP) continue;
-
-    // Round up segStart to 30min grid
-    let t = Math.ceil(segStart / STEP) * STEP;
-    for (; t < segEnd; t += STEP) {
+  if (bothVirtual) {
+    // === PATCH START: full-day grid (virtual x virtual) ===
+    for (let t = Math.ceil(dayStartMs / STEP) * STEP; t <= dayEndMs; t += STEP) {
       slotSet.add(new Date(t).toISOString());
+    }
+    // === PATCH END ===
+  } else {
+    // Original behavior: limit to B2B sessions for the day
+    const b2bRx = /b2b/i;
+    const sessions = await Schedule.find({
+      $and: [
+        { $or: [{ id_event: eventId }, { eventId }] },
+        { track: { $regex: b2bRx } },
+        {
+          $or: [
+            { $and: [{ startTime: { $lt: dayEndEx } }, { endTime: { $gt: dayStart } }] },
+            { $and: [{ startAt:   { $lt: dayEndEx } }, { endAt:   { $gt: dayStart } }] },
+            { $and: [{ start:     { $lt: dayEndEx } }, { end:     { $gt: dayStart } }] },
+          ],
+        },
+      ],
+    })
+      .select("track startTime endTime startAt endAt start end")
+      .lean();
+
+    // 2) Build 30-min grid inside each session and union them
+    if (Array.isArray(sessions) && sessions.length) {
+      for (const s of sessions) {
+        const S = pickTime(s, "startTime", "startAt", "start");
+        const E = pickTime(s, "endTime", "endAt", "end");
+        if (!S || !E) continue;
+
+        // Intersect with requested day
+        const segStart = Math.max(S.getTime(), dayStartMs);
+        const segEnd   = Math.min(E.getTime(), dayEndMs);
+        if (segEnd - segStart < STEP) continue;
+
+        // Round up segStart to 30min grid
+        for (let t = Math.ceil(segStart / STEP) * STEP; t <= segEnd; t += STEP) {
+          slotSet.add(new Date(t).toISOString());
+        }
+      }
     }
   }
 
-  console.log("raw slots in B2B sessions:", slotSet.size);
+  // short-circuit if no base slots
   if (!slotSet.size) {
     return res.json({ success: true, count: 0, data: [], tz: "UTC" });
   }
-
   // 3) Busy set for BOTH participants:
   const dayStartISO = dayStart.toISOString();
   const dayEndISO = dayEndEx.toISOString();
@@ -2638,9 +2738,8 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
     return res.json({ success: true, count: 0, data: [], tz: "UTC" });
   }
 
-  // 5) Attach capacity from MeetingSlot (if the model exists)
   let countMap = new Map();
-  if (MeetingSlot) {
+  if (!bothVirtual && MeetingSlot) {
     try {
       const msRows = await MeetingSlot.find({
         eventId,
@@ -2659,12 +2758,15 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
       console.warn("[listAvailableSlots] MeetingSlot read failed:", e?.message);
     }
   }
-
   const data = grid.sort().map((iso) => {
+    if (bothVirtual) {
+      // No physical room usage/limits for virtual x virtual
+      return { iso, used: 0, cap: Number.POSITIVE_INFINITY, isCap: true };
+    }
     const info = countMap.get(iso);
     const used = info?.used ?? 0;
     const cap = info?.cap ?? capDefault;
-    const isCap = used < cap && used < 30; // enforce your 30 hard ceiling
+    const isCap = used < cap && used < 30; // keep your hard ceiling for physical/hybrid
     return { iso, used, cap, isCap };
   });
 

@@ -939,7 +939,7 @@ async function loadBucket({ bucket, limit, eventOid, searchRx }) {
       role: "attendee",
       name:  pick(d, "personal.fullName"),
       email: String(pick(d, "personal.email")).toLowerCase(),
-      country: (pick(d, "personal.country") || "").toUpperCase(),
+      country: (pick(d, "personal.phone") || "").toUpperCase(),
       profilePic: pick(d, "personal.profilePic"),
       logo: "", // for UI compatibility
       adminVerified: normAdminVerified(d.adminVerified),
@@ -956,7 +956,7 @@ async function loadBucket({ bucket, limit, eventOid, searchRx }) {
       role: "exhibitor",
       name:  pick(d, "organization.orgName", "companyName", "contact.name"),
       email: String(pick(d, "contact.email")).toLowerCase(),
-      country: (pick(d, "contact.country", "organization.country") || "").toUpperCase(),
+      country: (pick(d, "identity.phone") || "").toUpperCase(),
       logo: pick(d, "logo"),
       profilePic: "", // for UI compatibility
       adminVerified: normAdminVerified(d.adminVerified),

@@ -13,7 +13,7 @@ const PersonalSchema = new mongoose.Schema({
   phone    : { type: String, trim: true },
   country  : { type: String, trim: true, uppercase: true, required: true }, // ISO2 (TN, FR…)
   city     : { type: String, trim: true },
-  gender: {
+  gender   : {
   type: String,
   enum: ['male', 'female'],
   set: v => (typeof v === 'string' ? v.trim().toLowerCase() : v),
@@ -26,45 +26,43 @@ const PersonalSchema = new mongoose.Schema({
 }, { _id: false });
 
 const OrganizationSchema = new mongoose.Schema({
-  orgName      : { type: String, trim: true, },
-  jobTitle     : { type: String, trim: true,},
-  businessRole : { type: String, trim: true,}, // Founder, Manager…
+  orgName           : { type: String, trim: true, },
+  jobTitle          : { type: String, trim: true,},
+  businessRole      : { type: String, trim: true,}, // Founder, Manager…
 }, { _id: false });
 
 const MatchingIntentSchema = new mongoose.Schema({
-  objectives      : { type: [String], default: [] }, // kept for backward compatibility
-  openToMeetings  : { type: Boolean, default: true },
+  objectives        : { type: [String], default: [] }, // kept for backward compatibility
+  openToMeetings    : { type: Boolean, default: true },
 }, { _id: false });
 
 const AttendeeSchema = new mongoose.Schema({
   // Lightweight “actor role” system
-  actorType    : { type: String, trim: true, default: '' },     // BusinessOwner, Consultant, Employee, Investor, Student, Expert
-  role    : { type: String, trim: true, default: '' },     // BusinessOwner, Consultant, Employee, Investor, Student, Expert
-  actorHeadline: { type: String, trim: true, default: '' },     // short tagline
-  subRole      : { type: [String], default: [] },
-  personal     : { type: PersonalSchema, required: true },
-  organization : { type: OrganizationSchema, required: true },
-  matchingIntent: { type: MatchingIntentSchema, default: () => ({}) },
-  links        : { type: LinksSchema, default: () => ({}) },
-
-  id_event     : { type: mongoose.Schema.Types.ObjectId, ref: 'Event', required: true },
-
+  actorType         : { type: String, trim: true, default: '' },     // BusinessOwner, Consultant, Employee, Investor, Student, Expert
+  role              : { type: String, trim: true, default: '' },     // BusinessOwner, Consultant, Employee, Investor, Student, Expert
+  actorHeadline     : { type: String, trim: true, default: '' },     // short tagline
+  subRole           : { type: [String], default: [] },
+  personal          : { type: PersonalSchema, required: true },
+  organization      : { type: OrganizationSchema, required: true },
+  matchingIntent    : { type: MatchingIntentSchema, default: () => ({}) },
+  links             : { type: LinksSchema, default: () => ({}) },
+  id_event          : { type: mongoose.Schema.Types.ObjectId, ref: 'Event', required: true },
   // Auth / verification (compatible with old flows)
-  pwd          : { type: String, select: false },               // hashed if you keep password login
-  verified     : { type: Boolean, default: false },             // email verified
-  adminVerified: { type: mongoose.Schema.Types.Mixed, default: 'pending' }, // 'yes'|'no'|true|false (kept for older admin code)
-
-  verifyToken  : { type: String, select: false },
-  verifyExpires: { type: Date,  select: false },
-  resetToken:      { type: String, select: false },
-  resetExpires:    { type: Date,   select: false },
+  pwd               : { type: String, select: false },               // hashed if you keep password login
+  verified          : { type: Boolean, default: false },             // email verified
+  adminVerified     : { type: mongoose.Schema.Types.Mixed, default: 'pending' }, // 'yes'|'no'|true|false (kept for older admin code)
+  virtualMeet       : { type: Boolean, default: false },  
+  verifyToken       : { type: String, select: false },
+  verifyExpires     : { type: Date,  select: false },
+  resetToken        :      { type: String, select: false },
+  resetExpires      :    { type: Date,   select: false },
 
   // Change-email rollback
-  emailChangeToken: { type: String, select: false },
+  emailChangeToken  : { type: String, select: false },
   emailChangeExpires:{ type: Date,  select: false },
-  emailChangePrev:  { type: String, select: false },
-  resetTokenPrev:   { type: String, select: false },
-  resetPrevExpires: { type: Date,   select: false },
+  emailChangePrev   :  { type: String, select: false },
+  resetTokenPrev    :   { type: String, select: false },
+  resetPrevExpires  : { type: Date,   select: false },
   
 }, { timestamps: true });
 

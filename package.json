@@ -4,7 +4,10 @@
   "main": "server.js",
   "scripts": {
     "start": "node server",
-    "dev": "nodemon server"
+    "dev": "nodemon server",
+    "patch:apply": "node scripts/anchorPatch.js",
+    "patch:dry": "node scripts/anchorPatch.js --dry",
+    "patch:revert": "node scripts/anchorPatch.js --revert"
   },
   "keywords": [],
   "author": "",

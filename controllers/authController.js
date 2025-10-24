@@ -500,7 +500,7 @@ exports.login = asyncHandler(async (req, res) => {
 
   /* 4️⃣  JWTs */
   const accessToken = jwt.sign(
-    { UserInfo: { email: loginInput.toLowerCase(), role ,ActorId: foundUser["_id"]} },
+    { UserInfo: { email: loginInput.toLowerCase(), role ,ActorId: foundUser["_id"], virtualMeet : foundUser.virtualMeet} },
     process.env.ACCESS_TOKEN_SECRET,
     { expiresIn: '15m' }
   );
@@ -572,7 +572,7 @@ exports.refresh = asyncHandler(async (req, res) => {
 
   /* 3️⃣  Sign new access token */
   const accessToken = jwt.sign(
-    { UserInfo: { email, role ,ActorId: foundUser._id.toString() } },
+    { UserInfo: { email, role ,ActorId: foundUser._id.toString(), virtualMeet : foundUser.virtualMeet} },
     process.env.ACCESS_TOKEN_SECRET,
     { expiresIn: '15m' }
   );
@@ -655,7 +655,7 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     'links.website': website,
     'links.linkedin': linkedin,
   } = req.body || {};
-
+  const virtualMeetRaw = req.body.virtualMeet;
   // Sessions
   const sessionIds = []
     .concat(req.body['sessionIds[]'] || req.body.sessionIds || [])
@@ -670,7 +670,9 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
   if (!EMAIL_RX.test(toStr(email))) return res.status(400).json({ message: 'Valid email is required' });
   if (!toStr(country).trim()) return res.status(400).json({ message: 'Country is required' });
   if (!sessionIds.length) return res.status(400).json({ message: 'Please select at least one session' });
-
+  if (typeof virtualMeetRaw === 'undefined') {
+    return res.status(400).json({ message: 'Meeting mode (virtual/physical) is required' });
+  }
   const PASSWORD_MIN = 8;
   if (!toStr(pwd)) return res.status(400).json({ message: 'Password is required' });
   if (toStr(pwd).length < PASSWORD_MIN)
@@ -687,6 +689,7 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
 
   const preferredLanguages = csvToArr(prefLangCsv).slice(0, 3);
   const openFlag = normBool(openToMeetings);
+  const virtualFlag = normBool(virtualMeetRaw);
   const salt    = await bcrypt.genSalt(12);
   const pwdHash = await bcrypt.hash(toStr(pwd), salt);
 
@@ -719,6 +722,7 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
       objectives: csvToArr(objective).length ? csvToArr(objective) : (toStr(objective) ? [toStr(objective)] : []),
       openToMeetings: openFlag
     },
+    virtualMeet: virtualFlag,
     links: { website: toStr(website).trim(), linkedin: toStr(linkedin).trim() },
     id_event: eventId,
 
@@ -859,8 +863,9 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     ${hdr}
     <p style="font:600 14px system-ui">Hello ${escapeHtml(who)},</p>
     <p style="font:600 13px system-ui">
-      Thank you for registering to <b>${escapeHtml(eventDoc.title || 'the event')}</b>.
-      We attached your confirmation PDF below (with your sessions and QR).
+    Thank you for registering to <b>${escapeHtml(eventDoc.title || 'the event')}</b>.
+    Your current meeting mode is <b>${virtualFlag ? 'Virtual' : 'Physical (in-person)'}</b>.
+    We attached your confirmation PDF below (with your sessions and QR).
     </p>
     <p style="font:600 13px system-ui;margin:12px 0">
       Please verify your email to activate your account:
