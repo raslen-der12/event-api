@@ -18,7 +18,8 @@ const meetRequestSchema = new mongoose.Schema({
   receiverId   : { type:mongoose.Schema.Types.ObjectId, required:true },
   receiverRole : { type:String, enum:['attendee','exhibitor','speaker','admin'], required:true },
   slotISO:   { type: Date, required: true, index: true }, 
-
+  tableId: { type: String, default: '' },
+  meetLink: { type: String, default: '' },
   /* ─── business payload ────────────────────────────────────────────── */
   subject      : { type:String, required:true, trim:true, minlength:3 },
   message      : { type:String },

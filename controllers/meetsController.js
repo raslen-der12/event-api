@@ -35,69 +35,72 @@ const BusinessProfile = require("../models/BusinessProfile");
 const Schedule = require("../models/eventModels/schedule");
 const QRCode = require("qrcode");
 const PDFDocument = require('pdfkit');
-
+const HybridMeetingSlot = require('../models/HybridMeetingSlot');
+const MeetingTableCounter = require('../models/MeetingTableCounter');
 /* ─────────────────── helper maps ──────────────────── */
+
+
+const MeetingAttendance =
+  mongoose.models.MeetingAttendance ||
+  mongoose.model(
+    'MeetingAttendance',
+    new mongoose.Schema(
+      {
+        eventId:   { type: mongoose.Schema.Types.ObjectId, index: true },
+        meetingId: { type: mongoose.Schema.Types.ObjectId, index: true },
+        actorId:   { type: mongoose.Schema.Types.ObjectId, index: true },
+        kind:      { type: String, enum: ['physical', 'virtual'], required: true },
+        attended:  { type: Boolean, default: true },
+        at:        { type: Date, default: Date.now },
+        by:        { type: mongoose.Schema.Types.ObjectId }, // admin user
+      },
+      { collection: 'meeting_attendance' }
+    )
+  );
+
+const SlotWhitelist = require('../models/SlotWhitelist'); // ← import
+
+const STEP_MS = 30 * 60 * 1000;
+const norm30 = (dLike) => {
+  const t = (dLike instanceof Date ? dLike : new Date(dLike)).getTime();
+  const aligned = Math.floor(t / STEP_MS) * STEP_MS;
+  return new Date(aligned);
+};
+const iso = (d) => new Date(d).toISOString();
+const toSetISO = (arr) => new Set((arr||[]).map(iso));
+
 const ROLE_MODEL = {
   attendee: attendee,
   exhibitor: Exhibitor,
   speaker: Speaker,
 };
-function getEmail(doc, role) {
-  switch (role) {
-    case "attendee":
-      return doc.personal.email;
-    case "speaker":
-      return doc.personal.email;
-    case "exhibitor":
-      return doc.identity.email;
-  }
+
+// === PATCH START: helpers for virtual/hybrid/physical + timezone formatting ===
+function isVirtualDoc(doc) {
+  return !!(doc && (doc.virtualMeet === true || doc.virtualMeet === 'true'));
 }
-function isOpenToMeetings(doc, role) {
-  switch (role) {
-    case "attendee":
-      return doc.matchingIntent?.openToMeetings ?? false;
-    case "speaker":
-      return doc.b2bIntent?.openMeetings ?? false;
-    case "exhibitor":
-      return doc.commercial?.availableMeetings ?? false;
-  }
-}
-// Floor to 30-minute grid (UTC)
-function floorTo30UTC(isoOrDate) {
-  const d = new Date(isoOrDate);
-  const step = 30 * 60 * 1000;
-  const floored = Math.floor(d.getTime() / step) * step;
-  const out = new Date(floored);
-  out.setUTCSeconds(0, 0);
-  return out;
+function meetingModeFromDocs(senderDoc, receiverDoc) {
+  const sV = isVirtualDoc(senderDoc);
+  const rV = isVirtualDoc(receiverDoc);
+  if (sV && rV) return 'virtual';
+  if (sV !== rV) return 'hybrid';
+  return 'physical';
 }
 
-// Build daily window from event start/end *time-of-day* (UTC).
-// If unusable, fallback to 10:00–16:00 UTC.
-function dailyWindowFromEvent(evStartDate, evEndDate, y, m, d) {
-  const evS = new Date(evStartDate);
-  const evE = new Date(evEndDate);
-  let sh = evS.getUTCHours(),
-    sm = evS.getUTCMinutes();
-  let eh = evE.getUTCHours(),
-    em = evE.getUTCMinutes();
-
-  // Unusable or inverted window? fallback to 10–16
-  const unusable =
-    eh < sh ||
-    (eh === sh && em <= sm) ||
-    (sh === 0 && sm === 0 && eh === 0 && em === 0);
-  if (unusable) {
-    sh = 10;
-    sm = 0;
-    eh = 16;
-    em = 0;
-  }
-
-  const start = Date.UTC(y, m - 1, d, sh, sm, 0, 0);
-  const end = Date.UTC(y, m - 1, d, eh, em, 0, 0);
-  return { dayStartUTC: start, dayEndUTC: end };
+// localize a Date (or ISO) using event timezone to a human string
+function fmtTZ(dt, tz, opts) {
+  const d = dt instanceof Date ? dt : new Date(dt);
+  return d.toLocaleString(undefined, { timeZone: tz || 'UTC', ...opts });
 }
+function fmtTZDate(dt, tz) {
+  return fmtTZ(dt, tz, { year:'numeric', month:'2-digit', day:'2-digit' });
+}
+function fmtTZTime(dt, tz) {
+  return fmtTZ(dt, tz, { hour:'2-digit', minute:'2-digit', hour12:false });
+}
+// === PATCH END: helpers for virtual/hybrid/physical + timezone formatting ===
+
+
 
 const isId = (v) => mongoose.Types.ObjectId.isValid(String(v));
 const arr = (v) => (Array.isArray(v) ? v : []);
@@ -487,7 +490,20 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
   const receiverVirtual = !!receiverDoc.virtualMeet;
   const bothVirtual = senderVirtual && receiverVirtual;
   const halfVirtual = senderVirtual !== receiverVirtual;
-  // Prevent duplicate active thread for same pair + event
+   const slotNorm = norm30(slotISO); // normalize before checking
+  const [wSender2, wReceiver2] = await Promise.all([
+    SlotWhitelist.findOne({ eventId, actorId: senderId }).select('slots').lean(),
+    SlotWhitelist.findOne({ eventId, actorId: receiverId }).select('slots').lean(),
+  ]);
+  const needCheck = !!(wSender2 || wReceiver2); // only enforce if at least one list exists
+  if (needCheck) {
+    const sSet = toSetISO(wSender2?.slots || []);
+    const rSet = toSetISO(wReceiver2?.slots || []);
+    const k = iso(slotNorm);
+    if (!(sSet.has(k) && rSet.has(k))) {
+      return res.status(409).json({ message: 'Selected slot is not whitelisted by both participants.' });
+    }
+  }
   const activeStatuses = ["pending", "confirmed", "rescheduled"];
   const existing = await MeetRequest.findOne({
     eventId,
@@ -508,51 +524,49 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
   }
 
   // Read capacity (always, but we will use it only if not both virtual)
-  let capMax =
-    Number(process.env.MEETING_SLOT_CAP) &&
-    Number(process.env.MEETING_SLOT_CAP) > 0
-      ? Number(process.env.MEETING_SLOT_CAP)
-      : 30;
-  if (Event) {
-    try {
-      const ev = await Event.findById(eventId)
-        .select("b2bCapacity timezone title name")
-        .lean();
-      if (Number(ev?.b2bCapacity) > 0) capMax = Number(ev.b2bCapacity);
-    } catch {}
+  let physCapMax =
+  Number(process.env.MEETING_SLOT_CAP) > 0 ? Number(process.env.MEETING_SLOT_CAP) : 30;
+let hybridCapMax = null;
+let eventObjForCaps = null;
+
+if (Event) {
+  try {
+    eventObjForCaps = await Event.findById(eventId)
+      .select("b2bCapacity postsCount timezone title name")
+      .lean();
+    if (Number(eventObjForCaps?.b2bCapacity) > 0) physCapMax = Number(eventObjForCaps.b2bCapacity);
+    if (Number(eventObjForCaps?.postsCount)  > 0) hybridCapMax = Number(eventObjForCaps.postsCount);
+  } catch {}
+}
+// sensible fallback for hybrid if postsCount missing
+if (!Number.isFinite(hybridCapMax) || hybridCapMax == null) hybridCapMax = 10;
+
+let used = 0, limit = 0;
+let counterKind = bothVirtual ? 'virtual' : (halfVirtual ? 'hybrid' : 'physical');
+
+if (counterKind === 'physical') {
+  // physical ↔ physical: use MeetingSlot
+  let slotDoc = await MeetingSlot.findOne({ eventId, slotISO }).lean();
+  if (!slotDoc) {
+    try { slotDoc = await MeetingSlot.create({ eventId, slotISO, used: 0, cap: physCapMax }); }
+    catch { slotDoc = await MeetingSlot.findOne({ eventId, slotISO }).lean(); }
   }
+  used  = Number(slotDoc?.used || 0);
+  limit = Number(slotDoc?.cap  || physCapMax);
+  if (used >= limit) return res.status(409).json({ message: "Slot is full, please choose another time" });
+}
 
-  // === PATCH START: skip MeetingSlot when both are virtual ===
-  let used = 0;
-  let limit = capMax;
-
-  if (!bothVirtual) {
-    // Check / upsert slot counter (atomic-ish)
-    let slotDoc = await MeetingSlot.findOne({ eventId, slotISO }).lean();
-    if (!slotDoc) {
-      try {
-        slotDoc = await MeetingSlot.create({
-          eventId,
-          slotISO,
-          used: 0,
-          cap: capMax,
-        });
-      } catch (e) {
-        // race: created by another request; re-read
-        slotDoc = await MeetingSlot.findOne({ eventId, slotISO }).lean();
-      }
-    }
-
-    // If full, block (UI now disables, but race-proof here)
-    used = Number(slotDoc?.used || 0);
-    limit = Number(slotDoc?.cap || capMax);
-    if (used >= limit) {
-      return res
-        .status(409)
-        .json({ message: "Slot is full, please choose another time" });
-    }
+if (counterKind === 'hybrid') {
+  // physical ↔ virtual: use HybridMeetingSlot (cap = postsCount)
+  let hDoc = await HybridMeetingSlot.findOne({ eventId, slotISO }).lean();
+  if (!hDoc) {
+    try { hDoc = await HybridMeetingSlot.create({ eventId, slotISO, used: 0, cap: hybridCapMax }); }
+    catch { hDoc = await HybridMeetingSlot.findOne({ eventId, slotISO }).lean(); }
   }
-  // === PATCH END ===
+  used  = Number(hDoc?.used || 0);
+  limit = Number(hDoc?.cap  || hybridCapMax);
+  if (used >= limit) return res.status(409).json({ message: "Hybrid slot is full, please choose another time" });
+}
 
 
   // Create meeting
@@ -571,13 +585,19 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
   });
 
   // Increment the slot usage
-  if (!bothVirtual) {
-    await MeetingSlot.updateOne(
-      { eventId, slotISO },
-      { $inc: { used: 1 }, $set: { cap: limit || capMax } },
-      { upsert: true }
-    );
-  }
+  if (counterKind === 'physical') {
+  await MeetingSlot.updateOne(
+    { eventId, slotISO },
+    { $inc: { used: 1 }, $set: { cap: limit || physCapMax } },
+    { upsert: true }
+  );
+} else if (counterKind === 'hybrid') {
+  await HybridMeetingSlot.updateOne(
+    { eventId, slotISO },
+    { $inc: { used: 1 }, $set: { cap: limit || hybridCapMax } },
+    { upsert: true }
+  );
+}
 
   // Email both parties
   const FRONT = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
@@ -693,7 +713,8 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
       slotISO: created.slotISO,
       sender: { id: senderId, role: senderRole },
       receiver: { id: receiverId, role: receiverRole },
-      slotCounter: bothVirtual ? null : { used: used + 1, cap: limit }, // no room usage for online
+      slotCounter: counterKind === 'virtual' ? null :
+             { used: used + 1, cap: limit, kind: counterKind },
     },
     emailFailed: mailErrors,
   });
@@ -1541,6 +1562,8 @@ async function buildMeetingPDF({ meet, eventObj, actor, other, qrPngBuffer }) {
   const tz = eventObj?.timezone || 'UTC';
   const when = fmtLocal(meet.slotISO, tz);
   const evTitle = eventObj?.title || eventObj?.name || 'Event';
+  const tableId = String(meet.tableId || '');
+  const vLink   = String(meet.meetLink || '');
 
   return pdfToBuffer((doc) => {
     doc.fontSize(18).text(`${evTitle} — B2B Meeting`, { align: 'left' });
@@ -1548,7 +1571,9 @@ async function buildMeetingPDF({ meet, eventObj, actor, other, qrPngBuffer }) {
     doc.fontSize(12).fillColor('#333').text(`Meeting ID: ${String(meet._id)}`);
     doc.text(`Status: ${String(meet.status).toUpperCase()}`);
     doc.text(`Timezone: ${tz}`);
+    if (tableId) doc.text(`Table: ${tableId.toUpperCase()}`);
     doc.moveDown();
+
     doc.fontSize(14).fillColor('#000').text('Details', { underline: true });
     doc.moveDown(0.25);
     doc.fontSize(12).fillColor('#333');
@@ -1556,6 +1581,12 @@ async function buildMeetingPDF({ meet, eventObj, actor, other, qrPngBuffer }) {
     doc.text(`Time: ${when.time} (${tz})`);
     doc.text(`Subject: ${meet.subject || '—'}`);
     if (meet.message) doc.text(`Message: ${meet.message}`);
+    if (vLink) {
+      doc.moveDown(0.25);
+      doc.fontSize(12).fillColor('#0ea5e9').text(`Virtual link: ${vLink}`, { link: vLink, underline: true });
+      doc.fillColor('#333');
+    }
+
     doc.moveDown();
     doc.fontSize(14).fillColor('#000').text('Participants', { underline: true });
     doc.moveDown(0.25);
@@ -1563,19 +1594,22 @@ async function buildMeetingPDF({ meet, eventObj, actor, other, qrPngBuffer }) {
     doc.text(`You: ${actor.name}${actor.org ? ` (${actor.org})` : ''}`);
     doc.text(`Partner: ${other.name}${other.org ? ` (${other.org})` : ''}`);
     doc.moveDown(1);
-    const imgSize = 220;
-    try {
-      doc.fontSize(14).fillColor('#000').text('Check-in QR', { underline: true });
-      doc.moveDown(0.25);
-      doc.image(qrPngBuffer, { fit: [imgSize, imgSize] });
-      doc.moveDown(0.5);
-      const FRONT = (process.env.FRONTEND_URL || '').replace(/\/+$/, '');
-      const checkinUrl = `${FRONT || '#'}\/admin/marking?meetId=${meet._id}&actorId=${actor._id}`;
-    } catch (e) {
-      doc.fontSize(10).fillColor('red').text(`QR render failed: ${e?.message || e}`);
+
+    // QR is optional: only rendered if qrPngBuffer is provided (i.e., recipient is physical)
+    if (qrPngBuffer) {
+      const imgSize = 220;
+      try {
+        doc.fontSize(14).fillColor('#000').text('Check-in QR', { underline: true });
+        doc.moveDown(0.25);
+        doc.image(qrPngBuffer, { fit: [imgSize, imgSize] });
+        doc.moveDown(0.5);
+      } catch (e) {
+        doc.fontSize(10).fillColor('red').text(`QR render failed: ${e?.message || e}`);
+      }
     }
+
     doc.moveDown(1);
-    doc.fontSize(9).fillColor('#666').text('Keep this PDF handy. Arrive 5 minutes before your slot. Each attendee has a unique QR.');
+    doc.fontSize(9).fillColor('#666').text('Keep this PDF handy. Arrive 5 minutes before your slot. Physical attendees use the QR to enter the room.');
   });
 }
 
@@ -1600,110 +1634,129 @@ async function sendConfirmEmailsWithPDF(meet) {
   const [senderDoc, receiverDoc, ev] = await Promise.all([
     ROLE_MODEL[meet.senderRole].findById(meet.senderId).lean(),
     ROLE_MODEL[meet.receiverRole].findById(meet.receiverId).lean(),
-    Event.findById(meet.eventId).select('title name timezone city country venue').lean(),
+    Event.findById(meet.eventId).select('title name timezone city country venue postsCount').lean(),
   ]);
-  const s = { ...getMeta(senderDoc, meet.senderRole), _id: meet.senderId };
-  const r = { ...getMeta(receiverDoc, meet.receiverRole), _id: meet.receiverId };
+  const s = { ...getMeta(senderDoc, meet.senderRole), _id: meet.senderId, virtual: !!senderDoc?.virtualMeet };
+  const r = { ...getMeta(receiverDoc, meet.receiverRole), _id: meet.receiverId, virtual: !!receiverDoc?.virtualMeet };
   console.log('[sendConfirmEmailsWithPDF] s=', s, 'r=', r, 'ev=', ev);
 
   const FRONT = (process.env.FRONTEND_URL || '').replace(/\/+$/, '') || '#';
   const tz = ev?.timezone || 'UTC';
   const when = fmtLocal(meet.slotISO, tz);
   const evTitle = ev?.title || ev?.name || 'Event';
+  const meetLink = meet.meetLink || `${FRONT}/vmeet/${String(meet._id)}`; // ensure present
+
+  const htmlBase = (whoName, otherName, isPhysical) => {
+    const qrLine = isPhysical
+      ? 'Your <b>PDF ticket</b> includes your personal QR code for venue check-in.'
+      : 'This is a virtual participant. Your PDF includes the meeting details and link.';
+    return `
+      <div style="background:#f6f7f9;padding:24px;font-family:Inter,Segoe UI,Roboto,Arial,sans-serif">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;margin:0 auto;border-collapse:separate;border-spacing:0">
+          <tr>
+            <td style="padding:0">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden">
+                <tr>
+                  <td style="padding:18px 20px;background:#0ea5e9;color:#fff;font:700 18px/1.2 Inter,Segoe UI,Roboto,Arial,sans-serif">
+                    Meeting confirmed
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:18px 20px 10px;color:#0f172a;font:700 16px/1.4 Inter,Segoe UI,Roboto,Arial,sans-serif">
+                    Hi ${whoName || 'there'}, your meeting is set ✅
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:0 20px 8px;color:#334155;font:500 14px/1.6 Inter,Segoe UI,Roboto,Arial,sans-serif">
+                    You’re meeting with <b>${otherName}</b>.
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:0 20px 0">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:10px;overflow:hidden">
+                      <tr>
+                        <td style="padding:10px 12px;width:140px;color:#64748b;font:600 12px Inter">When</td>
+                        <td style="padding:10px 12px;color:#0f172a;font:700 13px Inter">${when.date} — ${when.time} (${tz})</td>
+                      </tr>
+                      <tr style="background:#fafafa">
+                        <td style="padding:10px 12px;width:140px;color:#64748b;font:600 12px Inter">Subject</td>
+                        <td style="padding:10px 12px;color:#0f172a;font:700 13px Inter">${meet.subject || '—'}</td>
+                      </tr>
+                      ${meet.tableId ? `
+                      <tr>
+                        <td style="padding:10px 12px;width:140px;color:#64748b;font:600 12px Inter">Table</td>
+                        <td style="padding:10px 12px;color:#0f172a;font:700 13px Inter">${String(meet.tableId).toUpperCase()}</td>
+                      </tr>
+                      ` : ''}
+                      <tr>
+                        <td style="padding:10px 12px;width:140px;color:#64748b;font:600 12px Inter">Virtual link</td>
+                        <td style="padding:10px 12px">
+                          <a href="${meetLink}" style="color:#0ea5e9;font:700 13px Inter;text-decoration:none">${meetLink}</a>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:14px 20px 0;color:#334155;font:500 13px/1.6 Inter">
+                    ${qrLine}
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:16px 20px 22px">
+                    <a href="${FRONT}/meetings"
+                       style="display:inline-block;background:#0ea5e9;color:#ffffff;text-decoration:none;padding:10px 16px;border-radius:10px;font:800 13px Inter">
+                      Open my meetings
+                    </a>
+                  </td>
+                </tr>
+              </table>
+              <div style="color:#94a3b8;font:500 11px/1.6 Inter;margin-top:10px;text-align:center">
+                This is an automated message from GITS.
+              </div>
+            </td>
+          </tr>
+        </table>
+      </div>
+    `;
+  };
+
+  // Build PDFs:
+  // - Physical recipients: include QR
+  // - Virtual recipients: no QR (pass null)
   const urlFor = (actorId) => `${FRONT}/admin/marking?meetId=${meet._id}&actorId=${actorId}`;
 
+  const qrOrNull = async (isPhysical, actorId) => {
+    if (!isPhysical) return null;
+    return QRCode.toBuffer(urlFor(actorId), { type: 'png', errorCorrectionLevel: 'M', scale: 8, margin: 1 });
+  };
+
   const [qrS, qrR] = await Promise.all([
-    QRCode.toBuffer(urlFor(meet.senderId), { type: 'png', errorCorrectionLevel: 'M', scale: 8, margin: 1 }),
-    QRCode.toBuffer(urlFor(meet.receiverId), { type: 'png', errorCorrectionLevel: 'M', scale: 8, margin: 1 }),
+    qrOrNull(!s.virtual, meet.senderId),
+    qrOrNull(!r.virtual, meet.receiverId),
   ]);
-  console.log('[sendConfirmEmailsWithPDF] QR generated: s=%d bytes r=%d bytes', qrS.length, qrR.length);
 
   const [pdfS, pdfR] = await Promise.all([
     buildMeetingPDF({ meet, eventObj: ev, actor: s, other: r, qrPngBuffer: qrS }),
     buildMeetingPDF({ meet, eventObj: ev, actor: r, other: s, qrPngBuffer: qrR }),
   ]);
-  console.log('[sendConfirmEmailsWithPDF] PDFs generated: s=%d bytes r=%d bytes', pdfS.length, pdfR.length);
 
-  const htmlBase = (whoName, otherName) => `
-    <div style="background:#f6f7f9;padding:24px;font-family:Inter,Segoe UI,Roboto,Arial,sans-serif">
-      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;margin:0 auto;border-collapse:separate;border-spacing:0">
-        <tr>
-          <td style="padding:0">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden">
-              <tr>
-                <td style="padding:18px 20px;background:#0ea5e9;color:#fff;font:700 18px/1.2 Inter,Segoe UI,Roboto,Arial,sans-serif">
-                  Meeting confirmed
-                </td>
-              </tr>
-              <tr>
-                <td style="padding:18px 20px 10px;color:#0f172a;font:700 16px/1.4 Inter,Segoe UI,Roboto,Arial,sans-serif">
-                  Hi ${whoName || 'there'}, your meeting is set ✅
-                </td>
-              </tr>
-              <tr>
-                <td style="padding:0 20px 4px;color:#334155;font:500 14px/1.6 Inter,Segoe UI,Roboto,Arial,sans-serif">
-                  You’re meeting with <b>${otherName}</b>.
-                </td>
-              </tr>
-              <tr>
-                <td style="padding:12px 20px 0">
-                  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:10px;overflow:hidden">
-                    <tr>
-                      <td style="padding:10px 12px;width:140px;color:#64748b;font:600 12px Inter">When</td>
-                      <td style="padding:10px 12px;color:#0f172a;font:700 13px Inter">${when.date} — ${when.time} (${tz})</td>
-                    </tr>
-                    <tr style="background:#fafafa">
-                      <td style="padding:10px 12px;width:140px;color:#64748b;font:600 12px Inter">Subject</td>
-                      <td style="padding:10px 12px;color:#0f172a;font:700 13px Inter">${meet.subject || '—'}</td>
-                    </tr>
-                  </table>
-                </td>
-              </tr>
-              <tr>
-                <td style="padding:14px 20px 0;color:#334155;font:500 13px/1.6 Inter">
-                  Your <b>PDF ticket</b> with your personal QR code is attached to this email.
-                </td>
-              </tr>
-              <tr>
-                <td style="padding:16px 20px 22px">
-                  <a href="${FRONT}/meetings"
-                     style="display:inline-block;background:#0ea5e9;color:#ffffff;text-decoration:none;padding:10px 16px;border-radius:10px;font:800 13px Inter">
-                    Open my meetings
-                  </a>
-                </td>
-              </tr>
-            </table>
-            <div style="color:#94a3b8;font:500 11px/1.6 Inter;margin-top:10px;text-align:center">
-              This is an automated message from GITS.
-            </div>
-          </td>
-        </tr>
-      </table>
-    </div>
-  `;
-
-  // 5-arg signature: to, subject, html, text, attachments[]
-  const textSummary = `Your meeting is confirmed. Date: ${when.date} — ${when.time} (${tz}). Subject: ${meet.subject || '—'}. A PDF ticket is attached.`;
+  const textSummary = `Your meeting is confirmed. Date: ${when.date} — ${when.time} (${tz}). Subject: ${meet.subject || '—'}.`;
   const attS = [{ filename: `Meeting-${String(meet._id)}-YOU.pdf`, content: pdfS, contentType: 'application/pdf' }];
   const attR = [{ filename: `Meeting-${String(meet._id)}-YOU.pdf`, content: pdfR, contentType: 'application/pdf' }];
-  console.log('[sendConfirmEmailsWithPDF] attachments lengths:', { sender: attS[0].content.length, receiver: attR[0].content.length });
 
+  // Send
   const tasks = [];
   if (s.email) {
-    console.log('[sendConfirmEmailsWithPDF] sending to sender via 5-arg sendMail:', s.email);
-    tasks.push(sendMail(s.email, `${evTitle} · Meeting confirmed`, htmlBase(s.name, r.name), textSummary, attS));
-  } else {
-    console.warn('[sendConfirmEmailsWithPDF] sender has no email, skipping attachment.');
+    tasks.push(sendMail(s.email, `${evTitle} · Meeting confirmed`, htmlBase(s.name, r.name, !s.virtual), textSummary, attS));
   }
   if (r.email) {
-    console.log('[sendConfirmEmailsWithPDF] sending to receiver via 5-arg sendMail:', r.email);
-    tasks.push(sendMail(r.email, `${evTitle} · Meeting confirmed`, htmlBase(r.name, s.name), textSummary, attR));
-  } else {
-    console.warn('[sendConfirmEmailsWithPDF] receiver has no email, skipping attachment.');
+    tasks.push(sendMail(r.email, `${evTitle} · Meeting confirmed`, htmlBase(r.name, s.name, !r.virtual), textSummary, attR));
   }
   await Promise.all(tasks);
-  console.log('[sendConfirmEmailsWithPDF] done (with PDF attachments).');
+  console.log('[sendConfirmEmailsWithPDF] done (PDFs sent; QR only to physical).');
 }
+
 
 async function sendActionEmail(meet, type) {
   console.log('[sendActionEmail] meetingId=%s type=%s', String(meet._id), type);
@@ -1790,7 +1843,36 @@ async function sendActionEmail(meet, type) {
   await Promise.all(tasks);
   console.log('[sendActionEmail] done.');
 }
+function tableCodeFromIndex(idx, perLetter = 3) {
+  // a1..a3, b1..b3, c1..c3 ...
+  const letterIndex = Math.floor(idx / perLetter);
+  const number = (idx % perLetter) + 1;
+  const letter = String.fromCharCode('a'.charCodeAt(0) + letterIndex);
+  return `${letter}${number}`;
+}
 
+async function reserveTableIndex(eventId, slotISO) {
+  // atomic get&inc counter for this (eventId, slotISO)
+  const doc = await MeetingTableCounter.findOneAndUpdate(
+    { eventId, slotISO },
+    { $setOnInsert: { eventId, slotISO, next: 0 }, $inc: { next: 1 } },
+    { new: true, upsert: true }
+  ).lean();
+  // we want the allocated index = new.next - 1
+  return Math.max(0, Number(doc?.next || 1) - 1);
+}
+
+async function loadVirtualFlags(senderId, receiverId) {
+  const loadV = async (id) => {
+    let d = null;
+    try { d = await (global.Attendee || Attendee)?.findById(id).select('virtualMeet').lean(); } catch {}
+    if (!d) { try { d = await (global.Exhibitor || Exhibitor)?.findById(id).select('virtualMeet').lean(); } catch {} }
+    if (!d) { try { d = await (global.Speaker   || Speaker  )?.findById(id).select('virtualMeet').lean(); } catch {} }
+    return !!d?.virtualMeet;
+  };
+  const [sV, rV] = await Promise.all([loadV(senderId), loadV(receiverId)]);
+  return { senderVirtual: sV, receiverVirtual: rV };
+}
 // ──────────────────────────────────────────────────────────────────────────────
 // MAIN
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1875,6 +1957,20 @@ exports.makeMeetingAction = asyncHandler(async (req, res) => {
     $unset.proposedBy = 1;
 
     await lockActors(meet.eventId, finalISO, meet.senderId, meet.receiverId);
+    const { senderVirtual, receiverVirtual } = await loadVirtualFlags(meet.senderId, meet.receiverId);
+    const bothVirtual = senderVirtual && receiverVirtual;
+
+    // We always set a meet link (placeholder – your redirect to Google Meet can live there later)
+    const FRONT_URL = (process.env.FRONTEND_URL || '').replace(/\/+$/, '') || '#';
+    const meetLink = `${FRONT_URL}/vmeet/${String(meet._id)}`;
+
+    if (!bothVirtual) {
+      // Allocate a table index for the slot and turn it into a code (a1.., b1..)
+      const idx = await reserveTableIndex(meet.eventId, new Date(finalISO));
+      const tableId = tableCodeFromIndex(idx, 5); // 5 tables per letter
+      $set.tableId = tableId;
+    }
+    $set.meetLink = meetLink;
   }
 
   // REJECT
@@ -2548,89 +2644,68 @@ function pickTime(doc, ...keys) {
 // ───────────────────── GET /events/:eventId/available-slots ───────
 exports.listAvailableSlots = asyncHandler(async (req, res) => {
   const { eventId } = req.params || {};
-  const dateParam = req.query?.date || req.params?.date; // YYYY-MM-DD
+  const dateParam  = req.query?.date || req.params?.date; // YYYY-MM-DD
   const receiverId = req.query?.actorId || req.query?.receiverId;
-  console.log(
-    "eventId",
-    eventId,
-    "\n receiverId",
-    receiverId,
-    "\n dateParam",
-    dateParam
-  );
 
-  if (!mongoose.isValidObjectId(eventId)) {
-    return res.status(400).json({ message: "Bad eventId" });
-  }
-  if (!receiverId || !mongoose.isValidObjectId(receiverId)) {
-    return res
-      .status(400)
-      .json({
-        message: "actorId (receiver) is required and must be an ObjectId",
-      });
-  }
-  if (!dateParam || !/^\d{4}-\d{2}-\d{2}$/.test(String(dateParam))) {
-    return res
-      .status(400)
-      .json({ message: "date is required as YYYY-MM-DD (UTC day)" });
-  }
+  if (!mongoose.isValidObjectId(eventId)) return res.status(400).json({ message: 'Bad eventId' });
+  if (!receiverId || !mongoose.isValidObjectId(receiverId))
+    return res.status(400).json({ message: 'actorId (receiver) is required and must be an ObjectId' });
+  if (!dateParam || !/^\d{4}-\d{2}-\d{2}$/.test(String(dateParam)))
+    return res.status(400).json({ message: 'date is required as YYYY-MM-DD (UTC day)' });
 
   const senderId = req.user?._id;
-  if (!senderId) return res.status(401).json({ message: "Unauthorized" });
-  console.log("senderId :", senderId);
+  if (!senderId) return res.status(401).json({ message: 'Unauthorized' });
+
+  // helpers (safe locally)
+  const STEP_MS = 30 * 60 * 1000;
+  const iso      = (d) => new Date(d).toISOString();
+  const toSetISO = (arr) => new Set((arr || []).map(iso));
+
   const loadActor = async (id) => {
-    const opts = { lean: true, projection: { virtualMeet: 1 } };
+    const proj = { virtualMeet: 1 };
     let doc = null;
-    try { doc = await (global.Attendee || Attendee)?.findById(id, opts.projection).lean(); } catch {}
-    if (!doc) { try { doc = await (global.Exhibitor || Exhibitor)?.findById(id, opts.projection).lean(); } catch {} }
-    if (!doc) { try { doc = await (global.Speaker || Speaker)?.findById(id, opts.projection).lean(); } catch {} }
+    try { doc = await (global.attendee || attendee)?.findById(id, proj).lean(); } catch {}
+    if (!doc) { try { doc = await (global.Exhibitor || Exhibitor)?.findById(id, proj).lean(); } catch {} }
+    if (!doc) { try { doc = await (global.Speaker  || Speaker )?.findById(id, proj).lean(); } catch {} }
     return doc;
   };
 
-  const [senderDoc, receiverDoc] = await Promise.all([
-    loadActor(senderId),
-    loadActor(receiverId),
-  ]);
-
-  const senderVirtual = !!senderDoc?.virtualMeet;
+  const [senderDoc, receiverDoc] = await Promise.all([ loadActor(senderId), loadActor(receiverId) ]);
+  const senderVirtual   = !!senderDoc?.virtualMeet;
   const receiverVirtual = !!receiverDoc?.virtualMeet;
-  const bothVirtual = senderVirtual && receiverVirtual;
+  const bothVirtual     = senderVirtual && receiverVirtual;
+  const halfVirtual     = senderVirtual !== receiverVirtual;
 
-  // Optional: read event capacity
-  let capDefault = 30;
+  // capacity defaults
+  let capDefault = 45;
   if (Event) {
     try {
-      const ev = await Event.findById(eventId).select("b2bCapacity").lean();
+      const ev = await Event.findById(eventId).select('b2bCapacity').lean();
       if (Number(ev?.b2bCapacity) > 0) capDefault = Number(ev.b2bCapacity);
-    } catch {
-      /* ignore */
-    }
+    } catch {}
   }
-  console.log("capDefault", capDefault);
-
-  if (!Schedule) {
-    return res
-      .status(500)
-      .json({ message: "Schedule model not found on server" });
+  let capHybridDefault = 5;
+  if (Event) {
+    try {
+      const ev2 = await Event.findById(eventId).select('postsCount').lean();
+      if (Number(ev2?.postsCount) > 0) capHybridDefault = Number(ev2.postsCount);
+    } catch {}
   }
+  if (!Schedule) return res.status(500).json({ message: 'Schedule model not found on server' });
 
-  // Day bounds in UTC
-  const dayStart = new Date(`${dateParam}T00:00:00.000Z`);
-  const dayEndEx = new Date(`${dateParam}T24:00:00.000Z`); // exclusive
+  // day window
+  const dayStart   = new Date(`${dateParam}T00:00:00.000Z`);
+  const dayEndEx   = new Date(`${dateParam}T24:00:00.000Z`);
   const dayStartMs = dayStart.getTime();
-  const dayEndMs = dayEndEx.getTime();
-  const STEP = 30 * 60 * 1000;
+  const dayEndMs   = dayEndEx.getTime();
 
-  let slotSet = new Set();
-
+  // base grid (30-min)
+  const slotSet = new Set();
   if (bothVirtual) {
-    // === PATCH START: full-day grid (virtual x virtual) ===
-    for (let t = Math.ceil(dayStartMs / STEP) * STEP; t <= dayEndMs; t += STEP) {
+    for (let t = Math.ceil(dayStartMs / STEP_MS) * STEP_MS; t <= dayEndMs; t += STEP_MS) {
       slotSet.add(new Date(t).toISOString());
     }
-    // === PATCH END ===
   } else {
-    // Original behavior: limit to B2B sessions for the day
     const b2bRx = /b2b/i;
     const sessions = await Schedule.find({
       $and: [
@@ -2644,134 +2719,169 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
           ],
         },
       ],
-    })
-      .select("track startTime endTime startAt endAt start end")
-      .lean();
+    }).select('track startTime endTime startAt endAt start end').lean();
 
-    // 2) Build 30-min grid inside each session and union them
     if (Array.isArray(sessions) && sessions.length) {
       for (const s of sessions) {
-        const S = pickTime(s, "startTime", "startAt", "start");
-        const E = pickTime(s, "endTime", "endAt", "end");
+        const S = pickTime(s, 'startTime', 'startAt', 'start');
+        const E = pickTime(s, 'endTime', 'endAt', 'end');
         if (!S || !E) continue;
-
-        // Intersect with requested day
         const segStart = Math.max(S.getTime(), dayStartMs);
         const segEnd   = Math.min(E.getTime(), dayEndMs);
-        if (segEnd - segStart < STEP) continue;
-
-        // Round up segStart to 30min grid
-        for (let t = Math.ceil(segStart / STEP) * STEP; t <= segEnd; t += STEP) {
+        if (segEnd - segStart < STEP_MS) continue;
+        for (let t = Math.ceil(segStart / STEP_MS) * STEP_MS; t <= segEnd; t += STEP_MS) {
           slotSet.add(new Date(t).toISOString());
         }
       }
     }
   }
+  if (!slotSet.size) return res.json({ success: true, count: 0, data: [], tz: 'UTC' });
 
-  // short-circuit if no base slots
-  if (!slotSet.size) {
-    return res.json({ success: true, count: 0, data: [], tz: "UTC" });
-  }
-  // 3) Busy set for BOTH participants:
+  // busy (locks + requests)
   const dayStartISO = dayStart.toISOString();
-  const dayEndISO = dayEndEx.toISOString();
-
+  const dayEndISO   = dayEndEx.toISOString();
   const [locks, requests] = await Promise.all([
-    // Accepted/confirmed locks
     SlotIndex.find({
       eventId,
       actorId: { $in: [senderId, receiverId] },
       slotISO: { $gte: dayStartISO, $lt: dayEndISO },
-    })
-      .select("slotISO")
-      .lean(),
-
-    // Requests occupying that day (either participant)
+    }).select('slotISO').lean(),
     MeetRequest.find({
       eventId,
-      status: {
-        $in: [
-          "pending",
-          "accepted",
-          "confirmed",
-          "reschedule-proposed",
-          "rescheduled",
-        ],
-      },
+      status: { $in: ['pending','accepted','confirmed','reschedule-proposed','rescheduled'] },
       $and: [
-        {
-          $or: [
-            { senderId: senderId },
-            { receiverId: senderId },
-            { senderId: receiverId },
-            { receiverId: receiverId },
-          ],
-        },
-        {
-          $or: [
-            { requestedAt: { $gte: dayStart, $lt: dayEndEx } },
-            { proposedNewAt: { $gte: dayStart, $lt: dayEndEx } },
-          ],
-        },
+        { $or: [
+          { senderId: senderId }, { receiverId: senderId },
+          { senderId: receiverId }, { receiverId: receiverId },
+        ]},
+        { $or: [
+          { requestedAt:  { $gte: dayStart, $lt: dayEndEx } },
+          { proposedNewAt:{ $gte: dayStart, $lt: dayEndEx } },
+        ]},
       ],
-    })
-      .select("requestedAt proposedNewAt")
-      .lean(),
+    }).select('requestedAt proposedNewAt').lean(),
   ]);
 
   const busy = new Set([
-    ...locks.map((b) => new Date(b.slotISO).toISOString()),
-    ...requests.flatMap((r) => {
+    ...locks.map(b => iso(b.slotISO)),
+    ...requests.flatMap(r => {
       const out = [];
-      if (r.requestedAt) out.push(new Date(r.requestedAt).toISOString());
-      if (r.proposedNewAt) out.push(new Date(r.proposedNewAt).toISOString());
+      if (r.requestedAt)   out.push(iso(r.requestedAt));
+      if (r.proposedNewAt) out.push(iso(r.proposedNewAt));
       return out;
     }),
   ]);
-  console.log("busy slots for sender/receiver:", busy.size);
 
-  // 4) Filter out busy slots
-  const grid = Array.from(slotSet).filter((iso) => !busy.has(iso));
-  console.log("free slots after busy filtering:", grid.length);
-
-  if (!grid.length) {
-    return res.json({ success: true, count: 0, data: [], tz: "UTC" });
+  const allFreeGrid = Array.from(slotSet).filter(s => !busy.has(s));
+  if (!allFreeGrid.length) {
+    return res.json({ success: true, count: 0, data: [], tz: 'UTC' });
   }
 
+  // whitelist
+  const ignoreWhitelist = String(req.query?.ignoreWhitelist || '') === '1';
+  const [wSender, wReceiver] = await Promise.all([
+    SlotWhitelist.findOne({ eventId, actorId: senderId   }).select('slots').lean(),
+    SlotWhitelist.findOne({ eventId, actorId: receiverId }).select('slots').lean(),
+  ]);
+
+  const senderHasWl   = !!(wSender?.slots?.length);
+  const receiverHasWl = !!(wReceiver?.slots?.length);
+
+  // Only current day slots
+  const wS = senderHasWl
+    ? toSetISO((wSender.slots || []).filter(d => d >= dayStart && d < dayEndEx))
+    : null;
+  const wR = receiverHasWl
+    ? toSetISO((wReceiver.slots || []).filter(d => d >= dayStart && d < dayEndEx))
+    : null;
+
+  // Enforce intersection only when not ignoring AND at least one list exists (your original rule)
+  let grid = allFreeGrid;
+  let filteredOut = 0;
+  const shouldEnforce = !ignoreWhitelist && (senderHasWl || receiverHasWl);
+  if (shouldEnforce) {
+    grid = allFreeGrid.filter(sISO => {
+      const passSender   = !senderHasWl   || (wS && wS.has(sISO));
+      const passReceiver = !receiverHasWl || (wR && wR.has(sISO));
+      return passSender && passReceiver;
+    });
+    filteredOut = allFreeGrid.length - grid.length;
+  }
+
+  // capacity lookups for the resulting grid
   let countMap = new Map();
-  if (!bothVirtual && MeetingSlot) {
+  if (!bothVirtual && grid.length) {
     try {
-      const msRows = await MeetingSlot.find({
-        eventId,
-        slotISO: { $in: grid.map((iso) => new Date(iso)) },
-      })
-        .select("slotISO used cap")
-        .lean();
-
-      countMap = new Map(
-        msRows.map((r) => [
-          new Date(r.slotISO).toISOString(),
-          { used: Number(r.used || 0), cap: Number(r.cap || capDefault) },
-        ])
-      );
+      if (halfVirtual) {
+        const rowsH = await HybridMeetingSlot.find({
+          eventId, slotISO: { $in: grid.map(s => new Date(s)) }
+        }).select('slotISO used cap').lean();
+        countMap = new Map(rowsH.map(r => [ iso(r.slotISO), { used:Number(r.used||0), cap:Number(r.cap||capHybridDefault) } ]));
+      } else {
+        const rowsP = await MeetingSlot.find({
+          eventId, slotISO: { $in: grid.map(s => new Date(s)) }
+        }).select('slotISO used cap').lean();
+        countMap = new Map(rowsP.map(r => [ iso(r.slotISO), { used:Number(r.used||0), cap:Number(r.cap||capDefault) } ]));
+      }
     } catch (e) {
-      console.warn("[listAvailableSlots] MeetingSlot read failed:", e?.message);
+      console.warn('[listAvailableSlots] slot read failed:', e?.message);
     }
   }
-  const data = grid.sort().map((iso) => {
+
+  // Build final rows + CORRECT whitelist flags
+  const data = grid.sort().map((sISO) => {
+    // IMPORTANT: wl flags reflect *actual list presence*; if list absent => false
+    const wlSender   = senderHasWl   ? !!wS?.has(sISO) : false;
+    const wlReceiver = receiverHasWl ? !!wR?.has(sISO) : false;
+
+    // Block from current user's POV when we're *not* in ignore mode:
+    // - If receiver has no whitelist at all => blockedOther = true (everything blocked by them)
+    // - Else blocked if this specific slot is not in receiver's whitelist
+    const blockedOther = !ignoreWhitelist && (!receiverHasWl || !wlReceiver);
+
     if (bothVirtual) {
-      // No physical room usage/limits for virtual x virtual
-      return { iso, used: 0, cap: Number.POSITIVE_INFINITY, isCap: true };
+      return {
+        iso: sISO, used: 0, cap: Number.POSITIVE_INFINITY, isCap: true, kind: 'virtual',
+        wlSender, wlReceiver, blockedOther
+      };
     }
-    const info = countMap.get(iso);
+
+    const info = countMap.get(sISO);
     const used = info?.used ?? 0;
-    const cap = info?.cap ?? capDefault;
-    const isCap = used < cap && used < 30; // keep your hard ceiling for physical/hybrid
-    return { iso, used, cap, isCap };
+    const cap  = info?.cap  ?? (halfVirtual ? capHybridDefault : capDefault);
+    const hardCeil = 30;
+    const isCap = used < cap && (halfVirtual ? used < cap : used < hardCeil);
+
+    return {
+      iso: sISO, used, cap, isCap, kind: halfVirtual ? 'hybrid' : 'physical',
+      wlSender, wlReceiver, blockedOther
+    };
   });
 
-  return res.json({ success: true, count: data.length, data, tz: "UTC" });
+  const actorHasWhitelist    = senderHasWl;
+  const receiverHasWhitelist = receiverHasWl;
+  const whitelistStatus =
+    actorHasWhitelist && receiverHasWhitelist ? 'both' :
+    actorHasWhitelist ? 'sender' :
+    receiverHasWhitelist ? 'receiver' : 'none';
+
+  return res.json({
+    success: true,
+    count: data.length,
+    data,
+    tz: 'UTC',
+    actorHasWhitelist,
+    receiverHasWhitelist,
+    whitelistStatus,
+    allFreeCount: allFreeGrid.length,
+    filteredOut,
+    enforced: shouldEnforce,
+    ignoreWhitelist
+  });
 });
+
+
+
 
 exports.cancelMeeting = asyncHandler(async (req, res) => {
   const { id } = req.params;
@@ -2984,4 +3094,605 @@ exports.checkMeetingExist = asyncHandler(async (req, res) => {
   else if (st === "declined" || st === "cancelled") exist = "refused";
 
   return res.json({ success: true, exist });
+});
+exports.adminListMeets = asyncHandler(async (req, res) => {
+
+  const { eventId, status, from, to, q } = req.query || {};
+  const find = {};
+  if (eventId && mongoose.isValidObjectId(eventId)) find.eventId = eventId;
+  if (status) find.status = status;
+
+  if (from || to) {
+    find.slotISO = {};
+    if (from) find.slotISO.$gte = new Date(from);
+    if (to)   find.slotISO.$lte = new Date(to);
+  }
+  if (q) {
+    const rx = new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    find.$or = [
+      { subject: rx },
+      { message: rx }
+    ];
+  }
+
+  const rows = await MeetRequest.find(find)
+    .sort({ slotISO: 1, requestedAt: 1 })
+    .lean();
+
+  const data = await attachParticipants(rows);
+  return res.json({ success: true, count: data.length, data });
+});
+
+/* ──────────────────────── ADMIN: get one meeting ─────────────────────── */
+// GET /admin/meets/:id
+exports.adminGetMeet = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: 'Bad id' });
+
+  const row = await MeetRequest.findById(id).lean();
+  if (!row) return res.status(404).json({ message: 'Not found' });
+
+  const [enriched] = await attachParticipants([row]);
+  const attendance = await MeetingAttendance.find({ meetingId: id }).lean();
+  return res.json({ success: true, data: { ...enriched, attendance } });
+});
+
+/* ───────────────────────── ADMIN: calendar feed ──────────────────────── */
+// GET /admin/meets/calendar?eventId=&from=&to=
+exports.adminCalendar = asyncHandler(async (req, res) => {
+  const eventId = req.query?.eventId;
+  const fromISO  = req.query?.from;
+  const toISO    = req.query?.to;
+
+  if (!mongoose.isValidObjectId(eventId)) {
+    return res.status(400).json({ message: 'Bad id' });
+  }
+  const from = fromISO ? new Date(fromISO) : null;
+  const to   = toISO   ? new Date(toISO)   : null;
+
+  // Load slots from both physical and hybrid buckets within range (optional)
+  const slotQ = { eventId };
+  if (from && to) slotQ.slotISO = { $gte: from, $lte: to };
+
+  const [phys, hybrid] = await Promise.all([
+    MeetingSlot.find(slotQ).select('slotISO used cap').lean(),
+    HybridMeetingSlot.find(slotQ).select('slotISO used cap').lean(),
+  ]);
+
+  // Index by slotISO string
+  const byISO = new Map();
+  const asKey = (d) => new Date(d).toISOString();
+
+  for (const r of phys) {
+    const k = asKey(r.slotISO);
+    if (!byISO.has(k)) byISO.set(k, { slotISO: k, capPhysical: 0, usedPhysical: 0, capHybrid: 0, usedHybrid: 0, cnt: { physical:0, hybrid:0, virtual:0 } });
+    const it = byISO.get(k);
+    it.capPhysical = Math.max(it.capPhysical, Number(r.cap || 0));
+    it.usedPhysical = Math.max(it.usedPhysical, Number(r.used || 0)); // peak usage for the slot
+  }
+  for (const r of hybrid) {
+    const k = asKey(r.slotISO);
+    if (!byISO.has(k)) byISO.set(k, { slotISO: k, capPhysical: 0, usedPhysical: 0, capHybrid: 0, usedHybrid: 0, cnt: { physical:0, hybrid:0, virtual:0 } });
+    const it = byISO.get(k);
+    it.capHybrid = Math.max(it.capHybrid, Number(r.cap || 0));
+    it.usedHybrid = Math.max(it.usedHybrid, Number(r.used || 0));
+  }
+
+  // Count meetings per mode at each slot
+  const meetQ = { eventId };
+  if (from && to) {
+    meetQ.slotISO = { $gte: from, $lte: to };
+  }
+  const meets = await MeetRequest.find(meetQ)
+    .select('slotISO senderId senderRole receiverId receiverRole status tableId')
+    .lean();
+
+  // Cache virtual flags per actor
+  const vCache = new Map();
+  async function getVirtual(role, id) {
+    const key = `${role}:${id}`;
+    if (vCache.has(key)) return vCache.get(key);
+    const meta = await readActorMeta(role, id);
+    vCache.set(key, meta.virtual);
+    return meta.virtual;
+  }
+
+  for (const m of meets) {
+    const k = asKey(m.slotISO);
+    if (!byISO.has(k)) {
+      byISO.set(k, { slotISO: k, capPhysical: 0, usedPhysical: 0, capHybrid: 0, usedHybrid: 0, cnt: { physical:0, hybrid:0, virtual:0 } });
+    }
+  }
+
+  // Resolve modes (batched to reduce round trips)
+  const toResolve = [];
+  for (const m of meets) {
+    toResolve.push([m.senderRole, m.senderId]);
+    toResolve.push([m.receiverRole, m.receiverId]);
+  }
+  // de-dup & resolve
+  const uniqPairs = Array.from(new Set(toResolve.map(([r,i]) => `${r}:${i}`))).map(s => s.split(':'));
+  await Promise.all(uniqPairs.map(async ([role,id]) => { await getVirtual(role, id); }));
+
+  for (const m of meets) {
+    const k = asKey(m.slotISO);
+    const sV = await getVirtual(m.senderRole, m.senderId);
+    const rV = await getVirtual(m.receiverRole, m.receiverId);
+    const mode = computeMode(sV, rV);
+    const it = byISO.get(k);
+    it.cnt[mode] = (it.cnt[mode] || 0) + 1;
+  }
+
+  // Add localized labels for UI/export
+  const tz = await readEventTZ(eventId);
+  const data = Array.from(byISO.values())
+    .sort((a,b) => new Date(a.slotISO) - new Date(b.slotISO))
+    .map((s) => {
+      const loc = localizeSlot(s.slotISO, tz);
+      return {
+        ...s,
+        tz,
+        localDate: loc.localDate,
+        localTime: loc.localTime,
+        // totals per slot
+        totalMeetings: (s.cnt.physical || 0) + (s.cnt.hybrid || 0) + (s.cnt.virtual || 0),
+      };
+    });
+
+  return res.json({ success: true, data, count: data.length, tz });
+});
+
+/* ───────────────────────── ADMIN: create meeting ─────────────────────── */
+// POST /admin/meets  { eventId, senderId, senderRole, receiverId, receiverRole, slotISO, subject, message }
+exports.adminCreateMeet = asyncHandler(async (req, res) => {
+
+  const { eventId, senderId, senderRole, receiverId, receiverRole, slotISO, subject, message } = req.body || {};
+  for (const [k,v] of Object.entries({ eventId, senderId, receiverId, slotISO, subject })) {
+    if (!v) return res.status(400).json({ message: `Missing ${k}` });
+  }
+  if (![senderRole, receiverRole].every(r => ['attendee','exhibitor','speaker'].includes(String(r).toLowerCase())))
+    return res.status(400).json({ message: 'Bad roles' });
+
+  const iso = new Date(slotISO);
+  if (isNaN(iso.getTime())) return res.status(400).json({ message: 'Bad slotISO' });
+
+  // busy/conflict guard
+  const busy = await existsBusyAt(eventId, iso.toISOString(), [senderId, receiverId]);
+  if (busy) return res.status(409).json({ message: 'One of the participants is busy at that time' });
+
+  // virtual flags (decide counters + table)
+  const { senderVirtual, receiverVirtual } = await loadVirtualFlags(senderId, receiverId);
+  const bothVirtual = senderVirtual && receiverVirtual;
+  const halfVirtual = senderVirtual !== receiverVirtual;
+
+  // ensure counter doc & capacity
+  if (!bothVirtual) await ensureCapDoc(eventId, iso.toISOString());
+
+  // increment correct counter
+  if (!bothVirtual) {
+    if (halfVirtual) {
+      let hDoc = await HybridMeetingSlot.findOne({ eventId, slotISO: iso }).lean();
+      if (!hDoc) {
+        const ev = await Event.findById(eventId).select('postsCount').lean();
+        const cap = Number(ev?.postsCount) > 0 ? Number(ev.postsCount) : 10;
+        try { hDoc = await HybridMeetingSlot.create({ eventId, slotISO: iso, used: 0, cap }); }
+        catch { hDoc = await HybridMeetingSlot.findOne({ eventId, slotISO: iso }).lean(); }
+      }
+      if (Number(hDoc.used || 0) >= Number(hDoc.cap || 0)) return res.status(409).json({ message: 'Hybrid slot full' });
+      await HybridMeetingSlot.updateOne({ eventId, slotISO: iso }, { $inc: { used: 1 } }, { upsert: true });
+    } else {
+      await MeetingSlot.updateOne({ eventId, slotISO: iso }, { $inc: { used: 1 } }, { upsert: true });
+    }
+  }
+
+  // create meet (confirmed by admin right away)
+  const doc = await MeetRequest.create({
+    eventId,
+    senderId, senderRole,
+    receiverId, receiverRole,
+    subject: String(subject || ''),
+    message: String(message || ''),
+    requestedAt: iso,
+    slotISO: iso,
+    status: 'confirmed'
+  });
+
+  // lock both actors, set table and meet link
+  await lockActors(eventId, iso.toISOString(), senderId, receiverId);
+
+  const FRONT_URL = (process.env.FRONTEND_URL || '').replace(/\/+$/, '') || '#';
+  const upd = { meetLink: `${FRONT_URL}/vmeet/${String(doc._id)}` };
+  if (!bothVirtual) {
+    const idx = await reserveTableIndex(eventId, iso);
+    upd.tableId = tableCodeFromIndex(idx, 3);
+  }
+  await MeetRequest.updateOne({ _id: doc._id }, { $set: upd });
+
+  const finalDoc = await MeetRequest.findById(doc._id).lean();
+  try { await sendConfirmEmailsWithPDF(finalDoc); } catch(e) { console.warn('[adminCreateMeet] email failed', e?.message); }
+
+  return res.status(201).json({ success: true, data: finalDoc });
+});
+
+/* ───────────────────────── ADMIN: delete meeting ───────────────────── */
+// DELETE /admin/meets/:id
+exports.adminDeleteMeet = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: 'Bad id' });
+
+  const meet = await MeetRequest.findById(id).lean();
+  if (!meet) return res.status(404).json({ message: 'Not found' });
+
+  // unlock actors + decrement counters (if confirmed)
+  const slotISO = meet.slotISO ? new Date(meet.slotISO).toISOString() : null;
+  if (slotISO) await unlockActors(meet.eventId, slotISO, meet.senderId, meet.receiverId);
+
+  // decide which counter to decrement (best effort)
+  try {
+    const { senderVirtual, receiverVirtual } = await loadVirtualFlags(meet.senderId, meet.receiverId);
+    if (!(senderVirtual && receiverVirtual) && slotISO) {
+      const half = senderVirtual !== receiverVirtual;
+      if (half) {
+        await HybridMeetingSlot.updateOne(
+          { eventId: meet.eventId, slotISO: new Date(slotISO), used: { $gt: 0 } },
+          { $inc: { used: -1 } }
+        );
+      } else {
+        await MeetingSlot.updateOne(
+          { eventId: meet.eventId, slotISO: new Date(slotISO), used: { $gt: 0 } },
+          { $inc: { used: -1 } }
+        );
+      }
+    }
+  } catch {}
+
+  await MeetingAttendance.deleteMany({ meetingId: id });
+  await MeetRequest.deleteOne({ _id: id });
+  return res.json({ success: true, message: 'Deleted' });
+});
+/* ───────────────────────── ADMIN: create meeting ─────────────────────── */
+// POST /admin/meets  { eventId, senderId, senderRole, receiverId, receiverRole, slotISO, subject, message }
+exports.adminCreateMeet = asyncHandler(async (req, res) => {
+
+  const { eventId, senderId, senderRole, receiverId, receiverRole, slotISO, subject, message } = req.body || {};
+  for (const [k,v] of Object.entries({ eventId, senderId, receiverId, slotISO, subject })) {
+    if (!v) return res.status(400).json({ message: `Missing ${k}` });
+  }
+  if (![senderRole, receiverRole].every(r => ['attendee','exhibitor','speaker'].includes(String(r).toLowerCase())))
+    return res.status(400).json({ message: 'Bad roles' });
+
+  const iso = new Date(slotISO);
+  if (isNaN(iso.getTime())) return res.status(400).json({ message: 'Bad slotISO' });
+
+  // busy/conflict guard
+  const busy = await existsBusyAt(eventId, iso.toISOString(), [senderId, receiverId]);
+  if (busy) return res.status(409).json({ message: 'One of the participants is busy at that time' });
+
+  // virtual flags (decide counters + table)
+  const { senderVirtual, receiverVirtual } = await loadVirtualFlags(senderId, receiverId);
+  const bothVirtual = senderVirtual && receiverVirtual;
+  const halfVirtual = senderVirtual !== receiverVirtual;
+
+  // ensure counter doc & capacity
+  if (!bothVirtual) await ensureCapDoc(eventId, iso.toISOString());
+
+  // increment correct counter
+  if (!bothVirtual) {
+    if (halfVirtual) {
+      let hDoc = await HybridMeetingSlot.findOne({ eventId, slotISO: iso }).lean();
+      if (!hDoc) {
+        const ev = await Event.findById(eventId).select('postsCount').lean();
+        const cap = Number(ev?.postsCount) > 0 ? Number(ev.postsCount) : 10;
+        try { hDoc = await HybridMeetingSlot.create({ eventId, slotISO: iso, used: 0, cap }); }
+        catch { hDoc = await HybridMeetingSlot.findOne({ eventId, slotISO: iso }).lean(); }
+      }
+      if (Number(hDoc.used || 0) >= Number(hDoc.cap || 0)) return res.status(409).json({ message: 'Hybrid slot full' });
+      await HybridMeetingSlot.updateOne({ eventId, slotISO: iso }, { $inc: { used: 1 } }, { upsert: true });
+    } else {
+      await MeetingSlot.updateOne({ eventId, slotISO: iso }, { $inc: { used: 1 } }, { upsert: true });
+    }
+  }
+
+  // create meet (confirmed by admin right away)
+  const doc = await MeetRequest.create({
+    eventId,
+    senderId, senderRole,
+    receiverId, receiverRole,
+    subject: String(subject || ''),
+    message: String(message || ''),
+    requestedAt: iso,
+    slotISO: iso,
+    status: 'confirmed'
+  });
+
+  // lock both actors, set table and meet link
+  await lockActors(eventId, iso.toISOString(), senderId, receiverId);
+
+  const FRONT_URL = (process.env.FRONTEND_URL || '').replace(/\/+$/, '') || '#';
+  const upd = { meetLink: `${FRONT_URL}/vmeet/${String(doc._id)}` };
+  if (!bothVirtual) {
+    const idx = await reserveTableIndex(eventId, iso);
+    upd.tableId = tableCodeFromIndex(idx, 3);
+  }
+  await MeetRequest.updateOne({ _id: doc._id }, { $set: upd });
+
+  const finalDoc = await MeetRequest.findById(doc._id).lean();
+  try { await sendConfirmEmailsWithPDF(finalDoc); } catch(e) { console.warn('[adminCreateMeet] email failed', e?.message); }
+
+  return res.status(201).json({ success: true, data: finalDoc });
+});
+
+/* ───────────────────────── ADMIN: delete meeting ───────────────────── */
+// DELETE /admin/meets/:id
+exports.adminDeleteMeet = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: 'Bad id' });
+
+  const meet = await MeetRequest.findById(id).lean();
+  if (!meet) return res.status(404).json({ message: 'Not found' });
+
+  // unlock actors + decrement counters (if confirmed)
+  const slotISO = meet.slotISO ? new Date(meet.slotISO).toISOString() : null;
+  if (slotISO) await unlockActors(meet.eventId, slotISO, meet.senderId, meet.receiverId);
+
+  // decide which counter to decrement (best effort)
+  try {
+    const { senderVirtual, receiverVirtual } = await loadVirtualFlags(meet.senderId, meet.receiverId);
+    if (!(senderVirtual && receiverVirtual) && slotISO) {
+      const half = senderVirtual !== receiverVirtual;
+      if (half) {
+        await HybridMeetingSlot.updateOne(
+          { eventId: meet.eventId, slotISO: new Date(slotISO), used: { $gt: 0 } },
+          { $inc: { used: -1 } }
+        );
+      } else {
+        await MeetingSlot.updateOne(
+          { eventId: meet.eventId, slotISO: new Date(slotISO), used: { $gt: 0 } },
+          { $inc: { used: -1 } }
+        );
+      }
+    }
+  } catch {}
+
+  await MeetingAttendance.deleteMany({ meetingId: id });
+  await MeetRequest.deleteOne({ _id: id });
+  return res.json({ success: true, message: 'Deleted' });
+});
+/* ─────────────── ADMIN: mark attendance (physical or virtual) ───────────── */
+// POST /admin/meets/:id/attendance { actorId, kind: 'physical'|'virtual', attended: true|false }
+exports.adminMarkAttendance = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { actorId, kind = 'physical', attended = true } = req.body || {};
+  if (!mongoose.isValidObjectId(id) || !mongoose.isValidObjectId(actorId))
+    return res.status(400).json({ message: 'Bad ids' });
+  if (!['physical','virtual'].includes(kind)) return res.status(400).json({ message: 'Bad kind' });
+
+  const meet = await MeetRequest.findById(id).lean();
+  if (!meet) return res.status(404).json({ message: 'Meeting not found' });
+
+  await MeetingAttendance.updateOne(
+    { meetingId: id, actorId, kind },
+    { $set: { meetingId: id, eventId: meet.eventId, actorId, kind, attended: !!attended, at: new Date(), by: req.user._id } },
+    { upsert: true }
+  );
+  const recs = await MeetingAttendance.find({ meetingId: id }).lean();
+  return res.json({ success: true, data: recs });
+});
+
+/* ─────────────── ADMIN: generate/set Google Meet (or redirect link) ──────── */
+// POST /admin/meets/:id/link { link? }  -> if link omitted, we set your redirect link
+exports.adminSetVirtualLink = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { link } = req.body || {};
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: 'Bad id' });
+
+  const meet = await MeetRequest.findById(id).lean();
+  if (!meet) return res.status(404).json({ message: 'Meeting not found' });
+
+  const FRONT_URL = (process.env.FRONTEND_URL || '').replace(/\/+$/, '') || '#';
+  const meetLink = link && /^https?:\/\//i.test(link) ? link : `${FRONT_URL}/vmeet/${String(meet._id)}`;
+  await MeetRequest.updateOne({ _id: id }, { $set: { meetLink } });
+
+  const updated = await MeetRequest.findById(id).lean();
+  return res.json({ success: true, data: { id: String(updated._id), meetLink: updated.meetLink } });
+});
+/* ───────────────────────── ADMIN: stats for an event ───────────────────── */
+// GET /admin/meets/stats/:eventId
+exports.adminMeetStats = asyncHandler(async (req, res) => {
+  const { eventId } = req.params || {};
+  if (!mongoose.isValidObjectId(eventId)) return res.status(400).json({ message: 'Bad eventId' });
+
+  const base = { eventId: new mongoose.Types.ObjectId(eventId) };
+
+  const byStatus = await MeetRequest.aggregate([
+    { $match: base },
+    { $group: { _id: '$status', n: { $sum: 1 } } }
+  ]);
+
+  const byDay = await MeetRequest.aggregate([
+    { $match: base },
+    { $project: { day: { $dateToString: { date: '$slotISO', timezone: 'UTC', format: '%Y-%m-%d' } } } },
+    { $group: { _id: '$day', n: { $sum: 1 } } },
+    { $sort: { _id: 1 } }
+  ]);
+
+  // physical/hybrid/virtual breakdown (approx by current virtual flags)
+  const rows = await MeetRequest.find(base).select('senderId receiverId slotISO').lean();
+  let phys=0, hybrid=0, virt=0;
+  for (const r of rows) {
+    const { senderVirtual, receiverVirtual } = await loadVirtualFlags(r.senderId, r.receiverId);
+    if (senderVirtual && receiverVirtual) virt++;
+    else if (senderVirtual !== receiverVirtual) hybrid++;
+    else phys++;
+  }
+
+  // attendance
+  const att = await MeetingAttendance.aggregate([
+    { $match: base },
+    { $group: { _id: { kind: '$kind', attended: '$attended' }, n: { $sum: 1 } } }
+  ]);
+
+  return res.json({
+    success: true,
+    data: {
+      counts: Object.fromEntries(byStatus.map(x => [x._id || 'unknown', x.n])),
+      byDay: byDay.map(x => ({ day: x._id, count: x.n })),
+      modes: { physical: phys, hybrid, virtual: virt },
+      attendance: att.map(x => ({ kind: x._id.kind, attended: !!x._id.attended, count: x.n }))
+    }
+  });
+});
+// === PATCH START: adminListSlots (calendar-safe id + per-slot stats) ===
+// GET /admin/meets/slots?eventId=...&from=...&to=...&tz=Africa/Tunis
+exports.adminListSlots = asyncHandler(async (req, res) => {
+  const { eventId, from, to, tz = (process.env.TZ || 'Africa/Tunis') } = req.query || {};
+  if (!mongoose.isValidObjectId(eventId)) return res.status(400).json({ message: 'Bad eventId' });
+
+  const start = from ? new Date(from) : new Date();
+  const end   = to   ? new Date(to)   : new Date(start.getTime() + 24*3600*1000);
+  if (isNaN(start) || isNaN(end) || end <= start) return res.status(400).json({ message:'Bad range' });
+
+  // Build 30-min slots
+  const grid = [];
+  let t = new Date(Math.floor(start.getTime()/60000)*60000);
+  while (t < end) { grid.push(new Date(t).toISOString()); t = new Date(t.getTime()+30*60000); }
+
+  // Pull caps/usage for physical tables
+  const [physDocs, hybDocs] = await Promise.all([
+    MeetingSlot.find({ eventId, slotISO: { $gte: start, $lt: end }}).lean(),
+    HybridMeetingSlot.find({ eventId, slotISO: { $gte: start, $lt: end }}).lean(),
+  ]);
+
+  const physMap = new Map();
+  const hybMap  = new Map();
+  let capDefault = 0, hybridCap = 0;
+
+  for (const d of physDocs) {
+    const k = new Date(d.slotISO).toISOString();
+    physMap.set(k, { used: Number(d.used||0), cap: Number(d.cap||0) });
+    capDefault = Math.max(capDefault, Number(d.cap||0));
+  }
+  for (const d of hybDocs) {
+    const k = new Date(d.slotISO).toISOString();
+    hybMap.set(k, { used: Number(d.used||0), cap: Number(d.cap||0) });
+    hybridCap = Math.max(hybridCap, Number(d.cap||0));
+  }
+
+  // Count virtual-eligible meetings per slot (both participants marked virtual)
+  const meets = await MeetRequest.find({
+    eventId,
+    slotISO: { $gte: start, $lt: end },
+    status: { $in: ['pending','rescheduled','confirmed'] }
+  }).select('slotISO senderId receiverId').lean();
+
+  // cache actor virtual flags in bulk
+  const idSet = new Set();
+  for (const m of meets) { idSet.add(String(m.senderId)); idSet.add(String(m.receiverId)); }
+  const [as, xs, ss] = await Promise.all([
+    attendee.find({ _id: { $in: Array.from(idSet) } }).select('virtualMeet').lean(),
+    Exhibitor.find({ _id: { $in: Array.from(idSet) } }).select('virtualMeet').lean(),
+    Speaker.find({ _id: { $in: Array.from(idSet) } }).select('virtualMeet').lean(),
+  ]);
+  const vmap = new Map();
+  for (const d of [...as, ...xs, ...ss]) vmap.set(String(d._id), !!d.virtualMeet);  // ← small bugfix to your prev snippet
+
+  const virtCount = new Map();
+  for (const m of meets) {
+    const sV = !!vmap.get(String(m.senderId));
+    const rV = !!vmap.get(String(m.receiverId));
+    if (sV && rV && m.slotISO) {
+      const k = new Date(m.slotISO).toISOString();
+      virtCount.set(k, (virtCount.get(k) || 0) + 1);
+    }
+  }
+
+  const fmtTZDate = (iso, z) => new Date(iso).toLocaleDateString('en-GB', { timeZone: z });
+  const fmtTZTime = (iso, z) => new Date(iso).toLocaleTimeString([], { timeZone: z, hour:'2-digit', minute:'2-digit' });
+
+  const data = grid.map((iso) => {
+    const p = physMap.get(iso) || { used: 0, cap: capDefault };
+    const h = hybMap.get(iso)  || { used: 0, cap: hybridCap };
+    const v = virtCount.get(iso) || 0;
+    return {
+      iso,
+      physical: { used: p.used, cap: p.cap },
+      hybrid  : { used: h.used, cap: h.cap },
+      virtual : { used: v },
+      localDate: fmtTZDate(iso, tz),
+      localTime: fmtTZTime(iso, tz),
+    };
+  });
+
+  return res.json({ success: true, tz, caps: { capDefault, hybridCap }, data });
+});
+// PUT /admin/meets/:id/reschedule
+exports.adminReschedule = asyncHandler(async (req,res)=>{
+  const { id } = req.params; const { slotISO } = req.body||{};
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message:'Bad id' });
+  const iso = new Date(slotISO); if (isNaN(iso)) return res.status(400).json({ message:'Bad slotISO' });
+
+  const meet = await MeetRequest.findById(id);
+  if (!meet) return res.status(404).json({ message:'Not found' });
+
+  // unlock old
+  if (meet.slotISO) await unlockActors(meet.eventId, new Date(meet.slotISO).toISOString(), meet.senderId, meet.receiverId);
+
+  // conflict guard
+  if (await existsBusyAt(meet.eventId, iso.toISOString(), [meet.senderId, meet.receiverId]))
+    return res.status(409).json({ message:'Busy at that time' });
+
+  // place into counters like adminCreateMeet
+  const { senderVirtual, receiverVirtual } = await loadVirtualFlags(meet.senderId, meet.receiverId);
+  const bothVirtual = senderVirtual && receiverVirtual;
+  const halfVirtual = senderVirtual !== receiverVirtual;
+  if (!bothVirtual){
+    await ensureCapDoc(meet.eventId, iso.toISOString());
+    if (halfVirtual) await HybridMeetingSlot.updateOne({ eventId: meet.eventId, slotISO: iso }, { $inc:{ used:1 } }, { upsert:true });
+    else             await MeetingSlot.updateOne({ eventId: meet.eventId, slotISO: iso }, { $inc:{ used:1 } }, { upsert:true });
+  }
+
+  meet.slotISO = iso; meet.status = 'rescheduled';
+  await meet.save();
+  await lockActors(meet.eventId, iso.toISOString(), meet.senderId, meet.receiverId);
+  return res.json({ success:true, data: await MeetRequest.findById(id).lean() });
+});
+
+// PUT /admin/meets/:id/table
+exports.adminSetTable = asyncHandler(async (req,res)=>{
+  const { id } = req.params; const { tableId } = req.body||{};
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message:'Bad id' });
+  await MeetRequest.updateOne({ _id:id }, { $set: { tableId: String(tableId||'').toUpperCase() }});
+  return res.json({ success:true });
+});
+exports.setWhitelist = asyncHandler(async (req, res) => {
+  const actorId = req.body?.actorId || req.user?._id;
+  const { eventId } = req.body || {};
+  const slots = Array.isArray(req.body?.slots) ? req.body.slots : [];
+
+  if (!mongoose.isValidObjectId(actorId)) return res.status(400).json({ message: 'Bad actorId' });
+  if (!mongoose.isValidObjectId(eventId)) return res.status(400).json({ message: 'Bad eventId' });
+
+  // normalize to 30-min UTC grid & unique
+  const normalized = Array.from(
+    new Set(slots.map(norm30).map(Number))
+  ).map((n) => new Date(n));
+
+  const doc = await SlotWhitelist.findOneAndUpdate(
+    { eventId, actorId },
+    { $set: { slots: normalized } },
+    { upsert: true, new: true }
+  ).lean();
+
+  res.json({ success: true, data: { eventId, actorId, slots: doc.slots.map(iso) } });
+});
+exports.adminSetWhitelist = asyncHandler(async (req,res)=>{
+  // requires your admin auth middleware
+  const { actorId, eventId, slots } = req.body || {};
+  if (!mongoose.isValidObjectId(actorId)) return res.status(400).json({ message: 'Bad actorId' });
+  if (!mongoose.isValidObjectId(eventId)) return res.status(400).json({ message: 'Bad eventId' });
+  const normalized = Array.from(new Set((Array.isArray(slots)?slots:[]).map(norm30).map(Number))).map(n=>new Date(n));
+  const doc = await SlotWhitelist.findOneAndUpdate(
+    { eventId, actorId }, { $set:{ slots: normalized } }, { upsert:true, new:true }
+  ).lean();
+  res.json({ success:true, data:{ eventId, actorId, slots: doc.slots.map(iso) }});
 });

@@ -14,7 +14,7 @@ const router   = express.Router();
 
 const meetsCtrl = require('../controllers/meetsController');
 const { protect }  = require('../middleware/authProtect');
-const { isAdmin }  = require('../middleware/roleGuard');
+const { isAdmin, isSuper }  = require('../middleware/roleGuard');
 
 /* ───────────────  CREATE REQUEST  ─────────────── */
 router.post('/', protect, meetsCtrl.requestMeeting);                 // Part 2
@@ -30,7 +30,7 @@ router.post('/exist',               protect, meetsCtrl.checkMeetingExist)
 router.get('/',                     protect, meetsCtrl.getMyMeetings);        // Part 4
 router.post('/actions',                     protect, meetsCtrl.makeMeetingAction);        // Part 4
 router.get('/suggested',                     protect, meetsCtrl.getSuggestedList);        // Part 4
-router.get('/meets/agenda/:actorId',     protect, isAdmin, meetsCtrl.listActorAgenda); // Part 4
+router.get('/meets/agenda/:actorId',     protect, (isAdmin || isSuper), meetsCtrl.listActorAgenda); // Part 4
 router.get('/meets/:id/ics',             protect, meetsCtrl.getMeetingICS);        // Part 5
 router.get('/meetings/prefs/:actorId', protect, meetsCtrl.getMeetingPrefs);
 /* ───────────────  AVAILABILITY  ──────────────── */
@@ -39,6 +39,21 @@ router.get('/events/:eventId/available-slots',
 
 /* ───────────────  REMINDERS (admin) ──────────── */
 router.get('/meets/reminders/:eventId',
-           protect, isAdmin, meetsCtrl.listMeetingReminders);                        // Part 6
+           protect, (isAdmin || isSuper), meetsCtrl.listMeetingReminders);                        // Part 6
 
+ router.get('/admin/meets', protect,(isAdmin || isSuper), meetsCtrl.adminListMeets);                 // list grid
+router.get('/admin/meets/:id', protect,(isAdmin || isSuper), meetsCtrl.adminGetMeet);               // item details (+ attendance)
+router.get('/admin/meets/calendar',(isAdmin || isSuper), protect, meetsCtrl.adminCalendar);         // calendar feed
+router.get('/admin/meets/stats/:eventId', protect, meetsCtrl.adminMeetStats);  // stats
+
+router.post('/admin/meets', protect,(isAdmin || isSuper), meetsCtrl.adminCreateMeet);               // create+confirm
+router.delete('/admin/meets/:id', protect,(isAdmin || isSuper), meetsCtrl.adminDeleteMeet);         // delete
+
+router.post('/admin/meets/:id/attendance',(isAdmin || isSuper), protect, meetsCtrl.adminMarkAttendance); // mark physical/virtual attendance
+router.post('/admin/meets/:id/link', protect,(isAdmin || isSuper), meetsCtrl.adminSetVirtualLink);       // set/overwrite virtual link
+router.get('/admin/meets/:id/reschedule', protect, meetsCtrl.adminReschedule);     
+router.post('/admin/meets/:id/table', protect, meetsCtrl.adminSetTable);
+router.put('/whitelist', protect, meetsCtrl.setWhitelist);
+
+router.put('meets/admin/whitelist', protect, meetsCtrl.adminSetWhitelist);
 module.exports = router;

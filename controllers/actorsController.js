@@ -484,7 +484,7 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
     });
   } else {
     created = await Speaker.create({
-      personal: { fullName: name, email, phone, country, city, profilePic: DEF_PHOTO },
+      personal: { fullName: name, email,firstEmail:email, phone, country, city, profilePic: DEF_PHOTO },
       organization: { orgName: orgName || 'Unknown', jobTitle: jobTitle || 'Expert', businessRole: 'Expert' },
       talk: {
         title: String(req.body?.talk?.title || 'Unknown'),
@@ -3171,24 +3171,27 @@ exports.listSpeakersForEvent = asyncHdl(async (req, res) => {
 });
 
 exports.getAttendeesForMeeting = asyncHdl(async (req, res) => {
+  // === Auth: must have a logged-in actor (use token) ===
+  const meId = req.user?._id || req.query.meId;
+  console.log(req.user);
+  if (!mongoose.isValidObjectId(meId)) {
+    return res.status(401).json({ message: "Auth required" });
+  }
+
   const { eventId, country, q } = req.query || {};
   const onlyOpen = String(req.query?.onlyOpen ?? 'true').toLowerCase() !== 'false'; // default true
 
+  // ---- Filters -----------------------------------------------------
   const match = {};
-
   if (eventId && mongoose.isValidObjectId(eventId)) {
     match.id_event = new mongoose.Types.ObjectId(eventId);
   }
-
   if (country && String(country).trim()) {
     match['personal.country'] = String(country).trim().toUpperCase();
   }
-
   if (onlyOpen) {
     match['matchingIntent.openToMeetings'] = true;
   }
-
-  // text search (case-insensitive) over common attendee fields
   if (q && String(q).trim()) {
     const rx = new RegExp(String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
     match.$or = [
@@ -3203,9 +3206,10 @@ exports.getAttendeesForMeeting = asyncHdl(async (req, res) => {
     ];
   }
 
-  // limit safeguard (page groups client-side)
+  // ---- Limit -------------------------------------------------------
   const limit = Math.min(Math.max(parseInt(req.query.limit || '500', 10) || 500, 20), 2000);
 
+  // ---- Pull candidates (attendees only for this endpoint) ----------
   const rows = await attendee.aggregate([
     { $match: match },
     { $sort: { id_event: 1, 'personal.fullName': 1 } },
@@ -3213,17 +3217,18 @@ exports.getAttendeesForMeeting = asyncHdl(async (req, res) => {
       $project: {
         _id: 1,
         id_event: 1,
-        verified: { $ifNull: ['$verified', false] },
+        verified:      { $ifNull: ['$verified', false] },
+        adminVerified: { $ifNull: ['$adminVerified', false] },
         links: {
           linkedin: { $ifNull: ['$links.linkedin', ''] },
           website:  { $ifNull: ['$links.website',  '' ] },
         },
         personal: {
-          fullName: { $ifNull: ['$personal.fullName', ''] },
-          email:    { $ifNull: ['$personal.email', '' ] },
-          country:  { $ifNull: ['$personal.country', '' ] },
-          city:     { $ifNull: ['$personal.city', '' ] },
-          profilePic: { $ifNull: ['$personal.profilePic', '' ] },
+          fullName:  { $ifNull: ['$personal.fullName',  '' ] },
+          email:     { $ifNull: ['$personal.email',     '' ] },
+          country:   { $ifNull: ['$personal.country',   '' ] },
+          city:      { $ifNull: ['$personal.city',      '' ] },
+          profilePic:{ $ifNull: ['$personal.profilePic','' ] },
           preferredLanguages: {
             $cond: [
               { $isArray: '$personal.preferredLanguages' },
@@ -3233,8 +3238,36 @@ exports.getAttendeesForMeeting = asyncHdl(async (req, res) => {
           }
         },
         organization: {
-          orgName: { $ifNull: ['$organization.orgName', '' ] },
-          jobTitle:{ $ifNull: ['$organization.jobTitle', '' ] },
+          orgName:  { $ifNull: ['$organization.orgName',  '' ] },
+          jobTitle: { $ifNull: ['$organization.jobTitle', '' ] },
+        },
+        businessProfile: {
+          primaryIndustry: {
+            $cond: [
+              { $isArray: '$businessProfile.primaryIndustry' },
+              '$businessProfile.primaryIndustry',
+              {
+                $cond: [
+                  { $gt: [ { $type: '$businessProfile.primaryIndustry' }, 'missing' ] },
+                  [ '$businessProfile.primaryIndustry' ],
+                  []
+                ]
+              }
+            ]
+          },
+          offering: {
+            $cond: [
+              { $isArray: '$businessProfile.offering' },
+              '$businessProfile.offering',
+              {
+                $cond: [
+                  { $gt: [ { $type: '$businessProfile.offering' }, 'missing' ] },
+                  [ '$businessProfile.offering' ],
+                  []
+                ]
+              }
+            ]
+          }
         },
         matchingIntent: {
           openToMeetings: { $toBool: { $ifNull: ['$matchingIntent.openToMeetings', false] } },
@@ -3245,11 +3278,145 @@ exports.getAttendeesForMeeting = asyncHdl(async (req, res) => {
               []
             ]
           }
-        },
+        }
       }
     },
     { $limit: limit }
   ]);
 
-  return res.json({ success: true, data: rows });
+  // ---- Scoring (mirrors getSuggestedList) --------------------------
+  const toStr  = (v) => (v == null ? "" : String(v));
+  const norm   = (s) => toStr(s).trim().toLowerCase();
+  const arrify = (x) => (Array.isArray(x) ? x.filter(Boolean) : x ? [x] : []);
+  const uniq   = (a) => Array.from(new Set((a || []).filter(Boolean)));
+  const words  = (x) =>
+    uniq(
+      arrify(x)
+        .flatMap((s) => String(s).split(/[,;/|]+|\s+/g))
+        .map(norm)
+        .filter((t) => t && t.length >= 2 && t !== "and" && t !== "or")
+    );
+  const langAliases = {
+    en: "english", eng: "english", english: "english",
+    fr: "french",  french: "french",
+    ar: "arabic",  arabic: "arabic",
+    es: "spanish", spanish: "spanish",
+    de: "german",  german: "german",
+    it: "italian", italian: "italian"
+  };
+  const langTokens = (x) => uniq(words(x).map((t) => langAliases[t] || t));
+  const DEFAULT_PHOTO_RX = /\/default\/photodef\.png$/i;
+
+  // ---- Load "me" from token (attendee/exhibitor/speaker) -----------
+  let meDoc = null, meRole = null;
+  const roleTry = [
+    { role: 'attendee',  M: attendee },
+    { role: 'exhibitor', M: Exhibitor },
+    { role: 'speaker',   M: Speaker },
+  ];
+  for (const t of roleTry){
+    try {
+      const d = await t.M.findById(meId).lean().catch(() => null);
+      if (d) { meDoc = d; meRole = t.role; break; }
+    } catch {}
+  }
+  if (!meDoc) {
+    // If we can't resolve the actor from token, fail (this page requires it)
+    return res.status(401).json({ message: "Auth required (actor not found)" });
+  }
+
+  const read = (obj, path) =>
+    String(path || '')
+      .split('.')
+      .reduce((o, k) => (o && o[k] !== undefined && o[k] !== null ? o[k] : undefined), obj);
+
+  const meV = (() => {
+    const rawLangs =
+      read(meDoc, 'personal.preferredLanguages') ??
+      read(meDoc, 'identity.preferredLanguages') ??
+      read(meDoc, 'talk.language') ?? [];
+    const rawIndustries =
+      read(meDoc, 'businessProfile.primaryIndustry') ??
+      read(meDoc, 'business.industry') ??
+      read(meDoc, 'b2bIntent.businessSector') ?? [];
+    const rawOffering =
+      read(meDoc, 'businessProfile.offering') ??
+      read(meDoc, 'commercial.offering') ??
+      read(meDoc, 'b2bIntent.offering') ?? [];
+    const rawLooking =
+      read(meDoc, 'matchingIntent.objectives') ??
+      read(meDoc, 'commercial.lookingFor') ??
+      read(meDoc, 'b2bIntent.lookingFor') ?? [];
+
+    return {
+      looking:    words(arrify(rawLooking)),
+      offering:   words(arrify(rawOffering)),
+      industries: words(arrify(rawIndustries)),
+      languages:  uniq(langTokens(arrify(rawLangs))),
+      regions:    []
+    };
+  })();
+
+  const scorePair = (mine, other) => {
+    let s = 0;
+    const syn = (t)=>({partners:"partnership",partner:"partnership",investment:"investor",invest:"investor",hire:"recruitment",recruit:"recruitment"}[t]||t);
+    const meL = mine.looking.map(syn), meO = mine.offering.map(syn);
+    const otL = other.looking.map(syn), otO = other.offering.map(syn);
+    const lxo = meL.filter((t) => otO.includes(t)).length; s += lxo * 5.5;
+    const oxl = meO.filter((t) => otL.includes(t)).length; s += oxl * 4.5;
+    const ind = mine.industries.filter((t) => other.industries.includes(t)).length; s += ind * 3;
+    const lng = mine.languages.filter((t) => other.languages.includes(t)).length; s += lng * 1.5;
+    return s;
+  };
+
+  // Build vectors & compute score for each attendee
+  const now = Date.now();
+  const scored = rows.map((r) => {
+    const languages  = uniq(langTokens(r?.personal?.preferredLanguages || []));
+    const industries = words(r?.businessProfile?.primaryIndustry || []);
+    const offering   = words(r?.businessProfile?.offering || []);
+    const looking    = words(r?.matchingIntent?.objectives || []);
+    const vec = { languages, industries, offering, looking, regions: [] };
+
+    let score = scorePair(meV, vec);
+
+    const hasPhoto = !!r?.personal?.profilePic && !DEFAULT_PHOTO_RX.test(String(r?.personal?.profilePic || ""));
+    const verifiedBoost =
+      (r?.verified ? 1 : 0) + ((r?.adminVerified === 'yes' || r?.adminVerified === true) ? 0.5 : 0);
+    const completeness =
+      [
+        r?.personal?.fullName,
+        offering.length ? 'x' : '',
+        industries.length ? 'x' : '',
+        languages.length ? 'x' : '',
+        looking.length ? 'x' : '',
+      ].filter(Boolean).length / 5;
+
+    const updated = now; // aggregated rows may not carry updatedAt reliably
+    const recency = 0.5 + 0.5 * Math.exp(-(now - updated) / (1000 * 60 * 60 * 24 * 60));
+
+    score = score * 1.0 + verifiedBoost * 2.0 + completeness * 3.0 + recency * 1.0;
+    score *= hasPhoto ? 1.05 : 0.72;
+    score *= 0.97 + Math.random() * 0.06;
+
+    return { ...r, _rawScore: Math.max(1e-6, score) };
+  });
+
+  // Normalize 0..100 and sort desc
+  const min = Math.min(...scored.map(x => x._rawScore));
+  const max = Math.max(...scored.map(x => x._rawScore));
+  const normScore = (x, lo, hi) => (hi <= lo ? 1 : (x - lo) / (hi - lo));
+  const withPct = scored.map(r => ({
+    ...r,
+    matchPct: Math.round(normScore(r._rawScore, min, max) * 100)
+  }));
+  withPct.sort((a,b) =>
+    (b.matchPct - a.matchPct) ||
+    String(a.personal.fullName).localeCompare(String(b.personal.fullName))
+  );
+
+  // Remove temp
+  const out = withPct.map(({ _rawScore, ...rest }) => rest);
+
+  return res.json({ success: true, data: out });
 });
