@@ -1760,17 +1760,28 @@ async function sendConfirmEmailsWithPDF(meet) {
 
 async function sendActionEmail(meet, type) {
   console.log('[sendActionEmail] meetingId=%s type=%s', String(meet._id), type);
+
   const [senderDoc, receiverDoc, ev] = await Promise.all([
     ROLE_MODEL[meet.senderRole].findById(meet.senderId).lean(),
     ROLE_MODEL[meet.receiverRole].findById(meet.receiverId).lean(),
     Event.findById(meet.eventId).select('title name timezone').lean(),
   ]);
+
   const s = { ...getMeta(senderDoc, meet.senderRole), _id: meet.senderId };
   const r = { ...getMeta(receiverDoc, meet.receiverRole), _id: meet.receiverId };
+
   const FRONT = (process.env.FRONTEND_URL || '').replace(/\/+$/, '') || '#';
   const tz = ev?.timezone || 'UTC';
-  const when = fmtLocal(meet.slotISO || meet.proposedNewAt || meet.requestedAt, tz);
   const evTitle = ev?.title || ev?.name || 'Event';
+
+  // IMPORTANT: choose the right time for emails
+  // - rescheduled -> show proposedNewAt if present
+  // - others      -> prefer slotISO, then proposedNewAt, then requestedAt
+  const whenIso = (type === 'rescheduled')
+    ? (meet.proposedNewAt || meet.slotISO || meet.requestedAt)
+    : (meet.slotISO || meet.proposedNewAt || meet.requestedAt);
+
+  const when = fmtLocal(whenIso, tz);
 
   const types = {
     rejected: {
@@ -1876,138 +1887,248 @@ async function loadVirtualFlags(senderId, receiverId) {
 // ──────────────────────────────────────────────────────────────────────────────
 // MAIN
 // ──────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// CONFIG + SHARED UTILS
+// ──────────────────────────────────────────────────────────────────────────────
+const PER_LETTER = 5;            // A1..A5, B1..B5, ...
+
+function normISO(dt) {
+  if (!dt) return null;
+  const d = new Date(dt);
+  if (Number.isNaN(d.getTime())) return null;
+  d.setSeconds(0, 0);
+  const snapped = Math.floor(d.getTime() / STEP_MS) * STEP_MS;
+  return new Date(snapped).toISOString();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TABLE HELPERS (physical vs hybrid are separate namespaces)
+// ──────────────────────────────────────────────────────────────────────────────
+function* tableCodeGenerator(perLetter = PER_LETTER, kind = 'physical') {
+  // physical => A1, A2, ... ; hybrid => A1-h, A2-h, ...
+  const suffix = kind === 'hybrid' ? '-h' : '';
+  let li = 0;
+  while (true) {
+    const letter = String.fromCharCode('A'.charCodeAt(0) + li);
+    for (let n = 1; n <= perLetter; n++) yield `${letter}${n}${suffix}`;
+    li++;
+  }
+}
+
+function parseTableCode(code = '') {
+  // supports A1 and A1-h
+  const m = String(code).trim().toUpperCase().match(/^([A-Z])(\d{1,2})(-H)?$/);
+  if (!m) return null;
+  return { letterIdx: m[1].charCodeAt(0) - 'A'.charCodeAt(0), num: Number(m[2]), kind: m[3] ? 'hybrid' : 'physical' };
+}
+
+async function nextTableIdForSlot(eventId, slotISO, perLetter = PER_LETTER, kind = 'physical') {
+  // Only confirmed meetings on THIS (eventId, slotISO)
+  const rows = await MeetRequest.find({
+    eventId,
+    status: 'confirmed',
+    slotISO: new Date(slotISO),
+    tableId: { $exists: true, $ne: null },
+  }).select('tableId').lean();
+
+  // Partition namespace: hybrid (‘-h’) vs physical (no suffix)
+  const used = new Set(
+    (rows || [])
+      .map(r => String(r.tableId || '').toUpperCase())
+      .filter(Boolean)
+      .filter(code => (kind === 'hybrid' ? /-H$/.test(code) : !/-H$/.test(code)))
+  );
+
+  // Gap-fill in lexical order: A1..A5, B1..B5, ...
+  for (const code of tableCodeGenerator(perLetter, kind)) {
+    if (!used.has(code)) return code;
+  }
+  // Fallback (practically unreachable)
+  return kind === 'hybrid' ? 'Z999-H' : 'Z999';
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+async function passesWhitelist(eventId, senderId, receiverId, iso) {
+  const [wS, wR] = await Promise.all([
+    SlotWhitelist.findOne({ eventId, actorId: senderId }).select('slots').lean(),
+    SlotWhitelist.findOne({ eventId, actorId: receiverId }).select('slots').lean(),
+  ]);
+  const sArr = Array.isArray(wS?.slots) ? wS.slots : [];
+  const rArr = Array.isArray(wR?.slots) ? wR.slots : [];
+  const hasS = sArr.length > 0;
+  const hasR = rArr.length > 0;
+  if (!hasS && !hasR) return true; // no whitelist → open
+
+  const key = normISO(iso);
+  const sSet = hasS ? new Set(sArr.map(x => normISO(x))) : null;
+  const rSet = hasR ? new Set(rArr.map(x => normISO(x))) : null;
+  const passS = !hasS || sSet.has(key);
+  const passR = !hasR || rSet.has(key);
+  return passS && passR; // intersection
+}
+
+function pickTime(obj, ...keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v) {
+      const d = new Date(v);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+  }
+  return null;
+}
+
+async function validateRescheduleSlot({ eventId, senderId, receiverId, iso }) {
+  const key = normISO(iso);
+  if (!key) return { ok: false, reason: 'bad-iso' };
+
+  // Event range
+  const ev = await Event.findById(eventId).select('startDate endDate').lean();
+  if (!ev?.startDate || !ev?.endDate) return { ok: false, reason: 'no-event-range' };
+  const t = new Date(key).getTime();
+  const a = new Date(ev.startDate).getTime();
+  const b = new Date(ev.endDate).getTime();
+  if (!(t >= a && t <= b)) return { ok: false, reason: 'outside-event' };
+
+  // Whitelist
+  const wlOk = await passesWhitelist(eventId, senderId, receiverId, key);
+  if (!wlOk) return { ok: false, reason: 'whitelist' };
+
+  // Virtual case: both virtual → OK inside event range
+  const { senderVirtual, receiverVirtual } = await loadVirtualFlags(senderId, receiverId);
+  const bothVirtual = senderVirtual && receiverVirtual;
+  if (bothVirtual) return { ok: true };
+
+  // Otherwise must fall inside a B2B session window the same day
+  const dayIso = new Date(key).toISOString().slice(0, 10);
+  const dayStart = new Date(`${dayIso}T00:00:00.000Z`);
+  const dayEndEx = new Date(`${dayIso}T24:00:00.000Z`);
+
+  const sessions = await Schedule.find({
+    $and: [
+      { $or: [{ id_event: eventId }, { eventId }] },
+      { track: { $regex: /b2b/i } },
+      {
+        $or: [
+          { $and: [{ startTime: { $lt: dayEndEx } }, { endTime: { $gt: dayStart } }] },
+          { $and: [{ startAt:   { $lt: dayEndEx } }, { endAt:   { $gt: dayStart } }] },
+          { $and: [{ start:     { $lt: dayEndEx } }, { end:     { $gt: dayStart } }] },
+        ],
+      },
+    ],
+  }).select('track startTime endTime startAt endAt start end').lean();
+
+  if (!Array.isArray(sessions) || !sessions.length) return { ok: false, reason: 'no-b2b-sessions' };
+
+  const tms = new Date(key).getTime();
+  const inside = sessions.some(s => {
+    const S = pickTime(s, 'startTime', 'startAt', 'start');
+    const E = pickTime(s, 'endTime', 'endAt', 'end');
+    if (!S || !E) return false;
+    return tms >= S.getTime() && tms < E.getTime();
+  });
+
+  return inside ? { ok: true } : { ok: false, reason: 'outside-b2b-window' };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ACTION
+// ──────────────────────────────────────────────────────────────────────────────
 exports.makeMeetingAction = asyncHandler(async (req, res) => {
   console.log('================ [makeMeetingAction] START ================');
   console.log('[makeMeetingAction:req.body]=', req.body);
 
-  const slotKeyT = (dt) => {
-    const d = new Date(dt);
-    d.setSeconds(0, 0);
-    const iso = d.toISOString();
-    console.log('[slotKeyT] in=%s out=%s', dt, iso);
-    return iso;
-  };
-
   const { meetingId, action, actorId, proposedNewAt } = req.body || {};
-  
-  if (!mongoose.isValidObjectId(meetingId)) {
-    console.error('[makeMeetingAction] Bad meetingId', meetingId);
-    return res.status(400).json({ message: 'Bad meetingId' });
-  }
+  if (!mongoose.isValidObjectId(meetingId)) return res.status(400).json({ message: 'Bad meetingId' });
 
   const meId = String(req.user._id);
   const meRole = String(req.user.role || '').toLowerCase();
   const meIsAdmin = meRole === 'admin';
-  if (!meIsAdmin && actorId && String(actorId) !== meId) {
-    console.error('[makeMeetingAction] Forbidden actorId mismatch', { actorId, meId });
-    return res.status(403).json({ message: 'Forbidden' });
-  }
+  if (!meIsAdmin && actorId && String(actorId) !== meId) return res.status(403).json({ message: 'Forbidden' });
 
   const meet = await MeetRequest.findById(meetingId).lean();
-  console.log('[makeMeetingAction:meet]=', meet && { _id: String(meet._id), status: meet.status, senderId: String(meet.senderId), receiverId: String(meet.receiverId), eventId: String(meet.eventId), slotISO: meet.slotISO, requestedAt: meet.requestedAt, proposedNewAt: meet.proposedNewAt });
   if (!meet) return res.status(404).json({ message: 'Meeting not found' });
 
   const { isSender, isReceiver } = whoAmI(meet, meId);
-  console.log('[makeMeetingAction:whoAmI]=', { isSender, isReceiver, meIsAdmin });
   if (!isSender && !isReceiver && !meIsAdmin) return res.status(403).json({ message: 'Forbidden' });
 
   const prevStatus = String(meet.status || '').toLowerCase();
   const act = String(action || '').toLowerCase();
-  console.log('[makeMeetingAction:state]=', { prevStatus, act });
-
   const allowed = computeAllowedActions(meet, meId, meIsAdmin);
-  console.log('[makeMeetingAction:allowed]=', allowed);
-  if (!allowed.includes(act)) {
-    console.warn('[makeMeetingAction] Action not allowed for this user/state');
-    return res.status(400).json({ message: 'Action not allowed for this user/state' });
-  }
+  if (!allowed.includes(act)) return res.status(400).json({ message: 'Action not allowed for this user/state' });
 
   const now = new Date();
   const $set = { updatedAt: now };
   const $unset = {};
   let finalISO = null;
 
-  // CONFIRM
-  if (act === 'confirm') {
-    finalISO =
-      prevStatus === 'rescheduled' && meet.proposedNewAt
-        ? slotKeyT(meet.proposedNewAt)
-        : slotKeyT(meet.slotISO || meet.requestedAt);
-    console.log('[confirm] finalISO=', finalISO);
+if (act === 'confirm') {
+  const originalISO = normISO(meet.slotISO || meet.requestedAt);
+  const reschedISO  = normISO(meet.proposedNewAt);
+  finalISO = (prevStatus === 'rescheduled' && reschedISO) ? reschedISO : originalISO;
+  if (!finalISO) return res.status(400).json({ message: 'No slot to confirm' });
 
-    if (!finalISO) {
-      console.error('[confirm] No slot to confirm');
-      return res.status(400).json({ message: 'No slot to confirm' });
-    }
+  // Ensure capacity doc exists (do NOT increment here)
+  await ensureCapDoc(meet.eventId, finalISO);
 
-    const actorIds = [meet.senderId, meet.receiverId].map(String);
-    const busy = await existsBusyAt(meet.eventId, finalISO, actorIds, meet._id);
-    console.log('[confirm] existsBusyAt (ignoring self)=', busy);
-    if (busy) {
-      console.warn('[confirm] Busy conflict detected (not self)');
-      return res.status(409).json({ message: 'One of the participants is busy at that time' });
-    }
+  // compute virtuality BEFORE using it
+  const { senderVirtual, receiverVirtual } = await loadVirtualFlags(meet.senderId, meet.receiverId);
+  const bothVirtual = senderVirtual && receiverVirtual;
+  const halfVirtual = senderVirtual !== receiverVirtual;
 
-    await ensureCapDoc(meet.eventId, finalISO);
+  // lock actors on this slot (prevents future overlaps)
+  await lockActors(meet.eventId, finalISO, meet.senderId, meet.receiverId);
 
-    $set.status = 'confirmed';
-    $set.acceptedAt = now;
-    $set.slotISO = new Date(finalISO);
-    $unset.proposedNewAt = 1;
-    $unset.proposedBy = 1;
+  // always set virtual meet link (even for physical/hybrid)
+  const FRONT_URL = (process.env.FRONTEND_URL || '').replace(/\/+$/, '') || '#';
+  $set.meetLink = `${FRONT_URL}/vmeet/${String(meet._id)}`;
 
-    await lockActors(meet.eventId, finalISO, meet.senderId, meet.receiverId);
-    const { senderVirtual, receiverVirtual } = await loadVirtualFlags(meet.senderId, meet.receiverId);
-    const bothVirtual = senderVirtual && receiverVirtual;
-
-    // We always set a meet link (placeholder – your redirect to Google Meet can live there later)
-    const FRONT_URL = (process.env.FRONTEND_URL || '').replace(/\/+$/, '') || '#';
-    const meetLink = `${FRONT_URL}/vmeet/${String(meet._id)}`;
-
-    if (!bothVirtual) {
-      // Allocate a table index for the slot and turn it into a code (a1.., b1..)
-      const idx = await reserveTableIndex(meet.eventId, new Date(finalISO));
-      const tableId = tableCodeFromIndex(idx, 5); // 5 tables per letter
-      $set.tableId = tableId;
-    }
-    $set.meetLink = meetLink;
+  // assign physical/hybrid table id by namespace (hybrid -> "-h")
+  if (!bothVirtual) {
+    const kind = halfVirtual ? 'hybrid' : 'physical';
+    $set.tableId = await nextTableIdForSlot(meet.eventId, finalISO, PER_LETTER, kind);
+    console.log('[confirm] table assigned (%s) -> %s', kind, $set.tableId);
+  } else {
+    $unset.tableId = 1; // purely virtual → no table
   }
 
-  // REJECT
+  // finalize mutation
+  $set.status = 'confirmed';
+  $set.acceptedAt = now;
+  $set.slotISO = new Date(finalISO);
+  $unset.proposedNewAt = 1;
+  $unset.proposedBy = 1;
+}
+
+
+  // ───────── REJECT ─────────
   if (act === 'reject') {
     $set.status = 'rejected';
     $set.rejectedAt = now;
     $set.rejectedBy = req.user._id;
-    const slotToRelease = meet?.slotISO ? slotKeyT(meet?.slotISO) : null;
-    console.log('[reject] slotToRelease=', slotToRelease);
-    if (slotToRelease) {
-      await decMeetingSlotUsed(meet?.eventId, slotToRelease);
-    } else {
-      console.log('[reject] no slotISO on meeting; nothing to decrement');
+
+    const decISO = normISO(meet.slotISO || meet.requestedAt);
+    if (decISO) {
+      await decMeetingSlotUsed(meet.eventId, decISO);
+      await unlockActors(meet.eventId, decISO, meet.senderId, meet.receiverId);
     }
+    $unset.tableId = 1;
   }
 
-  // CANCEL
+  // ───────── CANCEL ─────────
   if (act === 'cancel') {
     $set.status = 'cancelled';
     $set.cancelledAt = now;
     $set.cancelledBy = req.user._id;
 
-    const slotsToUnlock = [
-      meet.slotISO ? slotKeyT(meet.slotISO) : null,
-      meet.requestedAt ? slotKeyT(meet.requestedAt) : null,
-      meet.proposedNewAt ? slotKeyT(meet.proposedNewAt) : null,
-    ].filter(Boolean);
-    console.log('[cancel] slotsToUnlock=', slotsToUnlock);
-    for (const iso of Array.from(new Set(slotsToUnlock))) {
-      await unlockActors(meet.eventId, iso, meet.senderId, meet.receiverId);
-      if (iso === slotKeyT(meet.slotISO)) {
-        await decMeetingSlotUsed(meet.eventId, iso);
-      }
+    const decISO = normISO(meet.slotISO || meet.requestedAt);
+    if (decISO) {
+      await unlockActors(meet.eventId, decISO, meet.senderId, meet.receiverId);
+      await decMeetingSlotUsed(meet.eventId, decISO);
     }
 
     if (prevStatus === 'confirmed') {
-      const r = await MeetingBlacklist.updateOne(
+      await MeetingBlacklist.updateOne(
         { meetingId: meet._id },
         {
           $setOnInsert: {
@@ -2020,50 +2141,59 @@ exports.makeMeetingAction = asyncHandler(async (req, res) => {
         },
         { upsert: true }
       );
-      console.log('[cancel] blacklisted (after confirmation) ->', r);
     }
+    $unset.tableId = 1;
   }
 
-  // RESCHEDULE (propose)
+  // ───────── RESCHEDULE (full checks like request; NO increment) ─────────
   if (act === 'reschedule') {
-    const t = new Date(proposedNewAt);
-    console.log('[reschedule] proposedNewAt=', proposedNewAt, 'parsed=', t);
-    if (!proposedNewAt || isNaN(t.getTime())) {
-      console.error('[reschedule] invalid proposedNewAt');
-      return res.status(400).json({ message: 'proposedNewAt must be a valid ISO datetime' });
+    const tISO = normISO(proposedNewAt);
+    if (!tISO) return res.status(400).json({ message: 'proposedNewAt must be a valid ISO datetime' });
+
+    const v = await validateRescheduleSlot({
+      eventId: meet.eventId,
+      senderId: meet.senderId,
+      receiverId: meet.receiverId,
+      iso: tISO,
+    });
+    if (!v.ok) {
+      const map = {
+        'bad-iso': 'Invalid time format',
+        'no-event-range': 'Event has no date range',
+        'outside-event': 'Selected time is outside event dates',
+        'whitelist': 'Selected time is not allowed by whitelist',
+        'no-b2b-sessions': 'No B2B sessions are scheduled for this day',
+        'outside-b2b-window': 'Selected time is outside B2B session windows',
+      };
+      return res.status(409).json({ message: map[v.reason] || 'Selected time is not allowed' });
     }
-    const iso = slotKeyT(t);
-    const actorIds = [meet.senderId, meet.receiverId].map(String);
-    const busy = await existsBusyAt(meet.eventId, iso, actorIds, meet._id);
-    console.log('[reschedule] existsBusyAt (ignoring self)=', busy);
+
+    const actorIds = [String(meet.senderId), String(meet.receiverId)];
+    const busy = await existsBusyAt(meet.eventId, tISO, actorIds, meet._id);
     if (busy) return res.status(409).json({ message: 'One of the participants is busy at the proposed time' });
 
-    await ensureCapDoc(meet.eventId, iso);
+    await ensureCapDoc(meet.eventId, tISO);
 
     $set.status = 'rescheduled';
-    $set.proposedNewAt = new Date(iso);
+    $set.proposedNewAt = new Date(tISO);
     $set.proposedBy = req.user._id;
+    $unset.tableId = 1; // tables only on confirm
   }
 
-  // DELETE
+  // ───────── DELETE ─────────
   if (act === 'delete') {
     const { isReceiver } = whoAmI(meet, meId);
     if (!(prevStatus === 'rejected' && isReceiver) && !meIsAdmin) {
-      console.warn('[delete] not allowed (only receiver on rejected or admin)');
       return res.status(400).json({ message: 'Delete allowed only to receiver when status is rejected' });
     }
 
-    const slotsToUnlock = [
-      meet.slotISO ? slotKeyT(meet.slotISO) : null,
-      meet.requestedAt ? slotKeyT(meet.requestedAt) : null,
-      meet.proposedNewAt ? slotKeyT(meet.proposedNewAt) : null,
-    ].filter(Boolean);
-    console.log('[delete] slotsToUnlock=', slotsToUnlock);
-    for (const iso of Array.from(new Set(slotsToUnlock))) {
-      await unlockActors(meet.eventId, iso, meet.senderId, meet.receiverId);
+    const decISO = normISO(meet.slotISO || meet.requestedAt);
+    if (decISO) {
+      await unlockActors(meet.eventId, decISO, meet.senderId, meet.receiverId);
+      await decMeetingSlotUsed(meet.eventId, decISO);
     }
 
-    const rBL = await MeetingBlacklist.updateOne(
+    await MeetingBlacklist.updateOne(
       { meetingId: meet._id },
       {
         $setOnInsert: {
@@ -2076,43 +2206,33 @@ exports.makeMeetingAction = asyncHandler(async (req, res) => {
       },
       { upsert: true }
     );
-    console.log('[delete] blacklisted ->', rBL);
 
-    const rDel = await MeetRequest.deleteOne({ _id: meet._id });
-    console.log('[delete] deleted ->', rDel);
+    await MeetRequest.deleteOne({ _id: meet._id });
     console.log('================ [makeMeetingAction] END (delete) ================');
     return res.json({ success: true, message: 'Deleted' });
   }
 
-  // Apply update
-  console.log('[update] $set=', $set, '$unset=', $unset);
-  const rUpd = await MeetRequest.updateOne({ _id: meetingId }, { $set, ...(Object.keys($unset).length ? { $unset } : {}) });
-  console.log('[update] updateOne result=', rUpd);
+  // ───────── persist + emails ─────────
+  await MeetRequest.updateOne(
+    { _id: meetingId },
+    { $set, ...(Object.keys($unset).length ? { $unset } : {}) }
+  );
 
   const updated = await MeetRequest.findById(meetingId).lean();
-  console.log('[updated]=', updated && { _id: String(updated._id), status: updated.status, slotISO: updated.slotISO, proposedNewAt: updated.proposedNewAt });
-
-  // Emails
   try {
-    if (act === 'confirm') {
-      await sendConfirmEmailsWithPDF(updated); // <-- now sends with PDF via your 5-arg sendMail
-    } else if (act === 'reject') {
-      await sendActionEmail(updated, 'rejected');
-    } else if (act === 'reschedule') {
-      await sendActionEmail(updated, 'rescheduled');
-    } else if (act === 'cancel') {
-      await sendActionEmail(updated, 'cancelled');
-    }
+    if (act === 'confirm')         await sendConfirmEmailsWithPDF(updated);
+    else if (act === 'reject')     await sendActionEmail(updated, 'rejected');
+    else if (act === 'reschedule') await sendActionEmail(updated, 'rescheduled');
+    else if (act === 'cancel')     await sendActionEmail(updated, 'cancelled');
   } catch (e) {
     console.error('[emails] error:', e?.message || e);
   }
 
   const allowedAfter = computeAllowedActions(updated, meId, meIsAdmin);
-  console.log('[allowedAfter]=', allowedAfter);
-
   console.log('================ [makeMeetingAction] END (ok) ================');
   return res.json({ success: true, message: 'OK', data: { ...updated, allowedActions: allowedAfter } });
 });
+
 
 
 
@@ -2644,7 +2764,7 @@ function pickTime(doc, ...keys) {
 // ───────────────────── GET /events/:eventId/available-slots ───────
 exports.listAvailableSlots = asyncHandler(async (req, res) => {
   const { eventId } = req.params || {};
-  const dateParam  = req.query?.date || req.params?.date; // YYYY-MM-DD
+  const dateParam = req.query?.date || req.params?.date; // YYYY-MM-DD
   const receiverId = req.query?.actorId || req.query?.receiverId;
 
   if (!mongoose.isValidObjectId(eventId)) return res.status(400).json({ message: 'Bad eventId' });
@@ -2655,11 +2775,6 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
 
   const senderId = req.user?._id;
   if (!senderId) return res.status(401).json({ message: 'Unauthorized' });
-
-  // helpers (safe locally)
-  const STEP_MS = 30 * 60 * 1000;
-  const iso      = (d) => new Date(d).toISOString();
-  const toSetISO = (arr) => new Set((arr || []).map(iso));
 
   const loadActor = async (id) => {
     const proj = { virtualMeet: 1 };
@@ -2679,23 +2794,21 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
   // capacity defaults
   let capDefault = 45;
   if (Event) {
-    try {
-      const ev = await Event.findById(eventId).select('b2bCapacity').lean();
+    try { const ev = await Event.findById(eventId).select('b2bCapacity').lean();
       if (Number(ev?.b2bCapacity) > 0) capDefault = Number(ev.b2bCapacity);
     } catch {}
   }
   let capHybridDefault = 5;
   if (Event) {
-    try {
-      const ev2 = await Event.findById(eventId).select('postsCount').lean();
+    try { const ev2 = await Event.findById(eventId).select('postsCount').lean();
       if (Number(ev2?.postsCount) > 0) capHybridDefault = Number(ev2.postsCount);
     } catch {}
   }
   if (!Schedule) return res.status(500).json({ message: 'Schedule model not found on server' });
 
   // day window
-  const dayStart   = new Date(`${dateParam}T00:00:00.000Z`);
-  const dayEndEx   = new Date(`${dateParam}T24:00:00.000Z`);
+  const dayStart = new Date(`${dateParam}T00:00:00.000Z`);
+  const dayEndEx = new Date(`${dateParam}T24:00:00.000Z`);
   const dayStartMs = dayStart.getTime();
   const dayEndMs   = dayEndEx.getTime();
 
@@ -2761,7 +2874,6 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
       ],
     }).select('requestedAt proposedNewAt').lean(),
   ]);
-
   const busy = new Set([
     ...locks.map(b => iso(b.slotISO)),
     ...requests.flatMap(r => {
@@ -2771,23 +2883,19 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
       return out;
     }),
   ]);
-
-  const allFreeGrid = Array.from(slotSet).filter(s => !busy.has(s));
-  if (!allFreeGrid.length) {
-    return res.json({ success: true, count: 0, data: [], tz: 'UTC' });
-  }
+  const allFreeGrid = Array.from(slotSet).filter(isoStr => !busy.has(isoStr));
+  if (!allFreeGrid.length) return res.json({ success: true, count: 0, data: [], tz: 'UTC' });
 
   // whitelist
   const ignoreWhitelist = String(req.query?.ignoreWhitelist || '') === '1';
   const [wSender, wReceiver] = await Promise.all([
-    SlotWhitelist.findOne({ eventId, actorId: senderId   }).select('slots').lean(),
+    SlotWhitelist.findOne({ eventId, actorId: senderId }).select('slots').lean(),
     SlotWhitelist.findOne({ eventId, actorId: receiverId }).select('slots').lean(),
   ]);
-
   const senderHasWl   = !!(wSender?.slots?.length);
   const receiverHasWl = !!(wReceiver?.slots?.length);
 
-  // Only current day slots
+  // Build whitelist sets but only for current day
   const wS = senderHasWl
     ? toSetISO((wSender.slots || []).filter(d => d >= dayStart && d < dayEndEx))
     : null;
@@ -2795,7 +2903,7 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
     ? toSetISO((wReceiver.slots || []).filter(d => d >= dayStart && d < dayEndEx))
     : null;
 
-  // Enforce intersection only when not ignoring AND at least one list exists (your original rule)
+  // Enforce whitelist if (a) NOT ignoring and (b) at least one list exists
   let grid = allFreeGrid;
   let filteredOut = 0;
   const shouldEnforce = !ignoreWhitelist && (senderHasWl || receiverHasWl);
@@ -2803,12 +2911,12 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
     grid = allFreeGrid.filter(sISO => {
       const passSender   = !senderHasWl   || (wS && wS.has(sISO));
       const passReceiver = !receiverHasWl || (wR && wR.has(sISO));
-      return passSender && passReceiver;
+      return passSender && passReceiver; // intersection of existing lists
     });
     filteredOut = allFreeGrid.length - grid.length;
   }
 
-  // capacity lookups for the resulting grid
+  // capacities
   let countMap = new Map();
   if (!bothVirtual && grid.length) {
     try {
@@ -2828,42 +2936,27 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
     }
   }
 
-  // Build final rows + CORRECT whitelist flags
   const data = grid.sort().map((sISO) => {
-    // IMPORTANT: wl flags reflect *actual list presence*; if list absent => false
-    const wlSender   = senderHasWl   ? !!wS?.has(sISO) : false;
-    const wlReceiver = receiverHasWl ? !!wR?.has(sISO) : false;
-
-    // Block from current user's POV when we're *not* in ignore mode:
-    // - If receiver has no whitelist at all => blockedOther = true (everything blocked by them)
-    // - Else blocked if this specific slot is not in receiver's whitelist
-    const blockedOther = !ignoreWhitelist && (!receiverHasWl || !wlReceiver);
-
     if (bothVirtual) {
-      return {
-        iso: sISO, used: 0, cap: Number.POSITIVE_INFINITY, isCap: true, kind: 'virtual',
-        wlSender, wlReceiver, blockedOther
-      };
+      return { iso: sISO, used: 0, cap: Number.POSITIVE_INFINITY, isCap: true, kind: 'virtual' };
     }
-
     const info = countMap.get(sISO);
     const used = info?.used ?? 0;
     const cap  = info?.cap  ?? (halfVirtual ? capHybridDefault : capDefault);
     const hardCeil = 30;
     const isCap = used < cap && (halfVirtual ? used < cap : used < hardCeil);
-
-    return {
-      iso: sISO, used, cap, isCap, kind: halfVirtual ? 'hybrid' : 'physical',
-      wlSender, wlReceiver, blockedOther
-    };
+    return { iso: sISO, used, cap, isCap, kind: halfVirtual ? 'hybrid' : 'physical' };
   });
 
   const actorHasWhitelist    = senderHasWl;
   const receiverHasWhitelist = receiverHasWl;
-  const whitelistStatus =
-    actorHasWhitelist && receiverHasWhitelist ? 'both' :
-    actorHasWhitelist ? 'sender' :
-    receiverHasWhitelist ? 'receiver' : 'none';
+  const whitelistStatus = actorHasWhitelist && receiverHasWhitelist
+    ? 'both'
+    : actorHasWhitelist
+      ? 'sender'
+      : receiverHasWhitelist
+        ? 'receiver'
+        : 'none';
 
   return res.json({
     success: true,
@@ -2873,13 +2966,13 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
     actorHasWhitelist,
     receiverHasWhitelist,
     whitelistStatus,
+    // meta for debugging/UX
     allFreeCount: allFreeGrid.length,
     filteredOut,
     enforced: shouldEnforce,
     ignoreWhitelist
   });
 });
-
 
 
 
@@ -3695,4 +3788,301 @@ exports.adminSetWhitelist = asyncHandler(async (req,res)=>{
     { eventId, actorId }, { $set:{ slots: normalized } }, { upsert:true, new:true }
   ).lean();
   res.json({ success:true, data:{ eventId, actorId, slots: doc.slots.map(iso) }});
+});
+
+exports.adminRepairEvent = asyncHandler(async (req, res) => {
+  const {
+    eventId: rawEventId,
+    apply = false,
+    mode = 'cancel',
+    syncCounters = true,
+  } = req.body || {};
+
+  const byEvent = (id) => (rawEventId ? String(id) === String(rawEventId) : true);
+  const EID = rawEventId && mongoose.isValidObjectId(rawEventId) ? new mongoose.Types.ObjectId(rawEventId) : null;
+
+  const report = {
+    scope: EID ? { eventId: String(EID) } : 'ALL EVENTS',
+    dryRun: !apply,
+    missingActors: { totalMeets: 0, cancelled: 0, deleted: 0, whitelistRemoved: 0, slotLocksRemoved: 0 },
+    slotUsed: { recomputedPhysical: 0, recomputedHybrid: 0 },
+    slotLocks: { deleted: 0, inserted: 0 },
+    counters: { adjusted: 0 },
+    notes: [],
+  };
+
+  // ─────────────────────────────────────────────────────────────
+  // Helpers (local)
+  const normISO = (dt) => {
+    if (!dt) return null;
+    const d = new Date(dt);
+    if (Number.isNaN(d.getTime())) return null;
+    d.setSeconds(0, 0);
+    return d.toISOString();
+  };
+
+  const ROLE_MODEL_SAFE = global.ROLE_MODEL || {
+    attendee  : global.Attendee  || (typeof Attendee  !== 'undefined' ? Attendee  : null),
+    exhibitor : global.Exhibitor || (typeof Exhibitor !== 'undefined' ? Exhibitor : null),
+    speaker   : global.Speaker   || (typeof Speaker   !== 'undefined' ? Speaker   : null),
+  };
+
+  async function actorExistsByRole(role, id) {
+    const m =
+      ROLE_MODEL_SAFE?.[String(role || '').toLowerCase()] ||
+      ROLE_MODEL_SAFE.attendee || ROLE_MODEL_SAFE.exhibitor || ROLE_MODEL_SAFE.speaker;
+    if (!m) return false;
+    const doc = await m.findById(id).select('_id').lean();
+    return !!doc;
+  }
+
+  async function bothVirtualFlags(sid, rid) {
+    try {
+      const { senderVirtual, receiverVirtual } = await loadVirtualFlags(sid, rid);
+      return { senderVirtual, receiverVirtual, bothVirtual: senderVirtual && receiverVirtual, halfVirtual: senderVirtual !== receiverVirtual };
+    } catch {
+      // Fallback if loadVirtualFlags is unavailable
+      return { senderVirtual: false, receiverVirtual: false, bothVirtual: false, halfVirtual: false };
+    }
+  }
+
+  // Optional Hybrid model presence
+  const HybridModel = (typeof HybridMeetingSlot !== 'undefined') ? HybridMeetingSlot : null;
+
+  // Filter for meets
+  const meetFilter = EID ? { eventId: EID } : {};
+  const meets = await MeetRequest.find(meetFilter).lean();
+
+  // ─────────────────────────────────────────────────────────────
+  // 1) Handle missing actors per meeting
+  for (const m of meets) {
+    const eok = byEvent(m.eventId);
+    if (!eok) continue;
+
+    const [senderOk, receiverOk] = await Promise.all([
+      actorExistsByRole(m.senderRole, m.senderId),
+      actorExistsByRole(m.receiverRole, m.receiverId),
+    ]);
+    const missing = (!senderOk || !receiverOk);
+
+    if (missing) {
+      report.missingActors.totalMeets += 1;
+
+      // Remove whitelist for missing actors
+      const toPurge = [];
+      if (!senderOk) toPurge.push(m.senderId);
+      if (!receiverOk) toPurge.push(m.receiverId);
+      for (const aid of toPurge) {
+        if (apply) await SlotWhitelist.deleteMany({ eventId: m.eventId, actorId: aid });
+        report.missingActors.whitelistRemoved += 1;
+      }
+
+      // Remove slot locks for this meet/actors/slot(s)
+      const slots = [normISO(m.slotISO), normISO(m.requestedAt), normISO(m.proposedNewAt)].filter(Boolean);
+      if (slots.length) {
+        const delQ = { eventId: m.eventId, actorId: { $in: [m.senderId, m.receiverId] }, slotISO: { $in: slots } };
+        if (apply) {
+          const r = await SlotIndex.deleteMany(delQ);
+          report.missingActors.slotLocksRemoved += (r?.deletedCount || 0);
+        } else {
+          const r = await SlotIndex.find(delQ).select('_id').lean();
+          report.missingActors.slotLocksRemoved += (r?.length || 0);
+        }
+      }
+
+      // Fix capacity for confirmed meet with missing actor
+      if (String(m.status).toLowerCase() === 'confirmed') {
+        const iso = normISO(m.slotISO || m.requestedAt);
+        if (iso) {
+          // Recompute phase later overwrites, but be conservative here too
+          if (apply) {
+            // physical vs hybrid split
+            const vf = await bothVirtualFlags(m.senderId, m.receiverId);
+            if (vf.bothVirtual) {
+              // nothing to do (virtual not counted)
+            } else if (vf.halfVirtual && HybridModel) {
+              await HybridModel.updateOne(
+                { eventId: m.eventId, slotISO: new Date(iso), used: { $gt: 0 } },
+                { $inc: { used: -1 } }
+              );
+            } else {
+              await MeetingSlot.updateOne(
+                { eventId: m.eventId, slotISO: new Date(iso), used: { $gt: 0 } },
+                { $inc: { used: -1 } }
+              );
+            }
+          }
+        }
+      }
+
+      // Finally cancel or delete the meet
+      if (apply) {
+        if (mode === 'delete') {
+          await MeetRequest.deleteOne({ _id: m._id });
+          report.missingActors.deleted += 1;
+        } else {
+          await MeetRequest.updateOne(
+            { _id: m._id },
+            { $set: { status: 'cancelled', cancelledAt: new Date(), cancelledBy: null, cancelledReason: 'actor-missing', tableId: null } }
+          );
+          report.missingActors.cancelled += 1;
+        }
+      } else {
+        if (mode === 'delete') report.missingActors.deleted += 1;
+        else report.missingActors.cancelled += 1;
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // 2) Recompute used per slot from confirmed meetings
+  //    physical vs hybrid counts
+  const confFilter = EID ? { eventId: EID, status: 'confirmed' } : { status: 'confirmed' };
+  const confirmed = await MeetRequest.find(confFilter)
+    .select('eventId slotISO senderId receiverId')
+    .lean();
+
+  // Aggregate counts
+  const physMap = new Map();   // key: eventId|iso => count
+  const hybrMap = new Map();   // if HybridMeetingSlot exists
+  for (const m of confirmed) {
+    const keyISO = normISO(m.slotISO);
+    if (!keyISO) continue;
+    const vf = await bothVirtualFlags(m.senderId, m.receiverId);
+    const ek = `${String(m.eventId)}|${keyISO}`;
+    if (vf.bothVirtual) {
+      // ignore (virtual not counted)
+    } else if (vf.halfVirtual && HybridModel) {
+      hybrMap.set(ek, (hybrMap.get(ek) || 0) + 1);
+    } else {
+      physMap.set(ek, (physMap.get(ek) || 0) + 1);
+    }
+  }
+
+  // Upsert + set used for physical slots
+  for (const [ek, used] of physMap.entries()) {
+    const [id, iso] = ek.split('|');
+    if (apply) {
+      // keep cap as-is or create with default from ensureCapDoc-like logic
+      const ev = await Event.findById(id).select('b2bCapacity').lean();
+      const capDefault = Number(ev?.b2bCapacity) > 0 ? Number(ev.b2bCapacity) : 30;
+      await MeetingSlot.updateOne(
+        { eventId: id, slotISO: new Date(iso) },
+        { $setOnInsert: { eventId: id, slotISO: new Date(iso), cap: capDefault }, $set: { used } },
+        { upsert: true }
+      );
+    }
+    report.slotUsed.recomputedPhysical += 1;
+  }
+
+  // Zero out physical slots that no longer have meetings (only within scope)
+  if (apply) {
+    const slotQ = EID ? { eventId: EID } : {};
+    const allSlots = await MeetingSlot.find(slotQ).select('eventId slotISO used').lean();
+    for (const s of allSlots) {
+      const k = `${String(s.eventId)}|${normISO(s.slotISO)}`;
+      if (!physMap.has(k) && s.used !== 0) {
+        await MeetingSlot.updateOne({ _id: s._id }, { $set: { used: 0 } });
+      }
+    }
+  }
+
+  // Hybrid used (if model exists)
+  if (HybridModel) {
+    for (const [ek, used] of hybrMap.entries()) {
+      const [id, iso] = ek.split('|');
+      if (apply) {
+        await HybridModel.updateOne(
+          { eventId: id, slotISO: new Date(iso) },
+          { $setOnInsert: { eventId: id, slotISO: new Date(iso), cap: 9999 }, $set: { used } }, // cap placeholder for hybrid
+          { upsert: true }
+        );
+      }
+      report.slotUsed.recomputedHybrid += 1;
+    }
+    if (apply) {
+      const hQ = EID ? { eventId: EID } : {};
+      const allH = await HybridModel.find(hQ).select('eventId slotISO used').lean();
+      for (const s of allH) {
+        const k = `${String(s.eventId)}|${normISO(s.slotISO)}`;
+        if (!hybrMap.has(k) && s.used !== 0) {
+          await HybridModel.updateOne({ _id: s._id }, { $set: { used: 0 } });
+        }
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // 3) Rebuild SlotIndex locks from truth (confirmed meets)
+  // Expected locks: for each confirmed meeting, 2 docs (sender/receiver)
+  const expected = new Set();
+  for (const m of confirmed) {
+    const iso = normISO(m.slotISO);
+    if (!iso) continue;
+    expected.add(`${String(m.eventId)}|${String(m.senderId)}|${iso}`);
+    expected.add(`${String(m.eventId)}|${String(m.receiverId)}|${iso}`);
+  }
+
+  const lockQ = EID ? { eventId: EID } : {};
+  const locks = await SlotIndex.find(lockQ).select('eventId actorId slotISO _id').lean();
+  const existing = new Map(); // key=>_id
+  for (const L of locks) {
+    const k = `${String(L.eventId)}|${String(L.actorId)}|${normISO(L.slotISO)}`;
+    existing.set(k, L._id);
+  }
+
+  // Delete extras
+  for (const [k, id] of existing.entries()) {
+    if (!expected.has(k)) {
+      report.slotLocks.deleted += 1;
+      if (apply) await SlotIndex.deleteOne({ _id: id });
+    }
+  }
+  // Insert missing
+  for (const k of expected) {
+    if (!existing.has(k)) {
+      report.slotLocks.inserted += 1;
+      if (apply) {
+        const [eid, aid, iso] = k.split('|');
+        await SlotIndex.updateOne(
+          { eventId: eid, actorId: aid, slotISO: iso },
+          { $setOnInsert: { eventId: eid, actorId: aid, slotISO: iso } },
+          { upsert: true }
+        );
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // 4) Sync MeetingTableCounter (optional; only useful if you still consume it)
+  if (syncCounters && typeof MeetingTableCounter !== 'undefined') {
+    // Compute physical count per (eventId, slotISO)
+    const physCounts = new Map(); // ek -> count
+    for (const m of confirmed) {
+      const iso = normISO(m.slotISO);
+      if (!iso) continue;
+      const vf = await bothVirtualFlags(m.senderId, m.receiverId);
+      if (!vf.bothVirtual && !vf.halfVirtual) {
+        const ek = `${String(m.eventId)}|${iso}`;
+        physCounts.set(ek, (physCounts.get(ek) || 0) + 1);
+      }
+    }
+
+    for (const [ek, n] of physCounts.entries()) {
+      const [eid, iso] = ek.split('|');
+      if (apply) {
+        const doc = await MeetingTableCounter.findOneAndUpdate(
+          { eventId: eid, slotISO: new Date(iso) },
+          { $setOnInsert: { eventId: eid, slotISO: new Date(iso), next: n }, $set: { next: n } },
+          { new: true, upsert: true }
+        ).lean();
+        if (doc?.next !== n) {
+          await MeetingTableCounter.updateOne({ _id: doc._id }, { $set: { next: n } });
+        }
+      }
+      report.counters.adjusted += 1;
+    }
+  }
+
+  return res.json({ success: true, apply, mode, report });
 });

@@ -4,6 +4,7 @@ const mongoose = require('mongoose');
 const MeetingTableCounterSchema = new mongoose.Schema({
   eventId : { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
   slotISO : { type: Date, required: true, index: true },
+  kind: { type: String, enum: ['physical','hybrid'], default: 'physical', index: true }, // NEW
   next    : { type: Number, default: 0 }, // increments on confirms to allocate a stable table index
 }, { timestamps: true });
 

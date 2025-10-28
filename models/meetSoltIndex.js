@@ -9,6 +9,7 @@ const mongoose = require('mongoose');
 const meetSlotIndexSchema = new mongoose.Schema({
   eventId : { type:mongoose.Schema.Types.ObjectId, ref:'event', index:true },
   actorId : { type:mongoose.Schema.Types.ObjectId, index:true },
+  meetingId: { type: mongoose.Schema.Types.ObjectId, ref: 'meetrequest', index: true },
   slotISO : { type:String, index:true }   // "2025-11-04T09:00:00.000Z"
 }, { versionKey:false });
 
