@@ -2850,6 +2850,31 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
   }
   if (!slotSet.size) return res.json({ success: true, count: 0, data: [], tz: 'UTC' });
 
+  // ─────────────────────────────────────────────────────────────
+  // PATCH: Ensure receiver has a whitelist; if missing or empty,
+  // create it with ALL slots of this day (non-destructive to existing).
+  // ─────────────────────────────────────────────────────────────
+  let createdReceiverWhitelist = false;
+  try {
+    const wl = await SlotWhitelist.findOne({ eventId, actorId: receiverId }).select('_id slots').lean();
+    if (!wl || !Array.isArray(wl.slots) || wl.slots.length === 0) {
+      const slotsAsDates = Array.from(slotSet).map(s => new Date(s));
+      await SlotWhitelist.updateOne(
+        { eventId, actorId: receiverId },
+        {
+          $setOnInsert: { eventId, actorId: receiverId, createdAt: new Date() },
+          $set: { updatedAt: new Date() },
+          $addToSet: { slots: { $each: slotsAsDates } } // only adds if not present
+        },
+        { upsert: true }
+      );
+      createdReceiverWhitelist = true;
+    }
+  } catch (e) {
+    console.warn('[listAvailableSlots] ensure whitelist failed:', e?.message || e);
+  }
+  // (If you also want to auto-create for the sender, repeat the same block for actorId: senderId)
+
   // busy (locks + requests)
   const dayStartISO = dayStart.toISOString();
   const dayEndISO   = dayEndEx.toISOString();
@@ -2884,18 +2909,23 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
     }),
   ]);
   const allFreeGrid = Array.from(slotSet).filter(isoStr => !busy.has(isoStr));
-  if (!allFreeGrid.length) return res.json({ success: true, count: 0, data: [], tz: 'UTC' });
+  if (!allFreeGrid.length) {
+    return res.json({
+      success: true, count: 0, data: [], tz: 'UTC',
+      createdReceiverWhitelist, allFreeCount: 0, filteredOut: 0, enforced: false, ignoreWhitelist: false
+    });
+  }
 
-  // whitelist
+  // whitelist (load after potential creation)
   const ignoreWhitelist = String(req.query?.ignoreWhitelist || '') === '1';
   const [wSender, wReceiver] = await Promise.all([
     SlotWhitelist.findOne({ eventId, actorId: senderId }).select('slots').lean(),
     SlotWhitelist.findOne({ eventId, actorId: receiverId }).select('slots').lean(),
   ]);
+
   const senderHasWl   = !!(wSender?.slots?.length);
   const receiverHasWl = !!(wReceiver?.slots?.length);
 
-  // Build whitelist sets but only for current day
   const wS = senderHasWl
     ? toSetISO((wSender.slots || []).filter(d => d >= dayStart && d < dayEndEx))
     : null;
@@ -2911,7 +2941,7 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
     grid = allFreeGrid.filter(sISO => {
       const passSender   = !senderHasWl   || (wS && wS.has(sISO));
       const passReceiver = !receiverHasWl || (wR && wR.has(sISO));
-      return passSender && passReceiver; // intersection of existing lists
+      return passSender && passReceiver;
     });
     filteredOut = allFreeGrid.length - grid.length;
   }
@@ -2966,13 +2996,14 @@ exports.listAvailableSlots = asyncHandler(async (req, res) => {
     actorHasWhitelist,
     receiverHasWhitelist,
     whitelistStatus,
-    // meta for debugging/UX
     allFreeCount: allFreeGrid.length,
     filteredOut,
     enforced: shouldEnforce,
-    ignoreWhitelist
+    ignoreWhitelist,
+    createdReceiverWhitelist
   });
 });
+
 
 
 

@@ -14,38 +14,51 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
  *  - All “actor-ish” entities → /profile/:ActorId   ✅
  *  - Sessions/events keep existing site routes
  * ------------------------------------------------------------------ */
-function linkFor(doc, type) {
-  const id = String(doc._id || doc.id || "");
-  switch (type) {
-    case "exhibitor":
-    case "attendee":
-    case "speaker":
-      return `/profile/${id}`;                             // ← as requested
+// FULL REPLACEMENT
+function linkFor(doc = {}, type = "") {
+  const id   = String(doc._id || doc.id || "").trim();
+  const evId = String(doc.id_event || doc.eventId || doc.event || "").trim();
+  const t    = String(type || "").toLowerCase();
 
-    case "session": {
-      const evId = String(doc.id_event || doc.eventId || "");
-      return evId ? `/events/${evId}#session-${id}` : `/events#session-${id}`;
+  const R = {
+    event:     (x) => x ? `/event/${x}` : `/events`,
+    speakers:  (e) => e ? `/event/${e}/speakers`   : `/event/68e6764bb4f9b08db3ccec04/speakers`,
+    exhibitors:(e) => e ? `/event/${e}/exhibitors` : `/event/68e6764bb4f9b08db3ccec04/exhibitors`,
+    attendees: (e) => e ? `/event/${e}/attendees`  : `/event/68e6764bb4f9b08db3ccec04/attendees`,
+    schedule:  (e) => e ? `/event/${e}/schedule`   : `/event/68e6764bb4f9b08db3ccec04/schedule`,
+    session:   (e, s) => (e ? `/event/${e}/schedule` : `/event/68e6764bb4f9b08db3ccec04/schedule`) + (s ? `#session-${s}` : ""),
+    track:     (e, trk) =>
+      (e ? `/event/${e}/schedule` : `/schedule`) + (trk ? `?track=${encodeURIComponent(trk)}` : ""),
+    byCity:    (c) => `/events?city=${encodeURIComponent(c || "")}`,
+    byCountry: (c) => `/events?country=${encodeURIComponent(c || "")}`,
+    tag:       (tg)=> `/tags/${encodeURIComponent(tg || "")}`,
+  };
+
+  switch (t) {
+    case "speaker":   return R.speakers(evId);
+    case "exhibitor": return R.exhibitors(evId);
+    case "attendee":  return R.attendees(evId);
+
+    // "Program" search intent → schedule page
+    case "Program":   return R.schedule(evId);
+
+    // Individual session result → schedule with anchor
+    case "session":   return R.session(evId, id);
+
+    case "track": {
+      const track = doc.track || doc._id || "";
+      return R.track(evId, track);
     }
 
-    case "event":
-      return `/event/${id}`;
+    case "event":     return R.event(id);
+    case "city":      return R.byCity(doc.city || doc._id || "");
+    case "country":   return R.byCountry(doc.country || doc._id || "");
+    case "tag":       return R.tag(doc.tag || doc._id || "");
 
-    case "track":
-      return `/event?track=${encodeURIComponent(doc.track || "")}`;
-
-    case "city":
-      return `/events?city=${encodeURIComponent(doc.city || "")}`;
-
-    case "country":
-      return `/events?country=${encodeURIComponent(doc.country || "")}`;
-
-    case "tag":
-      return `/tags/${encodeURIComponent(doc.tag || "")}`;
-
-    default:
-      return `/events`;
+    default:          return R.event(evId) || "/events";
   }
 }
+
 
 /* ------------------------- helpers ------------------------- */
 function escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
@@ -61,6 +74,7 @@ function makeRx(q) {
 ===================================================================== */
 exports.quick = async (req, res) => {
   const q = toStr(req.query.q).trim();
+  console.log(q);
   const limit = clamp(parseInt(req.query.limit, 10) || 4, 1, 8);
   if (!q || q.length < 2) return res.json([]);
 
@@ -148,6 +162,15 @@ exports.quick = async (req, res) => {
   ]);
 
   const out = [];
+  if (q === "Program") {
+    out.push({
+      _id: d._id,
+      type: "Program",
+      title: "Program",
+      href: linkFor(d, "Program"),
+      score: 12,
+    });
+  }
 
   exhibitors.forEach((d) => {
     const title = d.identity?.exhibitorName || d.identity?.orgName || "Exhibitor";
@@ -320,4 +343,60 @@ exports.click = async (req, res) => {
   } catch (_) {}
 
   res.json({ ok: true });
+};
+async function findActorById(id) {
+  if (!mongoose.isValidObjectId(id)) return null;
+  // Try known role collections; extend as needed
+  const [a, e, s] = await Promise.allSettled([
+    Attendee?.findById(id).select("_id").lean(),
+    Exhibitor?.findById(id).select("_id").lean(),
+    Speaker?.findById(id).select("_id").lean(),
+  ]);
+
+  const val = (r) => (r?.status === "fulfilled" ? r.value : null);
+  return val(a) || val(e) || val(s) || null;
+}
+
+/**
+ * GET /api/share/:actorId/:eventId
+ * Validates the link and returns canonical redirection target.
+ * No new model is required.
+ */
+exports.resolveShareLink = async (req, res) => {
+  try {
+    const { actorId, eventId } = req.params || {};
+
+    if (!mongoose.isValidObjectId(actorId)) {
+      return res.status(400).json({ message: "Bad actorId" });
+    }
+    if (!mongoose.isValidObjectId(eventId)) {
+      return res.status(400).json({ message: "Bad eventId" });
+    }
+
+    const [actor, ev] = await Promise.all([
+      findActorById(actorId),
+      Event.findById(eventId).select("_id title name").lean(),
+    ]);
+
+    if (!ev) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+    if (!actor) {
+      // We still return the event to allow redirect, but signal missing actor
+      return res.status(404).json({ message: "Actor not found for this link" });
+    }
+
+    // OK -> frontend will redirect to /event/:eventId
+    return res.json({
+      success: true,
+      data: {
+        eventId: String(ev._id),
+        actorId: String(actorId),
+        eventTitle: ev.title || ev.name || "Event",
+      },
+    });
+  } catch (e) {
+    console.error("[resolveShareLink] error:", e?.message || e);
+    return res.status(500).json({ message: "Internal error" });
+  }
 };

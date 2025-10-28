@@ -3183,6 +3183,7 @@ exports.getAttendeesForMeeting = asyncHdl(async (req, res) => {
 
   // ---- Filters -----------------------------------------------------
   const match = {};
+  match['adminVerified'] = { $in: ['yes'] }; // only admin-verified or unset
   if (eventId && mongoose.isValidObjectId(eventId)) {
     match.id_event = new mongoose.Types.ObjectId(eventId);
   }
