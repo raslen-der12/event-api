@@ -68,7 +68,7 @@ app.use('/api', require("./routes/freightRoutes"));
 app.use('/search', require('./routes/searchRoutes'));
 // Admin chat REST lives under /admin/chat/*
 app.use('/admin/chat', require('./routes/adminChatRoutes'));
-
+app.set('trust proxy', true);
 // Actor-facing API (DMs, groups, comments, etc.)
 app.use('/actors',  require('./routes/actorsRoutes'));
 
