@@ -54,6 +54,7 @@ router.post('/admin/meets/:id/link', protect,(isAdmin || isSuper), meetsCtrl.adm
 router.get('/admin/meets/:id/reschedule', protect, meetsCtrl.adminReschedule);     
 router.post('/admin/meets/:id/table', protect, meetsCtrl.adminSetTable);
 router.put('/whitelist', protect, meetsCtrl.setWhitelist);
-
+router.get("/:eventId/my", meetsCtrl.getMyWhitelist);
+router.post("/:eventId/my", meetsCtrl.setMyWhitelist);
 router.put('meets/admin/whitelist', protect, meetsCtrl.adminSetWhitelist);
 module.exports = router;

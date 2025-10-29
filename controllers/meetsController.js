@@ -37,6 +37,7 @@ const QRCode = require("qrcode");
 const PDFDocument = require('pdfkit');
 const HybridMeetingSlot = require('../models/HybridMeetingSlot');
 const MeetingTableCounter = require('../models/MeetingTableCounter');
+const SlotWhitelist = require("../models/SlotWhitelist");
 /* ─────────────────── helper maps ──────────────────── */
 
 
@@ -58,7 +59,6 @@ const MeetingAttendance =
     )
   );
 
-const SlotWhitelist = require('../models/SlotWhitelist'); // ← import
 
 const STEP_MS = 30 * 60 * 1000;
 const norm30 = (dLike) => {
@@ -4117,3 +4117,116 @@ exports.adminRepairEvent = asyncHandler(async (req, res) => {
 
   return res.json({ success: true, apply, mode, report });
 });
+
+
+function toYMD(d) {
+  return [
+    d.getUTCFullYear(),
+    String(d.getUTCMonth() + 1).padStart(2, "0"),
+    String(d.getUTCDate()).padStart(2, "0"),
+  ].join("-");
+}
+function normISOToStep(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  d.setSeconds(0, 0);
+  const snap = Math.floor(d.getTime() / STEP_MS) * STEP_MS;
+  return new Date(snap);
+}
+function dayBoundsUTC(ymd) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(ymd))) return null;
+  const [y, m, d] = ymd.split("-").map(Number);
+  const start = new Date(Date.UTC(y, (m || 1) - 1, d || 1, 0, 0, 0));
+  const endEx = new Date(start.getTime() + 24 * 3600 * 1000);
+  return { start, endEx };
+}
+
+// GET /api/availability/:eventId/my?date=YYYY-MM-DD
+exports.getMyWhitelist = async (req, res) => {
+  const { eventId } = req.params || {};
+  const { date } = req.query || {};
+  const { actorId } = req.query || {};
+  if (!mongoose.isValidObjectId(eventId))
+    return res.status(400).json({ message: "Bad eventId" });
+  const me = actorId && mongoose.isValidObjectId(actorId)
+    ? actorId
+    : req.user?._id;
+  if (!me) return res.status(401).json({ message: "Unauthorized" });
+  const rng = dayBoundsUTC(date);
+  if (!rng) return res.status(400).json({ message: "Bad date" });
+
+  const doc = await SlotWhitelist
+    .findOne({ eventId, actorId: me })
+    .select("slots")
+    .lean();
+
+  const all = Array.isArray(doc?.slots) ? doc.slots : [];
+  const daySlots = all
+    .map((v) => (v instanceof Date ? v : new Date(v)))
+    .filter((v) => v >= rng.start && v < rng.endEx)
+    .sort((a, b) => a - b);
+
+  return res.json({
+    success: true,
+    eventId,
+    date,
+    hasWhitelist: !!all.length,
+    data: daySlots.map((d) => d.toISOString()),
+  });
+};
+
+// POST /api/availability/:eventId/my  { date, slots:[iso...] }
+exports.setMyWhitelist = async (req, res) => {
+  const { eventId } = req.params || {};
+  const { date, slots } = req.body || {};
+  if (!mongoose.isValidObjectId(eventId))
+    return res.status(400).json({ message: "Bad eventId" });
+  const me = req.body.actorId || req.user?._id;
+  console.log(req.body);
+  if (!me) return res.status(401).json({ message: "Unauthorized" });
+
+  const rng = dayBoundsUTC(date);
+  if (!rng) return res.status(400).json({ message: "Bad date" });
+
+  if (!Array.isArray(slots))
+    return res.status(400).json({ message: "slots must be an array" });
+
+  // Normalize & keep only slots inside this day
+  const nextDaySlots = [];
+  for (const s of slots) {
+    const d = normISOToStep(s);
+    if (!d) continue;
+    if (d >= rng.start && d < rng.endEx) nextDaySlots.push(d);
+  }
+  // Dedupe
+  const dedup = new Map(nextDaySlots.map((d) => [d.getTime(), d]));
+  const payloadDay = Array.from(dedup.values()).sort((a, b) => a - b);
+
+  // Upsert document; remove any existing slots for THIS day, then add payloadDay
+  const doc = await SlotWhitelist.findOne({ eventId, actorId: me });
+  if (!doc) {
+    const created = await SlotWhitelist.create({
+      eventId,
+      actorId: me,
+      slots: payloadDay,
+    });
+    return res.json({
+      success: true,
+      eventId,
+      date,
+      data: created.slots.map((d) => d.toISOString()),
+    });
+  }
+
+  const all = Array.isArray(doc.slots) ? doc.slots : [];
+  const kept = all.filter((v) => v < rng.start || v >= rng.endEx);
+  doc.slots = kept.concat(payloadDay);
+  await doc.save();
+
+  const dayOut = doc.slots
+    .filter((v) => v >= rng.start && v < rng.endEx)
+    .sort((a, b) => a - b)
+    .map((d) => d.toISOString());
+
+  return res.json({ success: true, eventId, date, data: dayOut });
+};
