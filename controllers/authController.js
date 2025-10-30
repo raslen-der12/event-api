@@ -931,106 +931,108 @@ exports.registerExhibitor = asyncHandler(async (req, res) => {
     actorHeadline = '',
 
     'identity.exhibitorName': exhibitorName,
-    'identity.contactName': contactName,
-    'identity.email': email,
-    'identity.phone': phone,
-    'identity.country': country,
-    'identity.city': city,
-    'identity.orgName': orgName,
+    'identity.contactName'  : contactName,
+    'identity.email'        : email,
+    'identity.phone'        : phone,
+    'identity.country'      : country,
+    'identity.city'         : city,
+    'identity.orgName'      : orgName,
     'identity.preferredLanguages': prefLangCsv,
 
-    'business.industry': industry,
+    'business.industry'     : industry,
     'commercial.availableMeetings': availableMeetings,
 
-    'links.website': website,
-    'links.linkedin': linkedin,
+    'links.website'         : website,
+    'links.linkedin'        : linkedin,
   } = req.body || {};
 
-  await assertEmailAvailableEverywhere(req.body.email);
-
+  // Sessions (required, like attendee)
   const sessionIds = []
     .concat(req.body['sessionIds[]'] || req.body.sessionIds || [])
     .flat()
     .filter(Boolean);
 
-  // Basic validation
-  if (!isId(eventId)) return res.status(400).json({ message: 'Valid eventId is required' });
-  if (!toStr(exhibitorName).trim()) return res.status(400).json({ message: 'Exhibitor/Brand name is required' });
-  if (!toStr(contactName).trim()) return res.status(400).json({ message: 'Contact person is required' });
-  if (!EMAIL_RX.test(toStr(email))) return res.status(400).json({ message: 'Valid email is required' });
-  if (!toStr(country).trim()) return res.status(400).json({ message: 'Country is required' });
-  // Logo is OPTIONAL now (no error if missing)
-  if (!sessionIds.length) return res.status(400).json({ message: 'Please select at least one session' });
+  // Cross-collection uniqueness (same spirit as attendee)
+  await assertEmailAvailableEverywhere(email);
+
+  // Basic validation parity with attendee (minus gender/virtual fields)
+  if (!isId(eventId))                       return res.status(400).json({ message: 'Valid eventId is required' });
+  if (!toStr(exhibitorName).trim())         return res.status(400).json({ message: 'Exhibitor/Brand name is required' });
+  if (!toStr(contactName).trim())           return res.status(400).json({ message: 'Contact person is required' });
+  if (!EMAIL_RX.test(toStr(email)))         return res.status(400).json({ message: 'Valid email is required' });
+  if (!toStr(country).trim())               return res.status(400).json({ message: 'Country is required' });
+  if (!sessionIds.length)                   return res.status(400).json({ message: 'Please select at least one session' });
 
   const PASSWORD_MIN = 8;
-  if (!toStr(pwd)) return res.status(400).json({ message: 'Password is required' });
-  if (toStr(pwd).length < PASSWORD_MIN)
-    return res.status(400).json({ message: `Password must be at least ${PASSWORD_MIN} characters` });
+  if (!toStr(pwd))                          return res.status(400).json({ message: 'Password is required' });
+  if (toStr(pwd).length < PASSWORD_MIN)     return res.status(400).json({ message: `Password must be at least ${PASSWORD_MIN} characters` });
 
+  // Collection-local uniqueness (like attendee had for its own model)
   if (await Exhibitor.exists({ 'identity.email': toStr(email).toLowerCase() })) {
     return res.status(409).json({ message: 'Email already registered' });
   }
 
+  // Sub-roles (same helper used by attendee)
   const subRole = parseSubRoles(req.body);
   const actorTypeNorm = toStr(actorType).trim();
   const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
 
   const preferredLanguages = csvToArr(prefLangCsv).slice(0, 3);
   const openFlag = normBool(availableMeetings);
+
   const salt    = await bcrypt.genSalt(12);
   const pwdHash = await bcrypt.hash(toStr(pwd), salt);
 
-  // Logo: uploaded or default
-  const DEF_PHOTO =
-    `${(process.env.DEF_ROOT || '').replace(/\/+$/,'')}/uploads/default/photodef.png`;
-  const logoUrl = req.file?.path ? localPathToWebUrl(req.file.path) : DEF_PHOTO;
+  // Logo: uploaded or default (same default approach as attendee)
+  const DEF_PHOTO = `${(process.env.DEF_ROOT || '').replace(/\/+$/,'')}/uploads/default/photodef.png`;
+  const logoUrl   = req.file?.path ? localPathToWebUrl(req.file.path) : DEF_PHOTO;
 
+  // Persist (mirror attendee fields where applicable; keep adminVerified 'pending')
   const created = await Exhibitor.create({
     identity: {
       exhibitorName: toStr(exhibitorName).trim(),
-      contactName: toStr(contactName).trim(),
-      email: toStr(email).toLowerCase().trim(),
-      firstEmail: toStr(email).toLowerCase().trim(),
-      phone: toStr(phone).trim(),
-      country: toStr(country).toUpperCase(),
-      city: toStr(city).trim(),
-      orgName: toStr(orgName).trim(),
-      logo: logoUrl,
+      contactName  : toStr(contactName).trim(),
+      email        : toStr(email).toLowerCase().trim(),
+      firstEmail   : toStr(email).toLowerCase().trim(),
+      phone        : toStr(phone).trim(),
+      country      : toStr(country).toUpperCase(),
+      city         : toStr(city).trim(),
+      orgName      : toStr(orgName).trim(),
+      logo         : logoUrl,
       preferredLanguages
     },
-    business: { industry: toStr(industry).trim() },
-    commercial: { availableMeetings: openFlag },
-    links: { website: toStr(website).trim(), linkedin: toStr(linkedin).trim() },
-    id_event: eventId,
+    business   : { industry: toStr(industry).trim() },
+    commercial : { availableMeetings: openFlag },
+    links      : { website: toStr(website).trim(), linkedin: toStr(linkedin).trim() },
+    id_event   : eventId,
 
-    actorType: toStr(actorType).trim(),
-    role: toStr(actorType).trim(),
+    actorType,
+    role       : actorType,
     actorHeadline: toStr(actorHeadline).trim(),
-    pwd: pwdHash,
-    subRole: finalSubRole,
-    verified: false,
+    pwd        : pwdHash,
+    subRole    : finalSubRole,
+    verified   : false,
     adminVerified: 'pending'
   });
 
-  // Verify link
+  // Email verification (same flow as attendee)
   const raw = randomBytes(32).toString('hex');
   created.verifyToken   = await bcrypt.hash(raw, 12);
-  created.verifyExpires = Date.now() + 24 * 60 * 60 * 1000;
+  created.verifyExpires = Date.now() + 24 * 60 * 60 * 1000; // 24h
   await created.save();
   const verifyLink = `${process.env.FRONTEND_URL}/verify-email?token=${raw}&role=exhibitor&id=${created._id}`;
 
-  // Sessions (normalized)
+  // Normalize + validate sessions to event (same helpers)
   const normSessions = await loadAndValidateSessions(eventId, sessionIds);
 
-  // ==== Conflict system (per time slot + track family) ====
-  // Atelier and Masterclass do NOT conflict with each other at the same time.
-  const conflictBucket = (track) => {
-    const t = String(track || '').toLowerCase();
+  // Conflict system per (time,bucket) exactly like attendee
+  const conflictBucket = (track = '') => {
+    const t = String(track).toLowerCase();
     if (t.includes('atelier')) return 'atelier';
     if (t.includes('masterclass')) return 'masterclass';
     return 'other';
   };
-  const seen = new Map(); // key = `${startMs}|${bucket}`
+  const seen = new Map();
   for (const s of normSessions) {
     const start = s.startAt instanceof Date ? s.startAt : new Date(s.startAt);
     const key = `${start.getTime()}|${conflictBucket(s.track)}`;
@@ -1044,8 +1046,9 @@ exports.registerExhibitor = asyncHandler(async (req, res) => {
     seen.set(key, s);
   }
 
+  // Capacity enforcement (same as attendee)
   try {
-    await attachSeatsAndEnforce({ normSessions, enforce: true }); // throws if any session is full
+    await attachSeatsAndEnforce({ normSessions, enforce: true });
   } catch (e) {
     if (e && e.message === 'SESSION_FULL') {
       return res.status(409).json({
@@ -1056,94 +1059,86 @@ exports.registerExhibitor = asyncHandler(async (req, res) => {
     throw e;
   }
 
-  // Create registrations
+  // Registrations + bump seatsTaken (same as attendee)
   await createSessionRegs({ actorId: created._id, actorRole: 'exhibitor', eventId, sessions: normSessions });
   await bumpScheduleSeatsTaken(normSessions.map(s => s._id), +1);
   normSessions.forEach(s => { delete s.__raw; });
 
-  // Event doc for header/PDF
+  // Event for header/PDF
   const eventDoc = await Event.findById(eventId).lean().catch(() => null) || {
     _id: eventId, title: 'Event', startDate: new Date(), endDate: new Date(), city: '', country: ''
   };
 
-  // PDF
+  // PDF (same builder used everywhere)
   const pdf = await buildRegistrationPdf({ event: eventDoc, actor: created, role: 'exhibitor', sessions: normSessions });
 
-  // Email
+  // Email (parity styling; no virtual/gender mention)
   const brandLogoPath = process.env.BRAND_LOGO_PATH;
   const who = created?.identity?.contactName || created?.identity?.exhibitorName || 'there';
 
-  // Taller, wrapped rows for long titles
- const rowsHtml = normSessions.map(s => {
-  const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
-  const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
-  const seatNote = s.seats && s.seats.capacity > 0
-    ? ` (${Math.max(0, s.seats.capacity - s.seats.taken)} left / ${s.seats.capacity})`
+  const rowsHtml = normSessions.map(s => {
+    const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
+    const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
+    const seatNote = s.seats && s.seats.capacity > 0
+      ? ` (${Math.max(0, s.seats.capacity - s.seats.taken)} left / ${s.seats.capacity})`
+      : '';
+    const tdBase = "padding:12px 10px;border-bottom:1px solid #eee;vertical-align:top;line-height:1.5;height:auto;";
+    const wrap   = "white-space:normal;word-break:break-word;overflow-wrap:break-word;-ms-word-break:break-all;";
+    const nowrap = "white-space:nowrap;";
+    return `
+      <tr style="height:auto;">
+        <td valign="top" style="${tdBase}${nowrap}mso-line-height-rule:exactly;">${startStr}–${endStr}</td>
+        <td valign="top" style="${tdBase}font-weight:600;${wrap}mso-line-height-rule:exactly;">${escapeHtml(s.title)}${seatNote}</td>
+        <td valign="top" style="${tdBase}${wrap}mso-line-height-rule:exactly;">${escapeHtml(s.room.name || '')}</td>
+        <td valign="top" style="${tdBase}color:#64748b;${wrap}mso-line-height-rule:exactly;">${escapeHtml(s.track || '')}</td>
+      </tr>`;
+  }).join('');
+
+  const logoImg = brandLogoPath
+    ? `<img src="cid:brandlogo@cid" alt="Logo" style="max-height:40px;vertical-align:middle;margin-right:8px"/>`
     : '';
 
-  // Common TD style: let height expand with content; keep generous padding
-  const tdBase = "padding:12px 10px;border-bottom:1px solid #eee;vertical-align:top;line-height:1.5;height:auto;";
-  // Strong wrapping for long text (Outlook/Apple Mail/Gmail)
-  const wrap    = "white-space:normal;word-break:break-word;overflow-wrap:break-word;-ms-word-break:break-all;";
-  const nowrap  = "white-space:nowrap;";
+  const hdr = `
+    <div style="padding:14px 0;border-bottom:1px solid #e5e7eb;margin-bottom:12px">
+      ${logoImg}
+      <div style="font:700 18px/1.2 system-ui,Segoe UI,Roboto;display:inline-block;vertical-align:middle">
+        ${escapeHtml(eventDoc.title || 'Event')}
+      </div>
+      <div style="font:600 12px/1.4 system-ui;color:#64748b">
+        ${new Date(eventDoc.startDate||Date.now()).toLocaleDateString()} → ${new Date(eventDoc.endDate||Date.now()).toLocaleDateString()}
+        ${eventDoc.city ? `• ${escapeHtml(eventDoc.city)}` : ''} ${eventDoc.country ? `• ${escapeHtml(eventDoc.country)}` : ''}
+      </div>
+    </div>`;
 
-  return `
-    <tr style="height:auto;">
-      <td valign="top" style="${tdBase}${nowrap}mso-line-height-rule:exactly;">${startStr}–${endStr}</td>
-      <td valign="top" style="${tdBase}font-weight:600;${wrap}mso-line-height-rule:exactly;">
-        ${escapeHtml(s.title)}${seatNote}
-      </td>
-      <td valign="top" style="${tdBase}${wrap}mso-line-height-rule:exactly;">${escapeHtml(s.room.name || '')}</td>
-      <td valign="top" style="${tdBase}color:#64748b;${wrap}mso-line-height-rule:exactly;">${escapeHtml(s.track || '')}</td>
-    </tr>`;
-}).join('');
+  const sessionsHtml = normSessions.length ? `
+    <h3 style="font:800 14px system-ui;margin:12px 0 8px">Your selected sessions</h3>
+    <table role="presentation" cellpadding="0" cellspacing="0"
+           style="border-collapse:separate;border-spacing:0;width:100%;font:600 12px system-ui;table-layout:auto;mso-table-lspace:0pt;mso-table-rspace:0pt;">
+      <thead>
+        <tr>
+          <th align="left" valign="top" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;line-height:1.5;">Time</th>
+          <th align="left" valign="top" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;line-height:1.5;">Title</th>
+          <th align="left" valign="top" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;line-height:1.5;">Room</th>
+          <th align="left" valign="top" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;line-height:1.5;">Track</th>
+        </tr>
+      </thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>` : '';
 
-const logoImg = brandLogoPath
-  ? `<img src="cid:brandlogo@cid" alt="Logo" style="max-height:40px;vertical-align:middle;margin-right:8px"/>`
-  : '';
-
-const hdr = `
-  <div style="padding:14px 0;border-bottom:1px solid #e5e7eb;margin-bottom:12px">
-    ${logoImg}
-    <div style="font:700 18px/1.2 system-ui,Segoe UI,Roboto;display:inline-block;vertical-align:middle">
-      ${escapeHtml(eventDoc.title || 'Event')}
-    </div>
-    <div style="font:600 12px/1.4 system-ui;color:#64748b">
-      ${new Date(eventDoc.startDate||Date.now()).toLocaleDateString()} → ${new Date(eventDoc.endDate||Date.now()).toLocaleDateString()}
-      ${eventDoc.city ? `• ${escapeHtml(eventDoc.city)}` : ''} ${eventDoc.country ? `• ${escapeHtml(eventDoc.country)}` : ''}
-    </div>
-  </div>`;
-
-const sessionsHtml = normSessions.length ? `
-  <h3 style="font:800 14px system-ui;margin:12px 0 8px">Your selected sessions</h3>
-  <table role="presentation" cellpadding="0" cellspacing="0"
-         style="border-collapse:separate;border-spacing:0;width:100%;font:600 12px system-ui;table-layout:auto;mso-table-lspace:0pt;mso-table-rspace:0pt;">
-    <thead>
-      <tr>
-        <th align="left" valign="top" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;line-height:1.5;">Time</th>
-        <th align="left" valign="top" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;line-height:1.5;">Title</th>
-        <th align="left" valign="top" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;line-height:1.5;">Room</th>
-        <th align="left" valign="top" style="padding:12px 10px;border-bottom:2px solid #e5e7eb;line-height:1.5;">Track</th>
-      </tr>
-    </thead>
-    <tbody>${rowsHtml}</tbody>
-  </table>` : '';
-
-const html = `
-  ${hdr}
-  <p style="font:600 14px system-ui">Hello ${escapeHtml(who)},</p>
-  <p style="font:600 13px system-ui">
-    Thank you for registering to <b>${escapeHtml(eventDoc.title || 'the event')}</b>.
-    We attached your confirmation PDF below (with your sessions and QR).
-  </p>
-  <p style="font:600 13px system-ui;margin:12px 0">
-    Please verify your email to activate your account:
-    <br/><a href="${verifyLink}" style="font-weight:700;color:#2563eb">${verifyLink}</a>
-  </p>
-  ${sessionsHtml}
-  <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>IPDAYS X GITS 2025</p>
-`;
-
+  const html = `
+    ${hdr}
+    <p style="font:600 14px system-ui">Hello ${escapeHtml(who)},</p>
+    <p style="font:600 13px system-ui">
+      Thank you for registering to <b>${escapeHtml(eventDoc.title || 'the event')}</b>.
+      We attached your confirmation PDF below (with your sessions and QR).
+    </p>
+    <p style="font:600 13px system-ui;margin:12px 0">
+      Please verify your email to activate your account:
+      <br/><a href="${verifyLink}" style="font-weight:700;color:#2563eb">${verifyLink}</a>
+    </p>
+    ${sessionsHtml}
+    <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>IPDAYS X GITS 2025</p>
+  `;
 
   const attachments = [{ filename: 'registration.pdf', content: pdf, contentType: 'application/pdf' }];
   if (brandLogoPath) {
@@ -1158,6 +1153,7 @@ const html = `
     attachments
   );
 
+  // Atomic event seat increment (same guard as attendee)
   try {
     await incEventSeatsTakenOrThrow(eventId);
   } catch (e) {
@@ -1165,9 +1161,12 @@ const html = `
     return res.status(409).json({ message: 'Event is full' });
   }
 
+  // Popup notif (same as attendee)
   await notifyRegistrationPending(created._id, 'exhibitor', eventId);
+
   return res.status(201).json({ success: true, data: { id: created._id, role: 'exhibitor' } });
 });
+
 
 
 

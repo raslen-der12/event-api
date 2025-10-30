@@ -39,6 +39,8 @@ const HybridMeetingSlot = require('../models/HybridMeetingSlot');
 const MeetingTableCounter = require('../models/MeetingTableCounter');
 const SlotWhitelist = require("../models/SlotWhitelist");
 /* ─────────────────── helper maps ──────────────────── */
+const SessionRegistration = require('../models/sessionRegistration'); // path as in your app
+const { Types } = require("mongoose");
 
 
 const MeetingAttendance =
@@ -59,6 +61,31 @@ const MeetingAttendance =
     )
   );
 
+const EventCheckin = mongoose.models.eventCheckin || mongoose.model('eventCheckin', new mongoose.Schema({
+  eventId:  { type: Types.ObjectId, index: true, required: true },
+  actorId:  { type: Types.ObjectId, index: true, required: true },
+  actorRole:{ type: String, enum: ['attendee','exhibitor','speaker','admin'], required: true },
+  at:       { type: Date, default: Date.now },
+  by:       { type: Types.ObjectId, index: true }
+}, { versionKey:false, timestamps:false }));
+
+const SessionAttendance = mongoose.models.sessionAttendance || mongoose.model('sessionAttendance', new mongoose.Schema({
+  sessionId:{ type: Types.ObjectId, index: true, required: true },
+  eventId:  { type: Types.ObjectId, index: true, required: true },
+  actorId:  { type: Types.ObjectId, index: true, required: true },
+  actorRole:{ type: String, enum: ['attendee','exhibitor','speaker','admin'], required: true },
+  at:       { type: Date, default: Date.now },
+  by:       { type: Types.ObjectId, index: true }
+}, { versionKey:false, timestamps:false }));
+
+function resolveActorModel(role){
+  switch(String(role||'').toLowerCase()){
+    case 'attendee': return Attendee;
+    case 'exhibitor': return Exhibitor;
+    case 'speaker': return Speaker;
+    default: return null;
+  }
+}
 
 const STEP_MS = 30 * 60 * 1000;
 const norm30 = (dLike) => {
@@ -2237,7 +2264,6 @@ if (act === 'confirm') {
 
 
 
-
 // GET /meets/suggested?actorId=...&eventId=...&limit=20&pool=50&search=...&role=attendee|exhibitor|speaker&lang=en&country=TN&open=1
 exports.getSuggestedList = asyncHandler(async (req, res) => {
   const meId = req.user?._id || req.query.actorId;
@@ -2270,6 +2296,39 @@ exports.getSuggestedList = asyncHandler(async (req, res) => {
         .map(norm)
         .filter((t) => t && t.length >= 2 && t !== "and" && t !== "or")
     );
+    const extrasFromDoc = (role, doc) => {
+  const r = String(role || "").toLowerCase();
+  if (r === "attendee") {
+    return {
+      jobTitle: getp(doc, "organization.jobTitle") || "",
+      orgName:  getp(doc, "organization.orgName") || "",
+      city:     getp(doc, "personal.city") || "",
+      country:  getp(doc, "personal.country") || "",
+      objectives: arrify(getp(doc, "matchingIntent.objectives"))
+        .map(toStr).filter(Boolean),
+    };
+  }
+  if (r === "exhibitor") {
+    return {
+      jobTitle: "",
+      orgName:  getp(doc, "identity.orgName") || "",
+      city:     getp(doc, "identity.city") || "",
+      country:  getp(doc, "identity.country") || "",
+      objectives: arrify(getp(doc, "commercial.lookingFor"))
+        .map(toStr).filter(Boolean),
+    };
+  }
+  // speaker
+  return {
+    jobTitle: getp(doc, "organization.jobTitle") || "",
+    orgName:  getp(doc, "organization.orgName") || "",
+    city:     getp(doc, "personal.city") || "",
+    country:  getp(doc, "personal.country") || "",
+    objectives: arrify(getp(doc, "b2bIntent.lookingFor"))
+      .map(toStr).filter(Boolean),
+  };
+};
+
   const langAliases = {
     en: "english",
     eng: "english",
@@ -2565,6 +2624,9 @@ exports.getSuggestedList = asyncHandler(async (req, res) => {
       "personal.profilePic": 1,
       "personal.email": 1,
       "personal.country": 1,
+      "personal.city": 1,
+      "organization.orgName": 1,
+      "organization.jobTitle": 1,
       "personal.preferredLanguages": 1,
       "businessProfile.primaryIndustry": 1,
       "businessProfile.offering": 1,
@@ -2575,6 +2637,7 @@ exports.getSuggestedList = asyncHandler(async (req, res) => {
       "identity.orgName": 1,
       "identity.contactName": 1,
       "identity.email": 1,
+      "identity.city": 1,
       "identity.country": 1,
       "identity.logo": 1,
       "identity.preferredLanguages": 1,
@@ -2590,6 +2653,9 @@ exports.getSuggestedList = asyncHandler(async (req, res) => {
       "b2bIntent.lookingFor": 1,
       "b2bIntent.regionsInterest": 1,
       "b2bIntent.openMeetings": 1,
+      "organization.orgName": 1,
+    "organization.jobTitle": 1,
+    "personal.city": 1,
       id_event: 1,
     };
 
@@ -2622,9 +2688,9 @@ exports.getSuggestedList = asyncHandler(async (req, res) => {
   };
 
   const scored = candidates.map(({ role, doc }) => {
-  const disp = displayFromDoc(role, doc);
-  const vec = extractVectors(role, doc);
-
+const disp = displayFromDoc(role, doc);
+  const vec  = extractVectors(role, doc);
+  const ext  = extrasFromDoc(role, doc);
   const semantic = scorePair(meV, vec);
 
   const hasPhoto =
@@ -2672,7 +2738,13 @@ exports.getSuggestedList = asyncHandler(async (req, res) => {
     name: disp.name || "",
     photo: disp.photo || "",
     tag,
-    virtual: !!doc.virtualMeet,   // <<< keep for UI badge
+    virtual: !!doc.virtualMeet,
+    eventId: String(vec.eventId || getp(doc, "id_event") || ""),
+    jobTitle: ext.jobTitle,
+    orgName:  ext.orgName,
+    city:     ext.city,
+    country:  ext.country,
+    objectives: ext.objectives,
     _score: Math.max(1e-6, score) // raw (pre-normalization)
   };
 });
@@ -2712,14 +2784,20 @@ console.log("[getSuggestedList] Normalization", {
     .sort((a, b) => a.key - b.key);
 
   const out = keyed.slice(0, limit).map(({ p }) => ({
-    id: p.id,
-    role: p.role,
-    name: p.name,
-    photo: p.photo,
-    tag: p.tag,
-    virtual: !!p.virtual, 
-    matchPct: p.matchPct,
-  }));
+  id: p.id,
+  role: p.role,
+  name: p.name,
+  photo: p.photo,
+  tag: p.tag,
+  virtual: !!p.virtual,
+  matchPct: p.matchPct,
+  eventId: p.eventId,
+  jobTitle: p.jobTitle,
+  orgName:  p.orgName,
+  city:     p.city,
+  country:  p.country,
+  objectives: Array.isArray(p.objectives) ? p.objectives : [],
+}));
 
   console.log("[getSuggestedList] Pool/meta", {
     poolSize: pool.length,
@@ -4230,3 +4308,104 @@ exports.setMyWhitelist = async (req, res) => {
 
   return res.json({ success: true, eventId, date, data: dayOut });
 };
+
+exports.adminScanActorAttend = asyncHandler(async (req,res)=>{
+  let { eventId, actorId, actorRole, token } = req.body||{};
+  if (token && !eventId && !actorId){
+    try { const o = JSON.parse(Buffer.from(String(token),'base64url').toString('utf8'));
+      eventId=o.eventId; actorId=o.actorId; actorRole=o.actorRole;
+    } catch {}
+  }
+  if (!mongoose.isValidObjectId(eventId) || !mongoose.isValidObjectId(actorId))
+    return res.status(400).json({ message:'Bad ids' });
+
+  const Model = resolveActorModel(actorRole);
+  if (!Model) return res.status(400).json({ message:'Bad actorRole' });
+
+  const exists = await Model.exists({ _id: actorId, id_event: eventId });
+  if (!exists) return res.status(404).json({ message:'Actor not in event' });
+
+  await EventCheckin.updateOne(
+    { eventId, actorId, actorRole },
+    { $set: { eventId, actorId, actorRole, at: new Date(), by: req.user._id }},
+    { upsert:true }
+  );
+  const count = await EventCheckin.countDocuments({ eventId });
+  return res.json({ success:true, data:{ checkedIn:true, eventCheckins:count }});
+});
+exports.adminScanSession = asyncHandler(async (req,res)=>{
+  const { sessionId, eventId, actorId, actorRole, mark=true } = req.body||{};
+  if (![sessionId,eventId,actorId].every(mongoose.isValidObjectId))
+    return res.status(400).json({ message:'Bad ids' });
+
+  const reg = await SessionRegistration.findOne({ sessionId, actorId, eventId, status:{ $ne:'cancelled' } }).lean();
+  const assigned = !!reg;
+
+  if (mark && assigned){
+    await SessionAttendance.updateOne(
+      { sessionId, eventId, actorId },
+      { $set:{ sessionId, eventId, actorId, actorRole, at:new Date(), by:req.user._id }},
+      { upsert:true }
+    );
+  }
+  return res.json({ success:true, data:{ assigned, marked:Boolean(mark && assigned) }});
+});
+exports.adminScanMeet = asyncHandler(async (req,res)=>{
+  const { meetId, actorId, kind='physical' } = req.body||{};
+  if (!mongoose.isValidObjectId(meetId) || !mongoose.isValidObjectId(actorId))
+    return res.status(400).json({ message:'Bad ids' });
+  if (!['physical','virtual'].includes(kind)) return res.status(400).json({ message:'Bad kind' });
+
+  const meet = await MeetRequest.findById(meetId).lean();
+  if (!meet) return res.status(404).json({ message:'Meeting not found' });
+
+  // upsert attendance record
+  await MeetingAttendance.updateOne(
+    { meetingId: meetId, actorId, kind },
+    { $set:{ meetingId: meetId, eventId: meet.eventId, actorId, kind, attended:true, at:new Date(), by:req.user._id }},
+    { upsert:true }
+  );
+
+  // check both actors
+  const both = await MeetingAttendance.countDocuments({ meetingId: meetId, attended:true });
+  const happened = both >= 2;
+
+  if (happened){
+    // store marker without schema migration (extra field)
+    await MeetRequest.updateOne({ _id: meetId }, { $set:{ happenedAt: new Date() }});
+  }
+
+  const recs = await MeetingAttendance.find({ meetingId: meetId }).lean();
+  return res.json({ success:true, data:{ happened, recs }});
+});
+
+exports.exportConfirmedMeetsCSV = asyncHandler(async (req,res)=>{
+  const { eventId } = req.query||{};
+  if (!mongoose.isValidObjectId(eventId)) return res.status(400).json({ message:'Bad eventId' });
+
+  const rows = await MeetRequest.find({ eventId, status:'confirmed' })
+    .select('slotISO senderId receiverId tableId meetLink happenedAt')
+    .populate({ path:'senderId', select:'personal.fullName identity.exhibitorName identity.contactName' })
+    .populate({ path:'receiverId', select:'personal.fullName identity.exhibitorName identity.contactName' })
+    .lean();
+
+  const csv = [
+    'meetId,slotISO,sender,receiver,tableId,meetLink,happenedAt'
+  ].concat(rows.map(r=>{
+    const sName = r.senderId?.personal?.fullName || r.senderId?.identity?.contactName || r.senderId?.identity?.exhibitorName || '';
+    const rName = r.receiverId?.personal?.fullName || r.receiverId?.identity?.contactName || r.receiverId?.identity?.exhibitorName || '';
+    return [
+      r._id,
+      (r.slotISO ? new Date(r.slotISO).toISOString() : ''),
+      JSON.stringify(sName),
+      JSON.stringify(rName),
+      r.tableId || '',
+      r.meetLink || '',
+      r.happenedAt ? new Date(r.happenedAt).toISOString() : ''
+    ].join(',');
+  })).join('\n');
+
+  res.setHeader('Content-Type','text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="confirmed_meetings_${eventId}.csv"`);
+  return res.end(csv);
+});

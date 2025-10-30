@@ -10,7 +10,14 @@ router.get ('/refresh', authCtrl.refresh);
 router.post('/logout',  protect, authCtrl.logout);
 
 router.post('/register/attendee', imageUploader.single('photo') ,  authCtrl.registerAttendee);   
-router.post('/register/exhibitor',imageUploader.single('logo'), authCtrl.registerExhibitor);
+router.post(
+   '/register/exhibitor',
+   imageUploader.fields([
+     { name: 'logo',  maxCount: 1 },
+     { name: 'photo', maxCount: 1 },
+   ]),
+   authCtrl.registerExhibitor
+ );
 
 router.post ('/verify-email',        authCtrl.verifyEmail);
 router.post('/resend-verification', authCtrl.resendVerification);

@@ -15,7 +15,8 @@ const IdentitySchema = new mongoose.Schema({
   phone        : { type: String, trim: true },
   country      : { type: String, trim: true, uppercase: true, required: true },
   city         : { type: String, trim: true },
-  logo         : { type: String, trim: true },                 // /uploads/... set by multer
+  logo         : { type: String, trim: true },  
+  contactPhoto : { type: String, trim: true },
   preferredLanguages: {
     type: [String],
     default: []
