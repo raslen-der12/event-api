@@ -24,6 +24,7 @@ r.get('/bp/me/summary', protect, Prof.getMyProfileSummary);
 r.patch('/bp/me', protect, Prof.updateMyProfile);
 r.patch('/bp/me/role', protect, Prof.changeMyBusinessRole);
 r.post('/bp/me/legal',       protect, Media.setLegalDoc);
+r.get('/bp/by-id/:id', Prof.confirmProfileId);
 // items (owner)
 r.post('/bp/me/items', protect, Item.createItem);
 r.get('/bp/me/items',  protect, Item.listMyItems);
@@ -47,14 +48,13 @@ r.get('/bp/facets/selects', Search.getFacets);
 
 
 
-
 r.get('/bp/:profileId/overview', Stats.getProfileOverview);
 r.get('/bp/:profileId/rating', Stats.getProfileRating);
 r.post('/bp/:profileId/rating', protect, Stats.postProfileRating);
 r.post('/bp/:profileId/innovation', protect, Stats.postProfileInnovation);
 r.post('/bp/:profileId/presence',   protect, Stats.postProfilePresence);
 
-r.get('/bp/:profileId/team',   protect, Prof.getPublicTeam );
+r.get('/bp/:profileId/team',   protect, Prof.getPublicTeam ); // public view of team
 
 r.get('/bp/team/search', protect, Prof.searchTeamCandidates);
 r.get   ('/bp/me/team',                        protect, Prof.getMyTeam);

@@ -11,120 +11,129 @@ const TYPE_TO_MODEL = {
   speaker:   Speaker,
   attendee:  Attendee,
 };
-exports.getPublicTeam = async function getPublicTeam(req, res) {
-  try {
-    const { profileId } = req.params;
-    if (!profileId || !mongoose.isValidObjectId(profileId)) {
-      return res.status(400).json({ success: false, error: 'INVALID_PROFILE_ID' });
-    }
-
-    const bp = await BusinessProfile.findById(profileId).lean();
-    if (!bp) {
-      return res.status(404).json({ success: false, error: 'BP_NOT_FOUND' });
-    }
-
-    const rawTeam = Array.isArray(bp.team) ? bp.team : [];
-    console.log("rawTeam",rawTeam);
-    // De-dupe by entityType+entityId (newest first)
-    const seen = new Set();
-    const team = [];
-    for (let i = rawTeam.length - 1; i >= 0; i--) {
-      const t = rawTeam[i] || {};
-      const role = String(t.role || '').toLowerCase();
-      const id = String(t.entityId || '');
-      if (!role || !id) continue;
-      const key = `${role}:${id}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      team.unshift({entityId: id, role: role });
-    }
-
-    // Group ids by type for batched lookups
-    const byType = { exhibitor: [], speaker: [], attendee: [] };
-    for (const t of team) {
-      if (byType[t.role]) byType[t.role].push(t.entityId);
-    }
-
-    // Fetch docs in batches
-    const [exDocs, spDocs, atDocs] = await Promise.all([
-      byType.exhibitor.length ? Exhibitor.find({ _id: { $in: byType.exhibitor } }).lean() : [],
-      byType.speaker.length   ? Speaker.find({   _id: { $in: byType.speaker }   }).lean() : [],
-      byType.attendee.length  ? Attendee.find({  _id: { $in: byType.attendee }  }).lean() : [],
-    ]);
-
-    // Index by id for quick hydrate
-    const mapDoc = (arr) => {
-      const m = new Map();
-      for (const d of arr) m.set(String(d._id), d);
-      return m;
-    };
-    const idx = {
-      exhibitor: mapDoc(exDocs || []),
-      speaker:   mapDoc(spDocs || []),
-      attendee:  mapDoc(atDocs || []),
-    };
-
-    // helper: pick displayable fields with robust fallbacks
-    const pickName = (d) =>
-      d?.name ||
-      d?.fullName ||
-      [d?.firstName, d?.lastName].filter(Boolean).join(' ') ||
-      d?.company ||
-      '—';
-
-    const pickTitle = (d) =>
-      d?.title || d?.position || d?.jobTitle || d?.role || '';
-
-    const pickAvatar = (d, name) =>
-      d?.avatarUpload ||
-      d?.photoUpload ||
-      d?.logoUpload ||
-      d?.imageUpload ||
-      d?.avatarUrl ||
-      d?.photoUrl ||
-      d?.imageUrl ||
-      d?.logoUrl ||
-      // initials fallback (client can still use dicebear if empty)
-      '';
-
-    // Only include actors that do NOT have a BP (as requested)
-    const hasBP = (d) =>
-      !!(d?.businessProfile || d?.bpId || d?.bp || d?.profileId);
-
-    const out = [];
-    for (const t of team) {
-      const doc = idx[t.role]?.get(String(t.entityId));
-      if (!doc) continue;
-
-      if (hasBP(doc)) {
-        // skip actors that already have a business profile
-        continue;
-      }
-
-      const name = pickName(doc);
-      out.push({
-        role: t.role,
-        entityId: String(doc._id),
-
-        // presentation fields
-        name,
-        title: pickTitle(doc),
-        avatarUpload: pickAvatar(doc, name),
-
-        // optional enrichments if present in your models
-        city: doc.city || doc.location?.city || '',
-        country: doc.country || doc.location?.country || '',
-        dept: doc.department || doc.dept || '',
-        skills: Array.isArray(doc.skills) ? doc.skills : [],
-        open: !!doc.openToMeet || !!doc.open,
-      });
-    }
-
-    return res.status(200).json({ success: true, data: out });
-  } catch (err) {
-    console.error('getPublicTeam error:', err);
-    return res.status(500).json({ success: false, error: 'TEAM_FETCH_FAILED' });
+async function loadActorByAny(id){
+  if (!isId(id)) return null;
+  // try exact collections first
+  for (const M of [Attendee, Exhibitor, Speaker]){
+    const doc = await M.findById(id).lean();
+    if (doc) return { doc, role: M.modelName.toLowerCase() }; // attendee|exhibitor|speaker
   }
+  return null;
+}
+
+function nameOf(a, role){
+  if (!a) return '';
+  if (role === 'attendee')  return a.personal?.fullName || '';
+  if (role === 'speaker')   return a.personal?.fullName || '';
+  if (role === 'exhibitor') return a.identity?.contactName || a.identity?.exhibitorName || '';
+  return '';
+}
+function avatarOf(a, role){
+  if (!a) return '';
+  if (role === 'attendee')  return a.personal?.profilePic || '';
+  if (role === 'speaker')   return a.personal?.profilePic || '';
+  if (role === 'exhibitor') return a.identity?.logo || '';
+  return '';
+}
+function cityOf(a, role){
+  if (!a) return '';
+  if (role === 'exhibitor') return a.identity?.city || '';
+  return a.personal?.city || '';
+}
+function countryOf(a, role){
+  if (!a) return '';
+  if (role === 'exhibitor') return a.identity?.country || '';
+  return a.personal?.country || '';
+}
+function titleOf(a, role){
+  if (!a) return '';
+  if (role === 'exhibitor') return a.actorHeadline || a.business?.industry || '';
+  return a.organization?.jobTitle || a.actorHeadline || '';
+}
+function deptOf(a, role){
+  if (!a) return '';
+  if (role === 'exhibitor') return a.business?.industry || '';
+  return a.organization?.businessRole || '';
+}
+function openMeetOf(a, role){
+  if (!a) return false;
+  if (role === 'exhibitor') return !!a.commercial?.availableMeetings; // Exhibitor.commercial.availableMeetings
+  // attendee/speaker
+  return !!(a.matchingIntent?.openToMeetings || a.b2bIntent?.openMeetings);
+}
+function linksOf(a, role){
+  const website  = a?.links?.website  || '';
+  const linkedin = a?.links?.linkedin || '';
+  return { website, linkedin };
+}
+function emailOf(a, role){
+  if (!a) return '';
+  if (role === 'exhibitor') return a.identity?.email || a.identity?.firstEmail || '';
+  return a.personal?.email || a.personal?.firstEmail || '';
+}
+function phoneOf(a, role){
+  if (!a) return '';
+  if (role === 'exhibitor') return a.identity?.phone || '';
+  return a.personal?.phone || '';
+}
+
+function normalizeMember(a, role, entityId){
+  return {
+    id: String(entityId),
+    fullName: nameOf(a, role) || '—',
+    title: titleOf(a, role) || '',
+    dept: deptOf(a, role) || '',
+    city: cityOf(a, role) || '',
+    country: countryOf(a, role) || '',
+    avatar: avatarOf(a, role) || '',
+    open: openMeetOf(a, role),
+    skills: Array.isArray(a?.subRole) ? a.subRole : [],
+    peerId: String(entityId),
+    entityType: role,
+    entityId: String(entityId),
+  };
+}
+
+/* ---------- helpers for profile lookup (id or slug) ---------- */
+async function findProfile(idOrSlug){
+  if (isId(idOrSlug)){
+    return BusinessProfile.findById(idOrSlug).lean();
+  }
+  return BusinessProfile.findOne({ slug: String(idOrSlug).toLowerCase() }).lean();
+}
+const isId = (v)=> mongoose.Types.ObjectId.isValid(String(v||''));
+const toISO = (d)=> d ? new Date(d).toISOString() : '';
+exports.getPublicTeam = async (req, res) => {
+  const { idOrSlug } = req.params;
+  const p = await findProfile(idOrSlug);
+  if (!p) return res.status(404).json({ message: 'Profile not found' });
+
+  const rawTeam = Array.isArray(p.team) ? p.team : [];
+
+  // load each entity, normalize
+  const members = [];
+  for (const t of rawTeam){
+    const role = String(t.role || '').toLowerCase();
+    const entityId = t.entityId;
+    const M = ROLE_MODEL[role];
+    if (!M || !isId(entityId)) continue;
+    const doc = await M.findById(entityId).lean();
+    if (!doc) continue;
+    members.push(normalizeMember(doc, role, entityId));
+  }
+
+  // ensure owner appears once (if owner belongs to known base roles)
+  if (p.owner?.actor && isId(p.owner.actor)){
+    const exist = members.some(m => m.entityId === String(p.owner.actor));
+    if (!exist){
+      const owner = await loadActorByAny(p.owner.actor);
+      if (owner?.doc){
+        members.unshift(normalizeMember(owner.doc, owner.role, p.owner.actor));
+      }
+    }
+  }
+
+  return res.json({ success:true, data: members });
 };
 
 const get = (obj, path) => path.split('.').reduce((o,k)=> (o && o[k]!==undefined) ? o[k] : undefined, obj);
@@ -422,4 +431,16 @@ exports.getMyProfileSummary = asyncHdl(async (req, res) => {
   };
 
   return res.json({ ok: true, data });
+});
+exports.confirmProfileId = asyncHdl(async (req, res) => {
+  const profileId = req.params.id;
+  if (!profileId || !mongoose.isValidObjectId(profileId)) {
+    return res.status(400).json({ success: false, error: 'INVALID_PROFILE_ID' });
+  }
+  const bp = await BusinessProfile.findById(profileId).lean();
+  if (!bp) {
+    return res.status(404).json({ success: false, error: 'BP_NOT_FOUND' });
+  }
+  return res.status(200).json({ success: true, data: pickPublic(bp) });
+
 });

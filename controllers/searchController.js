@@ -16,49 +16,50 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
  * ------------------------------------------------------------------ */
 // FULL REPLACEMENT
 function linkFor(doc = {}, type = "") {
+  const DEF = "68e6764bb4f9b08db3ccec04";
+
   const id   = String(doc._id || doc.id || "").trim();
-  const evId = String(doc.id_event || doc.eventId || doc.event || "").trim();
+  const evId = String(doc.id_event || doc.eventId || doc.event || doc.event_id || "").trim();
   const t    = String(type || "").toLowerCase();
 
-  const R = {
-    event:     (x) => x ? `/event/${x}` : `/events`,
-    speakers:  (e) => e ? `/event/${e}/speakers`   : `/event/68e6764bb4f9b08db3ccec04/speakers`,
-    exhibitors:(e) => e ? `/event/${e}/exhibitors` : `/event/68e6764bb4f9b08db3ccec04/exhibitors`,
-    attendees: (e) => e ? `/event/${e}/attendees`  : `/event/68e6764bb4f9b08db3ccec04/attendees`,
-    schedule:  (e) => e ? `/event/${e}/schedule`   : `/event/68e6764bb4f9b08db3ccec04/schedule`,
-    session:   (e, s) => (e ? `/event/${e}/schedule` : `/event/68e6764bb4f9b08db3ccec04/schedule`) + (s ? `#session-${s}` : ""),
-    track:     (e, trk) =>
-      (e ? `/event/${e}/schedule` : `/schedule`) + (trk ? `?track=${encodeURIComponent(trk)}` : ""),
-    byCity:    (c) => `/events?city=${encodeURIComponent(c || "")}`,
-    byCountry: (c) => `/events?country=${encodeURIComponent(c || "")}`,
-    tag:       (tg)=> `/tags/${encodeURIComponent(tg || "")}`,
-  };
+  const schedule = (e) => `/event/${( DEF)}/schedule`;
+  const speakers = (e) => `/event/${( DEF)}/speakers`;
 
   switch (t) {
-    case "speaker":   return R.speakers(evId);
-    case "exhibitor": return R.exhibitors(evId);
-    case "attendee":  return R.attendees(evId);
+    // q: "Program" / "program"  -> /event/:eventId/schedule
+    case "program":
+    case "programme":
+    case "schedule":
+      return schedule(evId);
 
-    // "Program" search intent → schedule page
-    case "Program":   return R.schedule(evId);
+    // q: "speaker" / "speakers" -> /event/:eventId/speakers
+    case "speaker":
+    case "speakers":
+      return speakers(evId);
 
-    // Individual session result → schedule with anchor
-    case "session":   return R.session(evId, id);
-
+    // keep others sane
+    case "session":
+      return `${schedule(evId)}${id ? `#session-${id}` : ""}`;
+    case "event":
+      return id ? `/event/${id}` : "/events";
+    case "exhibitor":
+      return `/event/${(evId || DEF)}/exhibitors`;
+    case "attendee":
+      return `/event/${(evId || DEF)}/attendees`;
     case "track": {
-      const track = doc.track || doc._id || "";
-      return R.track(evId, track);
+      const track = doc.track || id || "";
+      return `${schedule(evId)}${track ? `?track=${encodeURIComponent(track)}` : ""}`;
     }
-
-    case "event":     return R.event(id);
-    case "city":      return R.byCity(doc.city || doc._id || "");
-    case "country":   return R.byCountry(doc.country || doc._id || "");
-    case "tag":       return R.tag(doc.tag || doc._id || "");
-
-    default:          return R.event(evId) || "/events";
+    case "city":
+      return `/events?city=${encodeURIComponent(doc.city || id || "")}`;
+    case "country":
+      return `/events?country=${encodeURIComponent(doc.country || id || "")}`;
+    case "tag":
+      return `/tags/${encodeURIComponent(doc.tag || id || "")}`;
+    default:
+      return evId ? `/event/${evId}` : "/events";
   }
 }
-
 
 /* ------------------------- helpers ------------------------- */
 function escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
@@ -73,8 +74,8 @@ function makeRx(q) {
    → [{ _id, type, title, tag, href, score }]
 ===================================================================== */
 exports.quick = async (req, res) => {
+  const DEF = process.env.DEFAULT_EVENT_ID || "68e6764bb4f9b08db3ccec04";
   const q = toStr(req.query.q).trim();
-  console.log(q);
   const limit = clamp(parseInt(req.query.limit, 10) || 4, 1, 8);
   if (!q || q.length < 2) return res.json([]);
 
@@ -89,11 +90,11 @@ exports.quick = async (req, res) => {
         { "business.industry": rx },
       ],
     })
-      .select({ _id: 1, "identity.exhibitorName": 1, "identity.orgName": 1, "business.industry": 1 })
+      .select({ _id: 1, "identity.exhibitorName": 1, "identity.orgName": 1, "business.industry": 1, id_event: 1 })
       .limit(10)
       .lean(),
 
-    // Attendees (optional for directory search; remove if not needed)
+    // Attendees (optional)
     Attendee.find({
       $or: [
         { "personal.fullName": rx },
@@ -101,18 +102,18 @@ exports.quick = async (req, res) => {
         { "organization.jobTitle": rx },
       ],
     })
-      .select({ _id: 1, "personal.fullName": 1, "organization.orgName": 1, "organization.jobTitle": 1 })
+      .select({ _id: 1, "personal.fullName": 1, "organization.orgName": 1, "organization.jobTitle": 1, id_event: 1 })
       .limit(8)
       .lean(),
 
-    // Speakers
+    // Speakers (include id_event so links are deterministic)
     Speaker.find({
       $or: [
         { "personal.fullName": rx },
         { "organization.jobTitle": rx },
       ],
     })
-      .select({ _id: 1, "personal.fullName": 1, "organization.jobTitle": 1 })
+      .select({ _id: 1, "personal.fullName": 1, "organization.jobTitle": 1, id_event: 1 })
       .limit(8)
       .lean(),
 
@@ -162,13 +163,33 @@ exports.quick = async (req, res) => {
   ]);
 
   const out = [];
-  if (q === "Program") {
+
+  // Choose an event id for generic intents: prefer sessions > speakers > events; else default
+  const genericEv =
+    (sessions && sessions[0] && sessions[0].id_event) ||
+    (speakers && speakers[0] && speakers[0].id_event) ||
+    (events && events[0] && events[0]._id) ||
+    DEF;
+
+  // Generic "Program" intent
+  if (/^\s*program(me)?\s*$/i.test(q)) {
     out.push({
-      _id: d._id,
-      type: "Program",
+      _id: "program",
+      type: "program",
       title: "Program",
-      href: linkFor(d, "Program"),
-      score: 12,
+      href: linkFor({ id_event: String(genericEv) }, "program"),
+      score: 100,
+    });
+  }
+
+  // Generic "Speakers" intent
+  if (/^\s*speakers?\s*$/i.test(q)) {
+    out.push({
+      _id: "speakers",
+      type: "speakers",
+      title: "Speakers",
+      href: linkFor({ id_event: String(genericEv) }, "speakers"),
+      score: 99,
     });
   }
 
