@@ -44,6 +44,8 @@ const toISO = (d)=> d ? new Date(d).toISOString() : '';
 exports.getPublicTeam = asyncHdl(async (req, res) => {
   const id = req.params.profileId;
   const profile = await loadProfile(id);
+    console.log("bp/me/team",req.user);
+
   if (!profile) return res.status(404).json({ message: 'BusinessProfile not found' });
 
   // helpers
@@ -254,6 +256,7 @@ exports.getPublicContact = asyncHdl(async (req, res) => {
 exports.getPublicEngagements = asyncHdl(async (req, res) => {
   const id = req.params.profileId;
   const profile = await loadProfile(id);
+  
   if (!profile) return res.status(404).json({ message: 'BusinessProfile not found' });
 
   const eventId = profile.event;
@@ -397,6 +400,7 @@ const pickPublic = (p) => ({
 });
 exports.getMyTeam = async (req, res) => {
   const actorId = req.user?._id || req.user?.id;
+  console.log("bp/me/team",req.user);
   const bp = await BusinessProfile.findOne({ 'owner.actor': actorId }).lean();
   console.log("bp",bp);
   if (!bp) return res.status(404).json({ message: 'BP_NOT_FOUND' });
@@ -515,6 +519,7 @@ await bp.save();
 /** DELETE /biz/bp/me/team/:entityType/:entityId */
 exports.removeTeamMember = async (req, res) => {
   const actorId = req.user?._id || req.user?.id;
+  console.log("req.params.entityType ",req.params.entityType );
   const roleKey = String(req.params.entityType || '').toLowerCase();
   const entId = req.params.entityId;
 
@@ -527,7 +532,7 @@ exports.removeTeamMember = async (req, res) => {
   if (!bp) return res.status(404).json({ message: 'BP_NOT_FOUND' });
 
   const before = bp.team?.length || 0;
-  bp.team = (bp.team || []).filter(t => !(t.entityType === roleKey && String(t.entityId) === String(entId)));
+  bp.team = (bp.team || []).filter(t => !(t.role === roleKey && String(t.entityId) === String(entId)));
   if (bp.team.length === before) return res.status(404).json({ message: 'Not in team' });
 
   await bp.save();

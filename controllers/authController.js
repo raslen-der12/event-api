@@ -36,6 +36,7 @@ const { randomBytes } = require('crypto');
 const Schedule = require('../models/eventModels/schedule');
 const programRoom = require('../models/programRoom');
 const sessionRegistration = require('../models/sessionRegistration');
+const ActorInviteCode = require('../models/ActorInviteCode');
 require('dotenv').config({ path: '../.env' });
 const toStr = (v) => (v == null ? '' : String(v));
 const normBool = (v) => ['1','true','yes','y','on'].includes(toStr(v).toLowerCase());
@@ -635,6 +636,7 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     eventId,
     pwd,
     actorType = '',
+    inviteCode = '',
     actorHeadline = '',
     'personal.fullName': fullName,
     'personal.email': email,
@@ -692,7 +694,7 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
   const virtualFlag = normBool(virtualMeetRaw);
   const salt    = await bcrypt.genSalt(12);
   const pwdHash = await bcrypt.hash(toStr(pwd), salt);
-
+  const inviteCodeStr = toStr(inviteCode).trim();
   // Photo: uploaded or default
   const DEF_PHOTO =
     `${(process.env.DEF_ROOT || '').replace(/\/+$/,'')}/uploads/default/photodef.png`;
@@ -896,6 +898,21 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
   }
 
   await notifyRegistrationPending(created._id, 'attendee', eventId);
+  if (inviteCodeStr) {
+    try {
+      // increment usage only for enabled codes; ignore if not found/disabled
+      await ActorInviteCode.findOneAndUpdate(
+        { code: inviteCodeStr, enabled: true },
+        { $inc: { usageCount: 1 } },
+        { new: false }
+      ).lean();
+      // (Optional) If you want to keep a trace on attendee without changing schema:
+      // await attendee.updateOne({ _id: created._id }, { $set: { 'meta.inviteCodeUsed': inviteCodeStr } });
+    } catch (e) {
+      console.error('inviteCode increment failed:', e?.message || e);
+      // do not throw; registration already succeeded
+    }
+  }
   return res.status(201).json({ success: true, data: { id: created._id, role: 'attendee' } });
 });
 

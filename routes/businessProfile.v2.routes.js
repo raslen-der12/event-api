@@ -54,14 +54,14 @@ r.post('/bp/:profileId/rating', protect, Stats.postProfileRating);
 r.post('/bp/:profileId/innovation', protect, Stats.postProfileInnovation);
 r.post('/bp/:profileId/presence',   protect, Stats.postProfilePresence);
 
-r.get('/bp/:profileId/team',   protect, Prof.getPublicTeam ); // public view of team
-r.get('/bp/:profileId/contact',   protect, Prof.getPublicContact ); // public view of team
-r.get('/bp/:profileId/engagements',   protect, Prof.getPublicEngagements ); // public view of team
-
 r.get('/bp/team/search', protect, Prof.searchTeamCandidates);
 r.get   ('/bp/me/team',                        protect, Prof.getMyTeam);
 r.post  ('/bp/me/team',                        protect, Prof.addTeamMember);
 r.delete('/bp/me/team/:entityType/:entityId',  protect, Prof.removeTeamMember);
+
+r.get('/bp/:profileId/team',   protect, Prof.getPublicTeam ); // public view of team
+r.get('/bp/:profileId/contact',   protect, Prof.getPublicContact ); // public view of team
+r.get('/bp/:profileId/engagements',   protect, Prof.getPublicEngagements ); // public view of team
 
 // owner media
 r.post('/bp/me/logo',        protect, Media.setLogo);
