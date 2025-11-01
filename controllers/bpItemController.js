@@ -4,6 +4,8 @@ const BusinessProfile = require('../models/BusinessProfile');
 const BPItem = require('../models/BPItem');
 const BPTaxonomy = require('../models/BPTaxonomy');
 const { toStr, normTags, isId, toLimit, makeRx } = require('../utils/bpUtil');
+const ObjectId = (v)=> (mongoose.Types.ObjectId.isValid(v) ? new mongoose.Types.ObjectId(v) : null);
+const mongoose = require('mongoose');
 
 /* ----------------------- logging helpers ----------------------- */
 const TAG = 'bpItemController';
@@ -390,4 +392,226 @@ exports.removeItemImage = asyncHdl(async (req, res) => {
   await it.save();
   log('removeItemImage() saved images:', s(it.images));
   res.json({ ok: true, images: it.images });
+});
+exports.marketList = asyncHdl(async (req, res) => {
+  // q, kind, sector, subsectorId, tags(csv), hasImages(1), sort=new|az, page, limit
+  const {
+    q = '', kind = '', sector = '', subsectorId = '',
+    tags = '', hasImages = '', sort = 'new',
+    page = 1, limit = 20
+  } = req.query;
+
+  const lim = toLimit(limit, 50);
+  const skip = (Math.max(1, Number(page)) - 1) * lim;
+
+  const match = {
+    published: true,
+    $or: [{ 'adminFlags.hidden': { $exists: false } }, { 'adminFlags.hidden': false }]
+  };
+
+  if (kind === 'product' || kind === 'service') match.kind = kind;
+  if (sector) match.sector = String(sector).toLowerCase().trim();
+  if (subsectorId && ObjectId(subsectorId)) match.subsectorId = ObjectId(subsectorId);
+
+  const tagList = String(tags || '')
+    .split(/[,\s]+/).map(s=>s.trim()).filter(Boolean);
+  if (tagList.length) match.tags = { $in: tagList };
+
+  if (hasImages === '1') {
+    match.$or = [
+      ...(match.$or || []),
+      { images: { $exists: true, $ne: [] } },
+      { thumbnailUpload: { $exists: true, $ne: null } },
+    ];
+  }
+
+  if (q && q.trim()) {
+    const rx = makeRx(q.trim(), 'i');
+    match.$and = [
+      ...(match.$and || []),
+      { $or: [{ title: rx }, { summary: rx }, { details: rx }, { tags: rx }] }
+    ];
+  }
+
+  const sortStage =
+    sort === 'az' ? { title: 1 }
+      : { createdAt: -1 };
+
+  const pipeline = [
+    { $match: match },
+    { $sort: sortStage },
+    { $skip: skip },
+    { $limit: lim },
+    { $project: {
+        profile: 1, kind: 1, sector: 1, subsectorId: 1, subsectorName: 1,
+        title: 1, summary: 1, tags: 1, images: 1, thumbnailUpload: 1,
+        pricingNote: 1, createdAt: 1
+    }},
+    { $lookup: {
+        from: 'businessprofiles', // ← collection name
+        localField: 'profile',
+        foreignField: '_id',
+        pipeline: [{ $project: { name: 1, slug: 1, logoUpload: 1 } }],
+        as: 'profileDoc'
+    }},
+    { $set: { profileDoc: { $first: '$profileDoc' } } }
+  ];
+
+  const [rows, total] = await Promise.all([
+    BPItem.aggregate(pipeline).allowDiskUse(true),
+    BPItem.countDocuments(match)
+  ]);
+
+  return res.json({
+    success: true,
+    page: Number(page),
+    limit: lim,
+    total,
+    items: rows.map(r => ({
+      id: String(r._id),
+      kind: r.kind,
+      sector: r.sector,
+      subsectorId: r.subsectorId,
+      subsectorName: r.subsectorName,
+      title: r.title,
+      pricingNote: r.pricingNote || "",
+      tags: r.tags || [],
+      images: r.images || [],
+      thumbnailUpload: r.thumbnailUpload || null,
+      profile: r.profileDoc ? {
+        id: String(r.profile),
+        name: r.profileDoc.name || '',
+        slug: r.profileDoc.slug || '',
+        logoUpload: r.profileDoc.logoUpload || null,
+      } : { id: String(r.profile) }
+    }))
+  });
+});
+
+exports.marketGetOne = asyncHdl(async (req, res) => {
+  const id = req.params.itemId;
+  if (!ObjectId(id)) return res.status(400).json({ message: 'Bad item id' });
+
+  const item = await BPItem.findOne({ _id: id, published: true, 'adminFlags.hidden': { $ne: true } })
+    .select('profile kind sector subsectorId subsectorName title summary details tags images thumbnailUpload pricingNote createdAt')
+    .lean();
+
+  if (!item) return res.status(404).json({ message: 'Item not found' });
+
+  const prof = await BusinessProfile.findById(item.profile)
+    .select('name slug logoUpload industries countries languages')
+    .lean();
+
+  return res.json({
+    success: true,
+    item: {
+      id: String(item._id),
+      ...item,
+      profile: prof ? {
+        id: String(prof._id), name: prof.name, slug: prof.slug,
+        logoUpload: prof.logoUpload, industries: prof.industries,
+        countries: prof.countries, languages: prof.languages
+      } : { id: String(item.profile) }
+    }
+  });
+});
+
+exports.marketFacets = asyncHdl(async (_req, res) => {
+  // sectors & subsectors (taxonomy)
+  const tax = await BPTaxonomy.find({})
+    .select('sector subsectors')
+    .lean();
+
+  // counts per sector & kind + top tags
+  const match = { published: true, $or: [{ 'adminFlags.hidden': { $exists: false } }, { 'adminFlags.hidden': false }] };
+
+  const [countsBySector, countsByKind, topTags] = await Promise.all([
+    BPItem.aggregate([
+      { $match: match },
+      { $group: { _id: '$sector', n: { $sum: 1 } } },
+      { $sort: { n: -1 } }
+    ]),
+    BPItem.aggregate([
+      { $match: match },
+      { $group: { _id: '$kind', n: { $sum: 1 } } }
+    ]),
+    BPItem.aggregate([
+      { $match: match },
+      { $unwind: { path: '$tags', preserveNullAndEmptyArrays: false } },
+      { $group: { _id: '$tags', n: { $sum: 1 } } },
+      { $sort: { n: -1 } },
+      { $limit: 50 }
+    ])
+  ]);
+
+  return res.json({
+    success: true,
+    sectors: tax.map(t => ({
+      sector: t.sector,
+      subsectors: (t.subsectors || []).map(s => ({
+        id: String(s._id), name: s.name, allowProducts: !!s.allowProducts, allowServices: !!s.allowServices
+      }))
+    })),
+    counts: {
+      bySector: countsBySector.map(x => ({ sector: x._id || '', n: x.n })),
+      byKind  : countsByKind.map(x => ({ kind: x._id || '', n: x.n })),
+    },
+    tagsTop: topTags.map(x => ({ tag: x._id, n: x.n }))
+  });
+});
+exports.getMarketItem = asyncHdl(async (req, res) => {
+  const id = req.params.productId;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Bad productId" });
+
+  const doc = await BPItem.findById(id).lean();
+  if (!doc) return res.status(404).json({ message: "Item not found" });
+
+  // Pull minimal BP data if linked
+  let profile = null;
+  if (doc.profileId && mongoose.isValidObjectId(doc.profileId)) {
+    const p = await BusinessProfile.findById(doc.profileId)
+      .select("name slug logo tagline headline locations links contacts about overview offerings badges certifications")
+      .lean();
+
+    if (p) {
+      profile = {
+        id: String(p._id),
+        name: p.name || "",
+        slug: p.slug || "",
+        logo: p.logo || "",
+        tagline: p.tagline || p.headline || "",
+        locations: Array.isArray(p.locations)
+          ? p.locations.map(l => ({ city: l?.city || "", country: l?.country || "" }))
+          : [],
+        links: p.links || {},
+        contacts: Array.isArray(p.contacts)
+          ? p.contacts
+              .filter(c => c && c.kind && c.value)
+              .map(c => ({ kind: String(c.kind).toLowerCase(), value: c.value, label: c.label || "" }))
+          : [],
+        overview: p.overview || p.about || "",
+        offerings: Array.isArray(p.offerings) ? p.offerings : [],
+        badges: Array.isArray(p.badges) ? p.badges : (Array.isArray(p.certifications) ? p.certifications : []),
+      };
+    }
+  }
+
+  const out = {
+    id: String(doc._id),
+    kind: doc.kind || "product",                 // "product" | "service"
+    title: doc.title || doc.name || "",
+    sector: doc.sectorName || doc.sector || "",
+    subsectorName: doc.subsectorName || "",
+    summary: doc.summary || doc.description || "",
+    details: doc.details || doc.longDescription || "",
+    features: Array.isArray(doc.features) ? doc.features : [],
+    specs: doc.specs && typeof doc.specs === "object" ? doc.specs : {},
+    images: Array.isArray(doc.images) ? doc.images : (Array.isArray(doc.gallery) ? doc.gallery : []),
+    thumbnailUpload: doc.thumbnailUpload || "",
+    tags: Array.isArray(doc.tags) ? doc.tags : [],
+    profile, // normalized BP info used by the page
+  };
+
+  // Return raw object (not wrapped) to match your existing hook usage
+  return res.json(out);
 });

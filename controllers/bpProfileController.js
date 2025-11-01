@@ -5,6 +5,8 @@ const { toStr, normTags } = require('../utils/bpUtil');
 const Exhibitor = require('../models/exhibitor');
 const Speaker   = require('../models/speaker');
 const Attendee  = require('../models/attendee');
+const MeetRequest = require('../models/meetRequest');
+const SessionRegistration = require('../models/sessionRegistration');
 const mongoose = require('mongoose');
 const TYPE_TO_MODEL = {
   exhibitor: Exhibitor,
@@ -20,79 +22,14 @@ async function loadActorByAny(id){
   }
   return null;
 }
-
-function nameOf(a, role){
-  if (!a) return '';
-  if (role === 'attendee')  return a.personal?.fullName || '';
-  if (role === 'speaker')   return a.personal?.fullName || '';
-  if (role === 'exhibitor') return a.identity?.contactName || a.identity?.exhibitorName || '';
-  return '';
-}
-function avatarOf(a, role){
-  if (!a) return '';
-  if (role === 'attendee')  return a.personal?.profilePic || '';
-  if (role === 'speaker')   return a.personal?.profilePic || '';
-  if (role === 'exhibitor') return a.identity?.logo || '';
-  return '';
-}
-function cityOf(a, role){
-  if (!a) return '';
-  if (role === 'exhibitor') return a.identity?.city || '';
-  return a.personal?.city || '';
-}
-function countryOf(a, role){
-  if (!a) return '';
-  if (role === 'exhibitor') return a.identity?.country || '';
-  return a.personal?.country || '';
-}
-function titleOf(a, role){
-  if (!a) return '';
-  if (role === 'exhibitor') return a.actorHeadline || a.business?.industry || '';
-  return a.organization?.jobTitle || a.actorHeadline || '';
-}
-function deptOf(a, role){
-  if (!a) return '';
-  if (role === 'exhibitor') return a.business?.industry || '';
-  return a.organization?.businessRole || '';
-}
-function openMeetOf(a, role){
-  if (!a) return false;
-  if (role === 'exhibitor') return !!a.commercial?.availableMeetings; // Exhibitor.commercial.availableMeetings
-  // attendee/speaker
-  return !!(a.matchingIntent?.openToMeetings || a.b2bIntent?.openMeetings);
-}
-function linksOf(a, role){
-  const website  = a?.links?.website  || '';
-  const linkedin = a?.links?.linkedin || '';
-  return { website, linkedin };
-}
-function emailOf(a, role){
-  if (!a) return '';
-  if (role === 'exhibitor') return a.identity?.email || a.identity?.firstEmail || '';
-  return a.personal?.email || a.personal?.firstEmail || '';
-}
-function phoneOf(a, role){
-  if (!a) return '';
-  if (role === 'exhibitor') return a.identity?.phone || '';
-  return a.personal?.phone || '';
+function modelByRole(role) {
+  const r = String(role || '').toLowerCase();
+  if (r === 'exhibitor') return Exhibitor;
+  if (r === 'attendee')  return Attendee;
+  if (r === 'speaker' && Speaker) return Speaker;
+  return null;
 }
 
-function normalizeMember(a, role, entityId){
-  return {
-    id: String(entityId),
-    fullName: nameOf(a, role) || '—',
-    title: titleOf(a, role) || '',
-    dept: deptOf(a, role) || '',
-    city: cityOf(a, role) || '',
-    country: countryOf(a, role) || '',
-    avatar: avatarOf(a, role) || '',
-    open: openMeetOf(a, role),
-    skills: Array.isArray(a?.subRole) ? a.subRole : [],
-    peerId: String(entityId),
-    entityType: role,
-    entityId: String(entityId),
-  };
-}
 
 /* ---------- helpers for profile lookup (id or slug) ---------- */
 async function findProfile(idOrSlug){
@@ -103,39 +40,330 @@ async function findProfile(idOrSlug){
 }
 const isId = (v)=> mongoose.Types.ObjectId.isValid(String(v||''));
 const toISO = (d)=> d ? new Date(d).toISOString() : '';
-exports.getPublicTeam = async (req, res) => {
-  const { idOrSlug } = req.params;
-  const p = await findProfile(idOrSlug);
-  if (!p) return res.status(404).json({ message: 'Profile not found' });
 
-  const rawTeam = Array.isArray(p.team) ? p.team : [];
+exports.getPublicTeam = asyncHdl(async (req, res) => {
+  const id = req.params.profileId;
+  const profile = await loadProfile(id);
+  if (!profile) return res.status(404).json({ message: 'BusinessProfile not found' });
 
-  // load each entity, normalize
-  const members = [];
-  for (const t of rawTeam){
-    const role = String(t.role || '').toLowerCase();
-    const entityId = t.entityId;
-    const M = ROLE_MODEL[role];
-    if (!M || !isId(entityId)) continue;
-    const doc = await M.findById(entityId).lean();
-    if (!doc) continue;
-    members.push(normalizeMember(doc, role, entityId));
+  // helpers
+  const isId = (v) => mongoose.isValidObjectId(v);
+  const toStr = (v) => (v == null ? '' : String(v));
+  const norm = (s) => toStr(s).trim().toLowerCase();
+
+  const roleModel = (r) => ({ attendee: Attendee, exhibitor: Exhibitor, speaker: Speaker }[norm(r)] || null);
+
+  // Try to resolve owner role to one of attendee|exhibitor|speaker if possible
+  let ownerActor = profile?.owner?.actor;
+  let ownerRole  = norm(profile?.owner?.role);
+  if (isId(ownerActor) && !['attendee','exhibitor','speaker'].includes(ownerRole)) {
+    // Soft-detect which collection actually holds the owner
+    if (await Attendee.exists({ _id: ownerActor }))  ownerRole = 'attendee';
+    else if (await Exhibitor.exists({ _id: ownerActor })) ownerRole = 'exhibitor';
+    else if (await Speaker.exists({ _id: ownerActor }))   ownerRole = 'speaker';
   }
 
-  // ensure owner appears once (if owner belongs to known base roles)
-  if (p.owner?.actor && isId(p.owner.actor)){
-    const exist = members.some(m => m.entityId === String(p.owner.actor));
-    if (!exist){
-      const owner = await loadActorByAny(p.owner.actor);
-      if (owner?.doc){
-        members.unshift(normalizeMember(owner.doc, owner.role, p.owner.actor));
-      }
+  // Base members use model fields: team[].{role, entityId}
+  const base = Array.isArray(profile.team) ? profile.team : [];
+  const members = base
+    .filter(m => isId(m?.entityId) && ['attendee','exhibitor','speaker'].includes(norm(m.role)))
+    .map(m => ({ entityType: norm(m.role), entityId: String(m.entityId) }));
+
+  // Ensure owner is present if resolvable
+  if (isId(ownerActor) && ['attendee','exhibitor','speaker'].includes(ownerRole)) {
+    const key = `${ownerRole}|${String(ownerActor)}`;
+    const have = new Set(members.map(m => `${m.entityType}|${m.entityId}`));
+    if (!have.has(key)) members.push({ entityType: ownerRole, entityId: String(ownerActor) });
+  }
+
+  // De-dupe
+  const uniq = Array.from(new Map(members.map(m => [`${m.entityType}|${m.entityId}`, m])).values());
+
+  // Batch fetch by role
+  const byRole = uniq.reduce((acc, m) => {
+    (acc[m.entityType] ||= []).push(m.entityId);
+    return acc;
+  }, {});
+
+  const out = [];
+
+  async function pull(role, Model) {
+    const ids = byRole[role] || [];
+    if (!ids.length || !Model) return;
+
+    const select =
+      role === 'exhibitor'
+        ? 'identity.exhibitorName identity.contactName identity.logo identity.city identity.country commercial.availableMeetings'
+        : 'personal.fullName personal.profilePic personal.city personal.country matchingIntent.openToMeetings';
+
+    const docs = await Model.find({ _id: { $in: ids } }).select(select).lean();
+    const map  = new Map(docs.map(d => [String(d._id), d]));
+
+    for (const id of ids) {
+      const d = map.get(String(id));
+      const card = d ? extractActorCard(role, d) : { name:'', avatar:'', city:'', country:'', open:false };
+      out.push({
+        id: String(id),
+        peerId: String(id),
+        entityType: role,
+        entityId: String(id),
+        fullName: card.name || '',
+        title: role,       // no title in BP.team schema; keep empty for UI compatibility
+        dept: '',        // same
+        city: card.city || '',
+        country: card.country || '',
+        avatar: card.avatar || '',
+        open: !!card.open,
+        skills: []       // team schema has no skills; keep empty list
+      });
     }
   }
 
-  return res.json({ success:true, data: members });
-};
+  await pull('attendee',  Attendee);
+  await pull('exhibitor', Exhibitor);
+  await pull('speaker',   Speaker);
 
+  out.sort((a,b)=> (a.fullName||'').localeCompare(b.fullName||'', undefined, { sensitivity:'base' }));
+  return res.json({ success:true, data: out, count: out.length });
+});
+
+function extractActorCard(role, doc) {
+  const r = String(role||'').toLowerCase();
+  let name = '';
+  let avatar = '';
+  let city = '';
+  let country = '';
+  let open = false;
+
+  if (r === 'exhibitor') {
+    name    = toStr(doc?.identity?.contactName) || toStr(doc?.identity?.exhibitorName);
+    avatar  = toStr(doc?.identity?.logo);
+    city    = toStr(doc?.identity?.city);
+    country = toStr(doc?.identity?.country);
+    open    = !!doc?.commercial?.availableMeetings;
+  } else {
+    // attendee / speaker share the same personal.* structure in your codebase
+    name    = toStr(doc?.personal?.fullName);
+    avatar  = toStr(doc?.personal?.profilePic);
+    city    = toStr(doc?.personal?.city);
+    country = toStr(doc?.personal?.country);
+    open    = !!doc?.matchingIntent?.openToMeetings;
+  }
+
+  return { name, avatar, city, country, open };
+}
+async function loadProfile(id) {
+  if (isId(id)) {
+    const p = await BusinessProfile.findById(id).lean();
+    if (p) return p;
+  }
+  return await BusinessProfile.findOne({ slug: String(id).trim().toLowerCase() }).lean();
+}
+exports.getPublicContact = asyncHdl(async (req, res) => {
+  const id = req.params.profileId;
+  const profile = await loadProfile(id);
+  if (!profile) return res.status(404).json({ message: 'BusinessProfile not found' });
+
+  const toStr = (v) => (v == null ? '' : String(v));
+  const isId  = (v) => mongoose.isValidObjectId(v);
+  const normR = (r) => String(r||'').toLowerCase();
+
+  // 1) Base arrays from BP model
+  const contacts = Array.isArray(profile.contacts) ? profile.contacts : [];   // [{kind,value,label}]
+  const socials  = Array.isArray(profile.socials)  ? profile.socials  : [];   // [{kind,url}]
+  const countries= Array.isArray(profile.countries)? profile.countries: [];   // ['TN','FR',...]
+  const name     = toStr(profile.name);
+  const size     = toStr(profile.size);
+
+  // 2) Owner fallback for a "people" main contact + website/linkedin
+  let ownerDoc = null, ownerRole = normR(profile?.owner?.role), ownerId = profile?.owner?.actor;
+  const roleModel = (r) => ({ attendee: Attendee, exhibitor: Exhibitor, speaker: Speaker }[normR(r)] || null);
+
+  if (isId(ownerId)) {
+    if (!['attendee','exhibitor','speaker'].includes(ownerRole)) {
+      if (await Attendee.exists({ _id: ownerId }))  ownerRole = 'attendee';
+      else if (await Exhibitor.exists({ _id: ownerId })) ownerRole = 'exhibitor';
+      else if (await Speaker.exists({ _id: ownerId }))   ownerRole = 'speaker';
+    }
+    const M = roleModel(ownerRole);
+    if (M) ownerDoc = await M.findById(ownerId).lean().catch(()=>null);
+  }
+
+  const people = [];
+  if (ownerDoc) {
+    const card = extractActorCard(ownerRole, ownerDoc);
+    const email = ownerRole === 'exhibitor' ? toStr(ownerDoc?.identity?.email) : toStr(ownerDoc?.personal?.email);
+    const phone = ownerRole === 'exhibitor' ? toStr(ownerDoc?.identity?.phone) : toStr(ownerDoc?.personal?.phone);
+    people.push({
+      id: String(ownerId),
+      name: card.name || 'Contact',
+      title: ownerRole.charAt(0).toUpperCase() + ownerRole.slice(1),
+      email, phone, avatar: card.avatar || ''
+    });
+
+    // Derive common socials if BP.socials misses them
+    const website  = toStr(ownerDoc?.links?.website);
+    const linkedin = toStr(ownerDoc?.links?.linkedin);
+    const has = (k) => socials.some(s => s?.kind === k);
+    if (website && !has('website'))  socials.push({ kind:'website',  url: website });
+    if (linkedin && !has('linkedin')) socials.push({ kind:'linkedin', url: linkedin });
+  }
+
+  // 3) Locations: BP has no locations array; build a light list from owner city/country or BP.countries
+  const locs = [];
+  if (ownerDoc) {
+    const city = ownerRole === 'exhibitor' ? toStr(ownerDoc?.identity?.city) : toStr(ownerDoc?.personal?.city);
+    const country = ownerRole === 'exhibitor' ? toStr(ownerDoc?.identity?.country) : toStr(ownerDoc?.personal?.country);
+    if (city || country) locs.push({ label:'HQ', city, country, address:'' });
+  }
+  if (!locs.length && countries.length) {
+    // show first country at least
+    locs.push({ label:'HQ', city:'', country: countries[0], address:'' });
+  }
+
+  // 4) Company facts
+  const company = [];
+  if (name) company.push({ label:'Company', value:name });
+  if (size) company.push({ label:'Size', value:size });
+
+  // 5) Collateral from available media fields in BP
+  const collateral = [];
+  if (profile.logoUpload)   collateral.push({ label:'Logo',   href: toStr(profile.logoUpload),   type:'image' });
+  if (profile.bannerUpload) collateral.push({ label:'Banner', href: toStr(profile.bannerUpload), type:'image' });
+  if (Array.isArray(profile.gallery) && profile.gallery.length) {
+    profile.gallery.slice(0, 6).forEach((g, i) => collateral.push({ label:`Gallery ${i+1}`, href: toStr(g), type:'image' }));
+  }
+  if (profile.legalDocPath) collateral.push({ label:'Legal', href: toStr(profile.legalDocPath), type:'file' });
+
+  // 6) Topics/tags — synthesize from offering|seeking|innovation|industries
+  const uniq = (a) => Array.from(new Set((a||[]).map(s => String(s).trim()).filter(Boolean)));
+  const topics = uniq([...(profile.offering||[]), ...(profile.seeking||[]), ...(profile.innovation||[]), ...(profile.industries||[])]).slice(0, 12);
+
+  return res.json({
+    success:true,
+    data: {
+      people,
+      social: socials.map(s => ({ kind: toStr(s.kind), url: toStr(s.url) })),
+      locations: locs,
+      company,
+      collateral,
+      topics
+    }
+  });
+});
+exports.getPublicEngagements = asyncHdl(async (req, res) => {
+  const id = req.params.profileId;
+  const profile = await loadProfile(id);
+  if (!profile) return res.status(404).json({ message: 'BusinessProfile not found' });
+
+  const eventId = profile.event;
+  const ownerId = profile?.owner?.actor;
+  if (!isId(eventId) || !isId(ownerId)) {
+    return res.json({ success:true, data: [] });
+  }
+
+  // --- pull meetings for this owner ---
+  const meets = await MeetRequest.find({
+    eventId,
+    $or: [{ senderId: ownerId }, { receiverId: ownerId }]
+  })
+  .select('_id slotISO status happenedAt senderId receiverId meetLink tableId')
+  .lean()
+  .catch(() => []);
+
+  // collect counterpart ids
+  const counterpartIds = new Set();
+  for (const m of meets) {
+    const me = String(ownerId);
+    const other = String(m?.senderId) === me ? String(m?.receiverId) : String(m?.senderId);
+    if (isId(other)) counterpartIds.add(other);
+  }
+  const cpIds = [...counterpartIds];
+
+  // fetch counterpart minimal cards from all roles
+  const [exh, att, spk] = await Promise.all([
+    Exhibitor.find({ _id: { $in: cpIds } })
+      .select('identity.exhibitorName identity.contactName')
+      .lean().catch(()=>[]),
+    Attendee.find({ _id: { $in: cpIds } })
+      .select('personal.fullName')
+      .lean().catch(()=>[]),
+    Speaker.find({ _id: { $in: cpIds } })
+      .select('personal.fullName')
+      .lean().catch(()=>[])
+  ]);
+
+  const cardMap = new Map();
+  for (const d of exh) cardMap.set(String(d._id), {
+    name: d?.identity?.exhibitorName || d?.identity?.contactName || 'Exhibitor',
+    org : d?.identity?.exhibitorName || undefined
+  });
+  for (const d of att) cardMap.set(String(d._id), {
+    name: d?.personal?.fullName || 'Attendee', org: undefined
+  });
+  for (const d of spk) cardMap.set(String(d._id), {
+    name: d?.personal?.fullName || 'Speaker', org: undefined
+  });
+
+  function inferMode(m){
+    if (m.meetLink && m.tableId) return 'hybrid';
+    if (m.meetLink) return 'virtual';
+    return 'in-person';
+  }
+  function mapStatus(m){
+    // normalize to UI’s set
+    if (m.status === 'confirmed') return m.happenedAt ? 'completed' : 'scheduled';
+    if (m.status === 'declined')  return 'lost';
+    if (m.status === 'cancelled') return 'lost';
+    return 'in-progress';
+  }
+
+  const items = [];
+  for (const m of meets) {
+    const me = String(ownerId);
+    const otherId = String(m?.senderId) === me ? String(m?.receiverId) : String(m?.senderId);
+    const cp = cardMap.get(otherId) || {};
+    items.push({
+      id: String(m._id),
+      type: 'meeting',
+      title: 'B2B Meeting',
+      counterpart: { name: cp.name || cp.org || '—', org: cp.org || cp.name || '' },
+      dateISO: m?.slotISO ? new Date(m.slotISO).toISOString() : null,
+      mode: inferMode(m),                 // 'in-person' | 'virtual' | 'hybrid'
+      status: mapStatus(m),               // 'scheduled' | 'in-progress' | 'completed' | 'lost'
+      notes: m.tableId ? `Table ${m.tableId}` : '',
+      tags: [inferMode(m)]
+    });
+  }
+
+  // (Optional) include simple session “touches” as follow-ups (non-destructive):
+  if (SessionRegistration && isId(ownerId) && isId(eventId)) {
+    const regs = await SessionRegistration.find({
+      actorId: ownerId, eventId, status: { $ne: 'cancelled' }
+    }).select('createdAt status attended').lean().catch(()=>[]);
+    for (const r of regs) {
+      items.push({
+        id: `sess-${String(r._id)}`,
+        type: 'followup',
+        title: 'Session Registration',
+        counterpart: { name: 'Program Session', org: '' },
+        dateISO: r?.createdAt ? new Date(r.createdAt).toISOString() : null,
+        mode: 'in-person',
+        status: r.attended ? 'completed' : 'in-progress',
+        notes: r.attended ? 'Marked attended' : 'Assigned',
+        tags: ['session']
+      });
+    }
+  }
+
+  items.sort((a,b)=>{
+    const A = a.dateISO ? new Date(a.dateISO).getTime() : 0;
+    const B = b.dateISO ? new Date(b.dateISO).getTime() : 0;
+    return B - A;
+  });
+
+  return res.json({ success:true, data: items });
+});
 const get = (obj, path) => path.split('.').reduce((o,k)=> (o && o[k]!==undefined) ? o[k] : undefined, obj);
 const pickFirst = (doc, paths) => {
   for (const p of paths) { const v = get(doc, p); if (v != null && v !== '') return v; }

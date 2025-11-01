@@ -55,6 +55,8 @@ r.post('/bp/:profileId/innovation', protect, Stats.postProfileInnovation);
 r.post('/bp/:profileId/presence',   protect, Stats.postProfilePresence);
 
 r.get('/bp/:profileId/team',   protect, Prof.getPublicTeam ); // public view of team
+r.get('/bp/:profileId/contact',   protect, Prof.getPublicContact ); // public view of team
+r.get('/bp/:profileId/engagements',   protect, Prof.getPublicEngagements ); // public view of team
 
 r.get('/bp/team/search', protect, Prof.searchTeamCandidates);
 r.get   ('/bp/me/team',                        protect, Prof.getMyTeam);
@@ -77,5 +79,8 @@ r.post('/admin/bp/profiles/bulk', isAdmin, Admin.adminBulkProfiles);
 r.get('/admin/bp/audit', isAdmin, Admin.adminAuditLogs);
 r.post('/uploads/single', protect, U.uploadSingle);
 r.post('/uploads/multi',  protect, U.uploadMulti);
-
+r.get('/market/items', Item.marketList);
+r.get('/market/items/:itemId', Item.marketGetOne);
+r.get('/market/facets', Item.marketFacets);
+r.get("/market/items/:productId", Item.getMarketItem);
 module.exports = r;
