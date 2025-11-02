@@ -21,6 +21,9 @@ const bpItemSchema = new mongoose.Schema({
 
   // commercial notes
   pricingNote: { type: String, trim: true, maxlength: 500 },
+  priceValue:     { type: Number, min: 0, default: null },
+  priceCurrency:  { type: String, trim: true, uppercase: true, minlength: 3, maxlength: 3, default: null },
+  priceUnit:      { type: String, trim: true, lowercase: true, maxlength: 40, default: null },
 
   // visibility
   published: { type: Boolean, default: true },

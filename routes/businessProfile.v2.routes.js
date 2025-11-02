@@ -9,7 +9,6 @@ const Adm  = require('../controllers/bpAdminController');
 const Search = require('../controllers/bpSearchController');
 const Stats  = require('../controllers/bpStatsController');
 const Media  = require('../controllers/bpMediaController');
-const Admin = require('../controllers/bpAdminController');
 const U = require('../controllers/uploadController');
 const { isAdmin } = require('../middleware/roleGuard');
 
@@ -37,7 +36,7 @@ r.post('/bp/me/items/:itemId/images/remove', protect, Item.removeItemImage);
 // items (public on a profile)
 r.get('/bp/:profileId/items', Item.listProfileItems);
 
-// admin moderation
+// admin moderationa
 r.get('/admin/bp/queue', protect, Adm.queue);
 r.patch('/admin/bp/:id/publish', protect, Adm.setProfilePublished);
 r.patch('/admin/bp/items/:itemId/hide', protect, Adm.hideItem);
@@ -70,17 +69,11 @@ r.post('/bp/me/gallery/add', protect, Media.addToGallery);
 r.post('/bp/me/gallery/remove', protect, Media.removeFromGallery);
 
 
-r.get('/admin/bp/profiles', isAdmin, Admin.adminListProfiles);
-r.get('/admin/bp/profile/:id', isAdmin, Admin.adminGetProfile);
-r.patch('/admin/bp/profile/:id/moderate', isAdmin, Admin.adminModerateProfile);
-r.patch('/admin/bp/profile/:id/owner-role', isAdmin, Admin.adminChangeOwnerRole);
-r.patch('/admin/bp/items/:itemId/moderate', isAdmin, Admin.adminModerateItem);
-r.post('/admin/bp/profiles/bulk', isAdmin, Admin.adminBulkProfiles);
-r.get('/admin/bp/audit', isAdmin, Admin.adminAuditLogs);
+
 r.post('/uploads/single', protect, U.uploadSingle);
 r.post('/uploads/multi',  protect, U.uploadMulti);
 r.get('/market/items', Item.marketList);
 r.get('/market/items/:itemId', Item.marketGetOne);
 r.get('/market/facets', Item.marketFacets);
-r.get("/market/items/:productId", Item.getMarketItem);
+r.get("/market/item/:productId", Item.getMarketItem);
 module.exports = r;

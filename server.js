@@ -71,7 +71,8 @@ app.use('/admin/chat', require('./routes/adminChatRoutes'));
 app.set('trust proxy', true);
 // Actor-facing API (DMs, groups, comments, etc.)
 app.use('/actors',  require('./routes/actorsRoutes'));
-app.use('/invites', require('./routes/inviteRoutes'))
+app.use('/invites', require('./routes/inviteRoutes'));
+app.use('/biz', require('./routes/bp.admin.routes'));
 // 404
 app.use((_req, res) => {
   console.log('404 Not Found');

@@ -21,7 +21,8 @@ const s = (v) => {
   }
 };
 const log = (...args) => console.log(`[${ts()}][${TAG}]`, ...args);
-
+const CUR_RX = /^[A-Z]{3}$/;
+const toNum = (v) => (v === '' || v === null || typeof v === 'undefined' ? NaN : Number(v));
 /* ----------------------- core helpers ----------------------- */
 async function myProfile(req) {
   const actorId = req.user?._id || req.user?.id;
@@ -38,17 +39,36 @@ async function validateTaxonomy(sector, subsectorId, kind) {
     log('validateTaxonomy() -> OK (no sector)');
     return { ok: true, sector: null, subsectorName: null, subsectorId: null };
   }
-  const sectorKey = String(sector).toLowerCase().trim();
-  const t = await BPTaxonomy.findOne({ sector: sectorKey }).lean();
-  log('validateTaxonomy() fetched sector:', t ? { sector: t.sector, subsectors: (t.subsectors || []).length } : null);
+
+  // Normalize: lower-case, collapse whitespace, strip diacritics
+  const normKey = (s='') => String(s)
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const sectorKey = normKey(sector);
+  log('validateTaxonomy() sectorKey:', sectorKey);
+
+  // Primary exact match against normalized key (schema stores lowercase)
+  let t = await BPTaxonomy.findOne({ sector: sectorKey }).lean();
+  // Fallback: case-insensitive anchored match (helps during data migration)
+  if (!t) {
+    const esc = (v) => String(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    t = await BPTaxonomy.findOne({ sector: new RegExp(`^${esc(sector)}$`, 'i') }).lean();
+  }
+
+  log('validateTaxonomy() fetched sector:', t ? { sector: t.sector, subsectors: (t.subsectors||[]).length } : null);
   if (!t) return { ok: false, error: 'sector_not_found' };
 
   if (!subsectorId) {
     log('validateTaxonomy() -> OK (no subsectorId)');
     return { ok: true, sector: t.sector, subsectorName: null, subsectorId: null };
   }
+
   const sub = (t.subsectors || []).find(s => String(s._id) === String(subsectorId));
-  log('validateTaxonomy() matched subsector:', sub ? { _id: String(sub._id), name: sub.name, allowProducts: sub.allowProducts, allowServices: sub.allowServices } : null);
+  log('validateTaxonomy() matched subsector:',
+      sub ? { _id:String(sub._id), name:sub.name, allowProducts:sub.allowProducts, allowServices:sub.allowServices } : null);
   if (!sub) return { ok: false, error: 'subsector_not_found' };
   if (kind === 'product' && !sub.allowProducts) return { ok: false, error: 'subsector_disallows_product' };
   if (kind === 'service' && !sub.allowServices) return { ok: false, error: 'subsector_disallows_service' };
@@ -56,6 +76,7 @@ async function validateTaxonomy(sector, subsectorId, kind) {
   log('validateTaxonomy() -> OK');
   return { ok: true, sector: t.sector, subsectorName: sub.name, subsectorId: sub._id };
 }
+
 
 /* Accepts a TON of shapes and normalizes to string[] */
 function coerceUploadsFromBody(body = {}) {
@@ -140,7 +161,20 @@ exports.createItem = asyncHdl(async (req, res) => {
     images: Array.isArray(req.body?.images) ? req.body.images.map(String).filter(Boolean).slice(0, 12) : [],
     published: req.body?.published !== false
   };
+  const pv = toNum(req.body?.priceValue);
+  const pc = toStr(req.body?.priceCurrency).toUpperCase();
+  const pu = toStr(req.body?.priceUnit).toLowerCase();
 
+  if (pv > 0) {
+    if (!CUR_RX.test(pc)) return res.status(400).json({ message: 'invalid_currency' });
+   payload.priceValue    = pv;
+    payload.priceCurrency = pc;
+    payload.priceUnit     = pu || null; // unit is optional free text (e.g., 'per kg','per hour')
+  } else {
+    payload.priceValue    = null;
+    payload.priceCurrency = null;
+    payload.priceUnit     = null;
+  }
   log('createItem() INSERT payload:', s(payload));
   const doc = await BPItem.create(payload);
   log('createItem() INSERTED _id:', String(doc._id), 'images:', s(doc.images));
@@ -194,7 +228,27 @@ exports.updateItem = asyncHdl(async (req, res) => {
   if ('tags' in body) it.tags = normTags(body.tags);
   if ('pricingNote' in body) it.pricingNote = toStr(body.pricingNote, 500);
   if ('published' in body) it.published = !!body.published;
+const hasPV = Object.prototype.hasOwnProperty.call(body, 'priceValue');
+  const hasPC = Object.prototype.hasOwnProperty.call(body, 'priceCurrency');
+  const hasPU = Object.prototype.hasOwnProperty.call(body, 'priceUnit');
 
+  if (hasPV || hasPC || hasPU) {
+    const pv = hasPV ? toNum(body.priceValue) : it.priceValue;
+    const pc = hasPC ? toStr(body.priceCurrency).toUpperCase() : it.priceCurrency;
+   const pu = hasPU ? toStr(body.priceUnit).toLowerCase() : it.priceUnit;
+
+    if (pv > 0) {
+      if (!CUR_RX.test(pc || '')) return res.status(400).json({ message: 'invalid_currency' });
+      it.priceValue    = pv;
+      it.priceCurrency = pc;
+     it.priceUnit     = pu || null;
+    } else {
+      // 0 or empty => clear whole price block
+      it.priceValue    = null;
+      it.priceCurrency = null;
+      it.priceUnit     = null;
+    }
+  }
   // media fields — store as strings
   if ('thumbnailUpload' in body) {
     const v = body.thumbnailUpload;
@@ -221,6 +275,9 @@ exports.updateItem = asyncHdl(async (req, res) => {
       details: it.details,
       tags: it.tags,
       pricingNote: it.pricingNote,
+      priceValue: it.priceValue,
+      priceCurrency: it.priceCurrency,
+      priceUnit: it.priceUnit,
       sector: it.sector,
       subsectorId: it.subsectorId,
       subsectorName: it.subsectorName,
@@ -275,7 +332,7 @@ exports.listMyItems = asyncHdl(async (req, res) => {
   const docs = await cursor
     .sort({ createdAt: -1 })
     .limit(lim)
-    .select('kind title summary details tags pricingNote sector subsectorId subsectorName thumbnailUpload images published createdAt')
+    .select('kind title summary details tags pricingNote priceValue priceCurrency priceUnit sector subsectorId subsectorName thumbnailUpload images published createdAt')
     .lean();
 
   log('listMyItems() -> count:', docs.length, 'sample[0]:', docs[0] ? s(docs[0]) : null);
@@ -305,7 +362,7 @@ exports.listProfileItems = asyncHdl(async (req, res) => {
   const docs = await BPItem.find(filter)
     .sort({ createdAt: -1 })
     .limit(lim)
-    .select('kind title summary details tags pricingNote sector subsectorId subsectorName thumbnailUpload images createdAt')
+    .select('kind title summary details tags pricingNote priceValue priceCurrency priceUnit sector subsectorId subsectorName thumbnailUpload images createdAt')
     .lean();
 
   log('listProfileItems() -> count:', docs.length);
@@ -560,17 +617,25 @@ exports.marketFacets = asyncHdl(async (_req, res) => {
   });
 });
 exports.getMarketItem = asyncHdl(async (req, res) => {
-  const id = req.params.productId;
-  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Bad productId" });
+  const { productId } = req.params;
+  if (!mongoose.isValidObjectId(productId)) {
+    return res.status(400).json({ message: "Bad productId" });
+  }
 
-  const doc = await BPItem.findById(id).lean();
+  // pull only the fields we actually need
+  const doc = await BPItem.findById(productId)
+    .select(
+      "kind sector subsectorId subsectorName title summary details tags pricingNote priceValue priceCurrency priceUnit images thumbnailUpload profile createdAt"
+    )
+    .lean();
+
   if (!doc) return res.status(404).json({ message: "Item not found" });
 
-  // Pull minimal BP data if linked
+  // --- normalize minimal BusinessProfile payload (MATCHES YOUR HOOK SAMPLE) ---
   let profile = null;
-  if (doc.profileId && mongoose.isValidObjectId(doc.profileId)) {
-    const p = await BusinessProfile.findById(doc.profileId)
-      .select("name slug logo tagline headline locations links contacts about overview offerings badges certifications")
+  if (doc.profile && mongoose.isValidObjectId(doc.profile)) {
+    const p = await BusinessProfile.findById(doc.profile)
+      .select("name slug logoUpload industries countries languages")
       .lean();
 
     if (p) {
@@ -578,40 +643,41 @@ exports.getMarketItem = asyncHdl(async (req, res) => {
         id: String(p._id),
         name: p.name || "",
         slug: p.slug || "",
-        logo: p.logo || "",
-        tagline: p.tagline || p.headline || "",
-        locations: Array.isArray(p.locations)
-          ? p.locations.map(l => ({ city: l?.city || "", country: l?.country || "" }))
-          : [],
-        links: p.links || {},
-        contacts: Array.isArray(p.contacts)
-          ? p.contacts
-              .filter(c => c && c.kind && c.value)
-              .map(c => ({ kind: String(c.kind).toLowerCase(), value: c.value, label: c.label || "" }))
-          : [],
-        overview: p.overview || p.about || "",
-        offerings: Array.isArray(p.offerings) ? p.offerings : [],
-        badges: Array.isArray(p.badges) ? p.badges : (Array.isArray(p.certifications) ? p.certifications : []),
+        logoUpload: p.logoUpload || "",
+        industries: Array.isArray(p.industries) ? p.industries : [],
+        countries: Array.isArray(p.countries) ? p.countries : [],
+        languages: Array.isArray(p.languages) ? p.languages : [],
       };
     }
   }
 
-  const out = {
+  // --- response shape (includes _id + id, price fields, images) ---
+  return res.json({
     id: String(doc._id),
-    kind: doc.kind || "product",                 // "product" | "service"
-    title: doc.title || doc.name || "",
-    sector: doc.sectorName || doc.sector || "",
-    subsectorName: doc.subsectorName || "",
-    summary: doc.summary || doc.description || "",
-    details: doc.details || doc.longDescription || "",
-    features: Array.isArray(doc.features) ? doc.features : [],
-    specs: doc.specs && typeof doc.specs === "object" ? doc.specs : {},
-    images: Array.isArray(doc.images) ? doc.images : (Array.isArray(doc.gallery) ? doc.gallery : []),
-    thumbnailUpload: doc.thumbnailUpload || "",
-    tags: Array.isArray(doc.tags) ? doc.tags : [],
-    profile, // normalized BP info used by the page
-  };
+    _id: String(doc._id),
+    profile,
 
-  // Return raw object (not wrapped) to match your existing hook usage
-  return res.json(out);
+    kind: doc.kind || "product",
+    sector: doc.sector || "",
+    subsectorId: doc.subsectorId || "",
+    subsectorName: doc.subsectorName || "",
+
+    title: doc.title || "",
+    summary: doc.summary || "",
+    details: doc.details || "",
+    tags: Array.isArray(doc.tags) ? doc.tags : [],
+
+    images: Array.isArray(doc.images) ? doc.images : [],
+    thumbnailUpload: doc.thumbnailUpload || "",
+
+    pricingNote: doc.pricingNote || "",
+    priceValue:
+      typeof doc.priceValue === "number"
+        ? doc.priceValue
+        : (doc.priceValue ? Number(doc.priceValue) : null),
+    priceCurrency: doc.priceCurrency || "",
+    priceUnit: doc.priceUnit || "",
+
+    createdAt: doc.createdAt,
+  });
 });

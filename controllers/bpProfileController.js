@@ -7,6 +7,7 @@ const Speaker   = require('../models/speaker');
 const Attendee  = require('../models/attendee');
 const MeetRequest = require('../models/meetRequest');
 const SessionRegistration = require('../models/sessionRegistration');
+const BPTaxonomy = require('../models/BPTaxonomy');
 const mongoose = require('mongoose');
 const TYPE_TO_MODEL = {
   exhibitor: Exhibitor,
@@ -432,49 +433,126 @@ exports.searchTeamCandidates = async (req, res) => {
   const actorId = req.user?._id || req.user?.id;
   if (!actorId) return res.status(401).json({ message: 'Unauthorized' });
 
-  const q = toStr(req.query.q);
-  const limit = Math.max(1, Math.min(30, Number(req.query.limit || 12)));
+  const qRaw   = toStr(req.query.q).trim();
+  const tokens = qRaw ? qRaw.split(/\s+/).filter(Boolean).slice(0, 5) : [];
+  const limit  = Math.max(1, Math.min(30, Number(req.query.limit || 12)));
+  const fetchPerRole = Math.max(limit * 2, 24); // fetch more, rank, then trim
 
-  // 1) Collect all actors who already OWN a BP -> exclude them
+  const escapeRx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  // 1) Exclude actors who already own a BP
   const owners = await BusinessProfile.find({}, { 'owner.actor': 1 }).lean();
-  const ownerIds = new Set(owners.map(x => String(x.owner?.actor)).filter(Boolean));
+  const ownerIds = new Set(owners.map(x => String(x?.owner?.actor)).filter(Boolean));
 
-  // 2) Collect my BP (to exclude already-added team members)
-  const myBP = await BusinessProfile.findOne({ 'owner.actor': actorId }, { team: 1 }).lean();
+  // 2) My BP: exclude already-added members, capture event scope
+  const myBP = await BusinessProfile.findOne(
+    { 'owner.actor': actorId },
+    { team: 1, event: 1 }
+  ).lean();
+
   const alreadyInTeam = new Set(
-    (myBP?.team || []).map(t => `${t.entityType}:${String(t.entityId)}`)
+    (myBP?.team || []).map(t => `${toStr(t.entityType).toLowerCase()}:${String(t.entityId)}`)
   );
+  const eventScope = myBP?.event || null; // most data models use id_event on actors
 
-  // 3) Build a regex for name/email search (where available)
-  const rx = q ? new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') : null;
+  // Build a tokenized $and of $or(regex) across the searchable fields
+function buildSearchFilter(roleKey, nameOrEmailPaths) {
+  // enforce only admin-approved actors
+  const base = { adminVerified: 'yes' }; // <-- NEW
 
-  async function searchRole(roleKey){
-    const { Model, namePaths, avatarPaths } = ROLE_MODELS[roleKey];
-    const nameOrEmail = [
-      ...namePaths,
-      ...(roleKey === 'exhibitor' ? ['identity.email'] : ['personal.email'])
-    ];
+  // keep event scoping
+  if (eventScope) base.id_event = eventScope;
+
+  // no search tokens -> just base filters
+  if (!tokens.length) return base;
+
+  // tokenized regex AND across name/email fields
+  const andClauses = tokens.map(tok => {
+    const rx = new RegExp(escapeRx(tok), 'i');
+    return { $or: nameOrEmailPaths.map(p => ({ [p]: rx })) };
+  });
+  return { ...base, $and: andClauses };
+}
+
+  // Ranking: prioritize startsWith on name, then contains, email startsWith, then contains
+  function rankDoc({ doc, roleKey, namePaths, emailPath, createdAt }, queryTokens) {
+    const name = (pickFirst(doc, namePaths) || '').toLowerCase();
+    const email = (toStr(emailPath ? pickFirst(doc, [emailPath]) : '')).toLowerCase();
+    let score = 0;
+
+    if (!queryTokens.length) {
+      // No query: favor freshness & having a name
+      score += name ? 1 : 0;
+      return score;
+    }
+
+    for (const t of queryTokens.map(x => x.toLowerCase())) {
+      if (name) {
+        if (name.startsWith(t)) score += 4;
+        else if (name.includes(t)) score += 2;
+      }
+      if (email) {
+        if (email.startsWith(t)) score += 3;
+        else if (email.includes(t)) score += 1;
+      }
+    }
+    return score;
+  }
+
+  async function searchRole(roleKey) {
+    const { Model, namePaths, avatarPaths } = ROLE_MODELS[roleKey] || {};
+    if (!Model) return [];
+
+    // choose email path per role
+    const emailPath = roleKey === 'exhibitor' ? 'identity.email' : 'personal.email';
+    const nameOrEmail = [...namePaths, emailPath];
+
+    // projection
     const proj = {};
     [...namePaths, ...avatarPaths, ...nameOrEmail, 'id_event', 'createdAt'].forEach(p => proj[p] = 1);
 
-    const sFilter = rx ? { $or: nameOrEmail.map(p => ({ [p]: rx })) } : {};
-    const rows = await Model.find(sFilter, proj).sort({ createdAt: -1 }).limit(limit).lean();
+    const filter = buildSearchFilter(roleKey, nameOrEmail);
+
+    // Pull more than we need, then rank & trim
+    const rows = await Model
+      .find(filter, proj)
+      .sort(tokens.length ? {} : { createdAt: -1 }) // when no q, recent first
+      .limit(fetchPerRole)
+      .lean();
 
     const out = [];
     for (const d of rows) {
       const id = String(d._id);
-      if (ownerIds.has(id)) continue; // has its own BP -> cannot be a team member
+
+      // Exclusions
+      if (ownerIds.has(id)) continue; // has its own BP
       const key = `${roleKey}:${id}`;
       if (alreadyInTeam.has(key)) continue; // already in my team
 
+      const score = rankDoc({
+        doc: d, roleKey,
+        namePaths,
+        emailPath,
+        createdAt: d.createdAt instanceof Date ? d.createdAt : new Date(d.createdAt || 0)
+      }, tokens);
+
       out.push({
+        _score: score,
+        _createdAt: d.createdAt instanceof Date ? d.createdAt : new Date(d.createdAt || 0),
         entityType: roleKey,
         entityId  : id,
         name      : pickFirst(d, namePaths) || '(Unnamed)',
-        title     : '', // optional – you can enrich if you have a title field
+        title     : '',
         avatarUpload: pickFirst(d, avatarPaths) || null,
       });
     }
+
+    // sort by score desc, then recency
+    out.sort((a, b) => {
+      if (b._score !== a._score) return b._score - a._score;
+      return (b._createdAt?.getTime?.() || 0) - (a._createdAt?.getTime?.() || 0);
+    });
+
     return out;
   }
 
@@ -484,9 +562,21 @@ exports.searchTeamCandidates = async (req, res) => {
     searchRole('attendee'),
   ]);
 
-  // merge + trim to limit
-  const merged = [...exh, ...spk, ...att].slice(0, limit);
-  return res.json({ success: true, data: merged });
+  // Merge, dedupe, trim to limit
+  const merged = [];
+  const seen = new Set();
+  for (const row of [...exh, ...spk, ...att]) {
+    const k = `${row.entityType}:${row.entityId}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    merged.push(row);
+    if (merged.length >= limit) break;
+  }
+
+  // Strip internal scoring fields
+  const data = merged.map(({ _score, _createdAt, ...rest }) => rest);
+
+  return res.json({ success: true, data });
 };
 
 
@@ -540,38 +630,79 @@ exports.removeTeamMember = async (req, res) => {
 };
 // POST /bp/me/create-or-get
 exports.createOrGetMyProfile = asyncHdl(async (req, res) => {
-  const actorId = req.user?._id || req.user?.id;
+  const actorId  = req.user?._id || req.user?.id;
   const actorRole = (req.user?.actorType || req.user?.role || '').toLowerCase();
   if (!actorId) return res.status(401).json({ message: 'Unauthorized' });
   if (denyStudent(actorRole)) return res.status(403).json({ message: 'Students cannot own a business profile' });
 
+  // If it already exists, return it (unchanged)
   let p = await BusinessProfile.findOne({ 'owner.actor': actorId });
   if (p) return res.json({ ok: true, created: false, data: pickPublic(p) });
 
-  // sensible defaults using any data present on req.user (comes from your role model at login)
+  // ---------------- helpers ----------------
+  const normUrl = (v) => {
+    const s = toStr(v).trim();
+    if (!s) return '';
+    return /^https?:\/\//i.test(s) ? s : `https://${s}`;
+  };
+  const isEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(toStr(v).trim());
+  const pushIf = (arr, cond, row) => { if (cond) arr.push(row); };
+
+  // sensible defaults using any data present on req.user
   const defaultName =
     req.user?.personal?.fullName ||
     req.user?.identity?.exhibitorName ||
     req.user?.organization?.orgName ||
     'My Business';
 
+  // ---------- contacts seed (from body first, then user fallback) ----------
+  const bodyContacts = req.body?.contacts || {};
+  const cWebsite = toStr(bodyContacts.website) || toStr(req.user?.links?.website) || toStr(req.user?.identity?.website);
+  const cEmail   = toStr(bodyContacts.email)   || toStr(req.user?.personal?.email);
+  const cPhone   = toStr(bodyContacts.phone)   || toStr(req.user?.personal?.phone);
+
+  const allowEmail = bodyContacts.hasOwnProperty('allowEmail') ? !!bodyContacts.allowEmail : true;
+  const allowPhone = bodyContacts.hasOwnProperty('allowPhone') ? !!bodyContacts.allowPhone : false;
+  const allowDM    = bodyContacts.hasOwnProperty('allowDM')    ? !!bodyContacts.allowDM    : true;
+
+  const contacts = [];
+  pushIf(contacts, !!cWebsite, { kind: 'website', value: normUrl(cWebsite), label: 'Website', show: true });
+  pushIf(contacts, isEmail(cEmail), { kind: 'email', value: cEmail.toLowerCase(), label: 'Email', show: allowEmail });
+  pushIf(contacts, !!cPhone, { kind: 'phone', value: cPhone, label: 'Phone', show: allowPhone });
+
+  // Optional: persist DM preference on the profile root (non-breaking)
+  const contactPrefs = { allowDM };
+
+  // ---------- create ----------
   p = new BusinessProfile({
     owner: { actor: actorId, role: actorRole || 'attendee' },
     event: req.user?.id_event || undefined,
-    name: toStr(req.body?.name || defaultName, 120),
-    size: toStr(req.body?.size || '1-10', 20),
+
+    name:    toStr(req.body?.name || defaultName, 120),
+    size:    toStr(req.body?.size || '1-10', 20),
     tagline: toStr(req.body?.tagline, 160),
-    about: toStr(req.body?.about, 4000),
+    about:   toStr(req.body?.about, 4000),
+
+    // positioning
     industries: normTags(req.body?.industries || req.user?.business?.industry || req.user?.businessProfile?.primaryIndustry),
-    countries : normTags(req.body?.countries || req.user?.personal?.country),
-    languages : normTags(req.body?.languages || req.user?.personal?.preferredLanguages || req.user?.identity?.preferredLanguages),
-    offering  : normTags(req.body?.offering  || req.user?.commercial?.offering || req.user?.b2bIntent?.offering),
-    seeking   : normTags(req.body?.seeking   || req.user?.matchingIntent?.objectives || req.user?.commercial?.lookingFor || req.user?.b2bIntent?.lookingFor),
+    countries : normTags(req.body?.countries  || req.user?.personal?.country),
+    languages : normTags(req.body?.languages  || req.user?.personal?.preferredLanguages || req.user?.identity?.preferredLanguages),
+    offering  : normTags(req.body?.offering   || req.user?.commercial?.offering || req.user?.b2bIntent?.offering),
+    seeking   : normTags(req.body?.seeking    || req.user?.matchingIntent?.objectives || req.user?.commercial?.lookingFor || req.user?.b2bIntent?.lookingFor),
     innovation: normTags(req.body?.innovation),
+
+    // NEW: seed contacts/socials on creation
+    contacts,
+    contactPrefs, // optional small object; safe to ignore on read
+    socials: Array.isArray(req.body?.socials)
+      ? (req.body.socials || [])
+          .filter(s => toStr(s?.url))
+          .map(s => ({ label: toStr(s.label, 40), url: normUrl(s.url) }))
+      : []
   });
 
   await p.save();
-  res.status(201).json({ ok: true, created: true, data: pickPublic(p) });
+  return res.status(201).json({ ok: true, created: true, data: pickPublic(p) });
 });
 
 // PATCH /bp/me
@@ -611,27 +742,77 @@ exports.changeMyBusinessRole = asyncHdl(async (req, res) => {
 
 // GET /bp/me/summary
 // controllers/bpProfileController.js
+
+const toKey = (v) => String(v || '').trim().toLowerCase();
+
+// Build a fast lookup from taxonomy:
+//  - sectorKey -> { sector, subsectors[{_id,name}] }
+//  - subsectorKey(name) -> { name, sectorKey }
+async function loadTaxMaps() {
+  const rows = await BPTaxonomy.find({}).select('sector subsectors').lean();
+  const bySectorKey = new Map();
+  const subsectorIndex = new Map();
+  for (const r of rows) {
+    const sk = toKey(r.sector);
+    bySectorKey.set(sk, r);
+    for (const ss of (r.subsectors || [])) {
+      subsectorIndex.set(toKey(ss.name), { name: ss.name, sectorKey: sk });
+    }
+  }
+  return { bySectorKey, subsectorIndex };
+}
+
+// Normalize whatever is in BP.industries (mixed case, sector+subsectors at same level)
+// into our canonical format: [sectorKey, ...subsectorNames]
+async function normalizeIndustries(rawInds) {
+  const list = Array.isArray(rawInds) ? rawInds : [];
+  if (!list.length) return [];
+  const { bySectorKey, subsectorIndex } = await loadTaxMaps();
+
+  let sectorKey = '';
+  const subsectors = [];
+
+  for (const v of list) {
+    const k = toKey(v);
+    if (bySectorKey.has(k)) {
+      sectorKey = k; // store only the key for sector
+      continue;
+    }
+    if (subsectorIndex.has(k)) {
+      // keep subsector display NAME in the array
+      subsectors.push(subsectorIndex.get(k).name);
+      continue;
+    }
+    // Unknown token -> keep as-is (don’t lose user data)
+    if (v && typeof v === 'string') subsectors.push(v);
+  }
+  return sectorKey ? [sectorKey, ...subsectors] : subsectors;
+}
 exports.getMyProfileSummary = asyncHdl(async (req, res) => {
   const actorId = req.user?._id || req.user?.id;
 
   const p = await BusinessProfile.findOne({ 'owner.actor': actorId })
-    .select(
-      [
-        '_id', 'slug', 'name', 'tagline', 'about', 'size',
-        'industries', 'countries', 'languages',
-        'offering', 'seeking', 'innovation',
-        'logoUpload', 'bannerUpload', 'gallery',
-        'contacts', 'socials', 'legalDocUpload',
-        'published', 'owner', 'role', 'stats',
-        'createdAt', 'updatedAt'
-      ].join(' ')
-    )
+    .select([
+      '_id', 'slug', 'name', 'tagline', 'about', 'size',
+      'industries', 'countries', 'languages',
+      'offering', 'seeking', 'innovation',
+      'logoUpload', 'bannerUpload', 'gallery',
+      'contacts', 'socials', 'legalDocUpload',
+      'published', 'owner', 'role', 'stats',
+      'createdAt', 'updatedAt'
+    ].join(' '))
     .lean();
 
   if (!p) return res.status(404).json({ message: 'Not found' });
 
-  // Normalize arrays so the client can map() safely
+  // Normalize arrays
   const arr = (v) => (Array.isArray(v) ? v : []);
+
+  // 🔧 Key fix: ensure industries come back and are normalized
+  console.log("Normalizing industries for BP ",p.industries );
+  const industries = await normalizeIndustries(p.industries);
+  console.log("Normalized industries for BP ",industries);
+
   const data = {
     _id: p._id,
     slug: p.slug || null,
@@ -639,7 +820,7 @@ exports.getMyProfileSummary = asyncHdl(async (req, res) => {
     tagline: p.tagline || '',
     about: p.about || '',
     size: p.size || '',
-    industries: arr(p.industries),
+    industries,                                // <- normalized, never randomly empty if DB has data
     countries: arr(p.countries),
     languages: arr(p.languages),
     offering: arr(p.offering),
