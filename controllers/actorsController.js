@@ -930,26 +930,31 @@ async function loadBucket({ bucket, limit, eventOid, searchRx }) {
       .lean() : Promise.resolve([]))
   ]);
 
-  // Normalize to a unified card object
   const rows = [];
 
+  // ATTENDEE → include gender + organization
   for (const d of attRows) {
     rows.push({
       _id: String(d._id),
       role: "attendee",
       name:  pick(d, "personal.fullName"),
       email: String(pick(d, "personal.email")).toLowerCase(),
+      // NOTE: this field has historically carried phone – keeping as-is
       country: (pick(d, "personal.phone") || "").toUpperCase(),
       profilePic: pick(d, "personal.profilePic"),
-      logo: "", // for UI compatibility
+      logo: "",
       adminVerified: normAdminVerified(d.adminVerified),
       verifiedEmail: !!d.verified,
       createdAt: d.createdAt,
       id_event: d.id_event,
-      eventName: "" // will be hydrated below
+      eventName: "",
+      // NEW:
+      gender: pick(d, "personal.gender") || "",
+      organization: pick(d, "organization.orgName") || ""
     });
   }
 
+  // EXHIBITOR → include organization (+ best-effort gender if present)
   for (const d of exhRows) {
     rows.push({
       _id: String(d._id),
@@ -958,12 +963,15 @@ async function loadBucket({ bucket, limit, eventOid, searchRx }) {
       email: String(pick(d, "contact.email")).toLowerCase(),
       country: (pick(d, "identity.phone") || "").toUpperCase(),
       logo: pick(d, "logo"),
-      profilePic: "", // for UI compatibility
+      profilePic: "",
       adminVerified: normAdminVerified(d.adminVerified),
       verifiedEmail: !!d.verified,
       createdAt: d.createdAt,
       id_event: d.id_event,
-      eventName: "" // will be hydrated below
+      eventName: "",
+      // NEW:
+      organization: pick(d, "organization.orgName", "companyName") || "",
+      gender: pick(d, "contact.gender", "identity.gender") || ""
     });
   }
 
@@ -980,14 +988,9 @@ async function loadBucket({ bucket, limit, eventOid, searchRx }) {
   return rows;
 }
 
+
 exports.getRequests = asyncHdl(async (req, res) => {
-  // Accept both body & query for convenience
-  let {
-    adminVerify, // "no" | "pending" | "yes" | undefined
-    limit,
-    search,
-    eventId
-  } = { ...(req.body || {}), ...(req.query || {}) };
+  let { adminVerify, limit, search, eventId } = { ...(req.body || {}), ...(req.query || {}) };
 
   adminVerify = typeof adminVerify === "string" ? adminVerify.trim().toLowerCase() : "";
   if (adminVerify && !STATUSES.includes(adminVerify)) {
@@ -997,30 +1000,26 @@ exports.getRequests = asyncHdl(async (req, res) => {
   const eventOid = (eventId && mongoose.isValidObjectId(eventId)) ? new mongoose.Types.ObjectId(eventId) : null;
   const searchRx = search && String(search).trim() ? makeRx(String(search).trim()) : null;
 
-  // Strategy:
-  // - if adminVerify provided: main bucket gets `limit` (default 20), others 5
-  // - else: fetch 5 for each bucket
   const MAIN_LIMIT  = toLimit(limit, 20);
   const OTHER_LIMIT = 5;
-
   const plan = adminVerify
     ? [[adminVerify, MAIN_LIMIT], ...STATUSES.filter(s => s !== adminVerify).map(s => [s, OTHER_LIMIT])]
     : STATUSES.map(s => [s, OTHER_LIMIT]);
 
   const results = { no: [], pending: [], yes: [] };
-  const promises = plan.map(([bucket, lim]) =>
-    loadBucket({ bucket, limit: lim, eventOid, searchRx }).then(rows => { results[bucket] = rows; })
-  );
-  await Promise.all(promises);
-
-  // Optional: attach role-assignment flags (if you already have those role-like models)
-  // Skipped here unless you need them; you can paste your previous "assignedRoles" block.
-
-  // Debug log for you
-  console.log("[admin:getRequests]",
-    { adminVerify: adminVerify || null, limit: MAIN_LIMIT, search: search || null, eventId: eventId || null },
-    { counts: { no: results.no.length, pending: results.pending.length, yes: results.yes.length } }
-  );
+  await Promise.all(plan.map(async ([bucket, lim]) => {
+    const rows = await loadBucket({ bucket, limit: lim, eventOid, searchRx });
+    results[bucket] = rows.map(doc => ({
+      ...doc,
+      // ensure flat fields always exist
+      phone: doc.phone || doc?.personal?.phone || doc?.identity?.phone || doc?.contactPhone || "",
+      gender: (doc.gender ?? "") || doc?.personal?.gender || doc?.identity?.gender || "",
+      organization:
+        (doc.organization ?? "") ||
+        doc?.organization?.orgName || doc?.identity?.orgName || doc?.identity?.exhibitorName ||
+        doc?.orgName || doc?.companyName || ""
+    }));
+  }));
 
   return res.json({
     success: true,
@@ -1033,6 +1032,7 @@ exports.getRequests = asyncHdl(async (req, res) => {
     data: results
   });
 });
+
 
 
 
