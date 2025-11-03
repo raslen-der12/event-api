@@ -66,6 +66,7 @@ app.use('/biz', require("./routes/businessProfile.v2.routes"));
 app.use('/pp', require("./routes/profile.v2.routes"));
 app.use('/api', require("./routes/freightRoutes"));
 app.use('/search', require('./routes/searchRoutes'));
+app.use('/bp-public', require('./routes/bp.public.routes'));  // Must exist before 404
 // Admin chat REST lives under /admin/chat/*
 app.use('/admin/chat', require('./routes/adminChatRoutes'));
 app.set('trust proxy', true);
@@ -73,6 +74,7 @@ app.set('trust proxy', true);
 app.use('/actors',  require('./routes/actorsRoutes'));
 app.use('/invites', require('./routes/inviteRoutes'));
 app.use('/biz', require('./routes/bp.admin.routes'));
+app.use('/admin/actors', require('./routes/adminActorsRoutes'));
 // 404
 app.use((_req, res) => {
   console.log('404 Not Found');
