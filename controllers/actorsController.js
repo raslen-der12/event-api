@@ -868,7 +868,7 @@ const STATUSES = ["no", "pending", "yes"];
 
 function toLimit(v, d = 20) {
   const n = Number(v);
-  return Number.isFinite(n) ? Math.min(Math.max(1, n), 200) : d;
+  return Number.isFinite(n) ? Math.min(Math.max(1, n), 10000) : d;
 }
 function makeRx(s = "") {
   const esc = String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
