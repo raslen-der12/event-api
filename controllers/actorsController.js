@@ -343,6 +343,95 @@ const normBool = (v) => {
   const s = String(v).trim().toLowerCase();
   return ['true','1','yes','y','on','ok'].includes(s);
 };
+
+
+
+async function buildRegistrationPdf({ event, actor, role, sessions }) {
+  const doc = new PDFDocument({ size: 'A4', margin: 36 });
+  const chunks = [];
+  doc.on('data', c => chunks.push(c));
+  const done = new Promise(res => doc.on('end', () => res(Buffer.concat(chunks))));
+
+  // Optional logo in header
+  const logoPath = process.env.BRAND_LOGO_PATH && path.resolve(process.env.BRAND_LOGO_PATH);
+  if (logoPath && fs.existsSync(logoPath)) {
+    doc.image(logoPath, 36, 24, { fit: [120, 40] });
+  }
+
+  // Event title & meta
+  doc.fontSize(18).font('Helvetica-Bold').fillColor('#000')
+     .text(event?.title || 'Event', 36, 78);
+  doc.moveDown(0.2);
+  doc.fontSize(10).font('Helvetica').fillColor('#555')
+     .text(`${new Date(event?.startDate || Date.now()).toLocaleDateString()} → ${new Date(event?.endDate || Date.now()).toLocaleDateString()}`)
+     .text([event?.city, event?.country].filter(Boolean).join(' • '));
+  doc.moveDown(0.6);
+  doc.moveTo(36, doc.y).lineTo(559, doc.y).strokeColor('#ddd').stroke();
+
+  // Two-column header: left (event + actor), right (QR)
+  const yTop = doc.y + 12;
+
+  // Left column details
+  doc.save();
+  doc.font('Helvetica-Bold').fillColor('#000').fontSize(13).text('Registration', 36, yTop);
+  doc.moveDown(0.3).font('Helvetica').fontSize(11).fillColor('#111');
+
+  if (role === 'exhibitor') {
+    doc.text(`Brand: ${actor?.identity?.exhibitorName || ''}`);
+    doc.text(`Contact: ${actor?.identity?.contactName || ''}`);
+    doc.text(`Email: ${actor?.identity?.email || ''}`);
+    if (actor?.identity?.country) doc.text(`Country: ${actor.identity.country}`);
+  } else {
+    doc.text(`Participant: ${actor?.personal?.fullName || ''}`);
+    doc.text(`Email: ${actor?.personal?.email || ''}`);
+    if (actor?.organization?.orgName) doc.text(`Organization: ${actor.organization.orgName}`);
+    if (actor?.personal?.country) doc.text(`Country: ${actor.personal.country}`);
+  }
+  doc.restore();
+
+  // Right column QR
+  const qrUrl = publicProfileUrl(role, actor?._id);
+  const qrPng = await QRCode.toBuffer(qrUrl, { width: 140, margin: 0 });
+  doc.image(qrPng, 559 - 140, yTop, { width: 140 });
+
+  // Sessions table
+  doc.moveTo(36, yTop + 140).lineTo(559, yTop + 140).strokeColor('#eee').stroke();
+  doc.font('Helvetica-Bold').fillColor('#000').fontSize(12).text('Your selected sessions', 36, yTop + 152);
+
+  const cols = [36, 140, 360, 480]; // Time, Title, Room, Track x-positions
+  let y = doc.y + 6;
+  doc.font('Helvetica-Bold').fontSize(10);
+  doc.text('Time', cols[0], y);
+  doc.text('Title', cols[1], y);
+  doc.text('Room', cols[2], y);
+  doc.text('Track', cols[3], y);
+  y += 14;
+  doc.moveTo(36, y).lineTo(559, y).strokeColor('#ddd').stroke();
+  y += 6;
+
+  doc.font('Helvetica').fillColor('#111');
+  (sessions || []).forEach(s => {
+    const startStr = s.startAt ? new Date(s.startAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
+    const endStr   = s.endAt   ? new Date(s.endAt).toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
+    doc.text(`${startStr}–${endStr}`, cols[0], y, { width: cols[1]-cols[0]-8 });
+    doc.text(s.title || 'Untitled',   cols[1], y, { width: cols[2]-cols[1]-8 });
+    doc.text(s.room?.name || '',      cols[2], y, { width: cols[3]-cols[2]-8 });
+    doc.text(s.track || '',           cols[3], y, { width: 559-cols[3]-8 });
+    y += 16;
+    if (y > 770) { doc.addPage(); y = 60; }
+  });
+
+  // Footer
+  doc.moveDown(1);
+  doc.fontSize(10).fillColor('#555')
+     .text('Best regards,')
+     .text('IPDAYS X GITS 2025');
+
+  doc.end();
+  return done;
+}
+
+
 /* ───────────────────────── Actor creation (admin) ───────────────────── */
 // CREATE: attendee | exhibitor | speaker
 exports.createActorSimple = asyncHdl(async (req, res) => {
@@ -3420,4 +3509,68 @@ exports.getAttendeesForMeeting = asyncHdl(async (req, res) => {
   const out = withPct.map(({ _rawScore, ...rest }) => rest);
 
   return res.json({ success: true, data: out });
+});
+const uniqById = (arr) => {
+  const m = new Map();
+  for (const d of arr) m.set(String(d._id), d);
+  return [...m.values()];
+};
+
+exports.listSpeakerAssignedSessions = asyncHdl(async (req, res) => {
+  const speakerId = req.params.speakerId || req.query.speakerId || req.body?.speakerId;
+  const eventId   = req.params.eventId   || req.query.eventId   || req.body?.eventId;
+
+  if (!mongoose.isValidObjectId(speakerId)) {
+    return res.status(400).json({ message: 'Bad speakerId' });
+  }
+  const speakerOid = new mongoose.Types.ObjectId(speakerId);
+
+  // Optional event filter
+  let eventFilter = {};
+  if (eventId) {
+    if (!mongoose.isValidObjectId(eventId)) return res.status(400).json({ message: 'Bad eventId' });
+    eventFilter = { id_event: new mongoose.Types.ObjectId(eventId) };
+  }
+
+  // Ensure speaker exists (helps catch typos)
+  const exists = await Speaker.exists({ _id: speakerOid });
+  if (!exists) return res.status(404).json({ message: 'Speaker not found' });
+
+  // A) Sessions where speaker is attached in the schedule doc
+  //    (either single `speaker` or array `speakers`)
+  const qSched = {
+    ...eventFilter,
+    $or: [{ speaker: speakerOid }, { speakers: speakerOid }],
+  };
+  const viaField = await Schedule.find(qSched)
+    .populate({ path: 'roomId',  select: 'name label floor' })
+    .populate({ path: 'id_event', select: 'title' })
+    .lean();
+
+  // B) Sessions via registrations table (actorRole:'speaker', not cancelled)
+  const regFilter = {
+    actorId: speakerOid,
+    actorRole: 'speaker',
+    status: { $ne: 'cancelled' },
+  };
+  if (eventFilter.id_event) regFilter.eventId = eventFilter.id_event;
+
+  const regs = await SessionRegistration.find(regFilter).select('sessionId').lean();
+  const sessionIds = regs.map(r => r.sessionId).filter(Boolean);
+
+  let viaReg = [];
+  if (sessionIds.length) {
+    viaReg = await Schedule.find({ _id: { $in: sessionIds } })
+      .populate({ path: 'roomId',  select: 'name label floor' })
+      .populate({ path: 'id_event', select: 'title' })
+      .lean();
+  }
+
+  // Merge (unique) and sort by start time
+  const merged = uniqById([
+    ...viaField.map(d => ({ ...d, _origin: 'speaker-field' })),
+    ...viaReg.map(d  => ({ ...d, _origin: 'registration' })),
+  ]).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+
+  return res.json({ success: true, count: merged.length, data: merged });
 });

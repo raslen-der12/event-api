@@ -69,7 +69,6 @@ app.use('/search', require('./routes/searchRoutes'));
 app.use('/bp-public', require('./routes/bp.public.routes'));  // Must exist before 404
 // Admin chat REST lives under /admin/chat/*
 app.use('/admin/chat', require('./routes/adminChatRoutes'));
-app.set('trust proxy', true);
 // Actor-facing API (DMs, groups, comments, etc.)
 app.use('/actors',  require('./routes/actorsRoutes'));
 app.use('/invites', require('./routes/inviteRoutes'));

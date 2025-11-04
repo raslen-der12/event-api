@@ -41,6 +41,8 @@ const SlotWhitelist = require("../models/SlotWhitelist");
 /* ─────────────────── helper maps ──────────────────── */
 const SessionRegistration = require('../models/sessionRegistration'); // path as in your app
 const { Types } = require("mongoose");
+const EventSchedule = require('../models/eventModels/schedule');
+const escapeRx = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 
 const MeetingAttendance =
@@ -80,7 +82,7 @@ const SessionAttendance = mongoose.models.sessionAttendance || mongoose.model('s
 
 function resolveActorModel(role){
   switch(String(role||'').toLowerCase()){
-    case 'attendee': return Attendee;
+    case 'attendee': return attendee;
     case 'exhibitor': return Exhibitor;
     case 'speaker': return Speaker;
     default: return null;
@@ -133,7 +135,33 @@ const isId = (v) => mongoose.Types.ObjectId.isValid(String(v));
 const arr = (v) => (Array.isArray(v) ? v : []);
 const text = (v) => (typeof v === "string" ? v.trim() : "");
 const firstText = (...vals) => vals.find((v) => text(v)) || "";
+exports.listEventSessionsMini = asyncHandler(async (req, res) => {
+  const eventId = req.params.eventId || req.query.eventId;
+  const search  = (req.query.search || '').trim();
+  if (!mongoose.isValidObjectId(eventId)) {
+    return res.status(400).json({ message: 'Bad eventId' });
+  }
 
+  const q = { id_event: new mongoose.Types.ObjectId(eventId) };
+  if (search) q.sessionTitle = { $regex: escapeRx(search), $options: 'i' };
+
+  const docs = await EventSchedule.find(q)
+    .select('_id sessionTitle startTime endTime room roomId track')
+    .sort({ startTime: 1, _id: 1 })
+    .lean();
+
+  const data = docs.map(d => ({
+    _id: String(d._id),
+    title: d.sessionTitle || 'Session',
+    startAt: d.startTime || null,
+    endAt: d.endTime || null,
+    room: d.room || null,
+    roomId: d.roomId || null,
+    track: d.track || ''
+  }));
+
+  return res.json({ success: true, count: data.length, data });
+});
 exports.getMeetingPrefs = async (req, res) => {
   try {
     const { actorId: id } = req.params;
@@ -4309,74 +4337,345 @@ exports.setMyWhitelist = async (req, res) => {
   return res.json({ success: true, eventId, date, data: dayOut });
 };
 
-exports.adminScanActorAttend = asyncHandler(async (req,res)=>{
-  let { eventId, actorId, actorRole, token } = req.body||{};
-  if (token && !eventId && !actorId){
-    try { const o = JSON.parse(Buffer.from(String(token),'base64url').toString('utf8'));
-      eventId=o.eventId; actorId=o.actorId; actorRole=o.actorRole;
+// helper: find actor & role across attendee/exhibitor/speaker for an event
+async function probeActorRoleAndDoc(eventId, actorId) {
+  const [att, exh, spk] = await Promise.all([
+    typeof attendee  !== "undefined" ? attendee.findOne({ _id: actorId, id_event: eventId })
+      .select("personal organization id_event").lean() : null,
+    typeof exhibitor !== "undefined" ? exhibitor.findOne({ _id: actorId, id_event: eventId })
+      .select("contact organization companyName logo id_event").lean() : null,
+    typeof speaker   !== "undefined" ? speaker.findOne({ _id: actorId, id_event: eventId })
+      .select("personal identity organization id_event").lean() : null,
+  ]);
+  if (att) return { role: "attendee", doc: att };
+  if (exh) return { role: "exhibitor", doc: exh };
+  if (spk) return { role: "speaker",  doc: spk };
+  return null;
+}
+
+function shapeActor(role, d) {
+  if (!d) return {};
+  if (role === "attendee") {
+    return {
+      name: d?.personal?.fullName || "",
+      email: d?.personal?.email || "",
+      organization: d?.organization?.orgName || "",
+      gender: d?.personal?.gender || "",
+      avatar: d?.personal?.profilePic || ""
+    };
+  }
+  if (role === "exhibitor") {
+    return {
+      name: d?.organization?.orgName || d?.companyName || d?.contact?.name || "",
+      email: d?.contact?.email || "",
+      organization: d?.organization?.orgName || d?.companyName || "",
+      gender: d?.contact?.gender || "",
+      avatar: d?.logo || ""
+    };
+  }
+  // speaker
+  return {
+    name: d?.personal?.fullName || d?.identity?.fullName || "",
+    email: d?.personal?.email || d?.identity?.email || "",
+    organization: d?.organization?.orgName || "",
+    gender: d?.personal?.gender || d?.identity?.gender || "",
+    avatar: d?.personal?.profilePic || d?.identity?.avatar || ""
+  };
+}
+
+// controllers/adminScanActorAttend.js (or wherever this lives)
+exports.adminScanActorAttend = asyncHandler(async (req, res) => {
+  let { eventId, actorId, actorRole, token, preview } = req.body || {};
+
+  // token support (unchanged)
+  if (token && !eventId && !actorId) {
+    try {
+      const o = JSON.parse(Buffer.from(String(token), "base64url").toString("utf8"));
+      eventId   = o.eventId   || eventId;
+      actorId   = o.actorId   || actorId;
+      actorRole = o.actorRole || actorRole;
     } catch {}
   }
-  if (!mongoose.isValidObjectId(eventId) || !mongoose.isValidObjectId(actorId))
-    return res.status(400).json({ message:'Bad ids' });
 
-  const Model = resolveActorModel(actorRole);
-  if (!Model) return res.status(400).json({ message:'Bad actorRole' });
+  if (!mongoose.isValidObjectId(eventId) || !mongoose.isValidObjectId(actorId)) {
+    return res.status(400).json({ message: "Bad ids" });
+  }
 
-  const exists = await Model.exists({ _id: actorId, id_event: eventId });
-  if (!exists) return res.status(404).json({ message:'Actor not in event' });
+  let role = (actorRole || "").trim().toLowerCase();
+  let actorDoc = null;
 
+  // If role not provided, probe all three collections
+  if (!role) {
+    const found = await probeActorRoleAndDoc(eventId, actorId);
+    if (!found) return res.status(404).json({ message: "Actor not in event" });
+    role = found.role;
+    actorDoc = found.doc;
+  } else {
+    // Validate given role and fetch doc for return
+    const Model = resolveActorModel(role);
+    if (!Model) return res.status(400).json({ message: "Bad actorRole" });
+    actorDoc = await Model.findOne({ _id: actorId, id_event: eventId }).lean();
+    if (!actorDoc) return res.status(404).json({ message: "Actor not in event" });
+  }
+
+  // Check existing check-in BEFORE preview/confirm
+  const existing = await EventCheckin
+    .findOne({ eventId, actorId, actorRole: role })
+    .select("at")
+    .lean();
+  const alreadyCheckedIn = !!existing;
+  const lastCheckinAt = existing?.at || null;
+
+  if (preview) {
+    // Preview: return identity + whether already checked-in
+    return res.json({
+      success: true,
+      data: {
+        preview: true,
+        actorRole: role,
+        actor: shapeActor(role, actorDoc),
+        alreadyCheckedIn,
+        lastCheckinAt
+      }
+    });
+  }
+
+  // Confirm (upsert)
   await EventCheckin.updateOne(
-    { eventId, actorId, actorRole },
-    { $set: { eventId, actorId, actorRole, at: new Date(), by: req.user._id }},
-    { upsert:true }
+    { eventId, actorId, actorRole: role },
+    { $set: { eventId, actorId, actorRole: role, at: new Date(), by: req.user?._id || null } },
+    { upsert: true }
   );
-  const count = await EventCheckin.countDocuments({ eventId });
-  return res.json({ success:true, data:{ checkedIn:true, eventCheckins:count }});
-});
-exports.adminScanSession = asyncHandler(async (req,res)=>{
-  const { sessionId, eventId, actorId, actorRole, mark=true } = req.body||{};
-  if (![sessionId,eventId,actorId].every(mongoose.isValidObjectId))
-    return res.status(400).json({ message:'Bad ids' });
 
-  const reg = await SessionRegistration.findOne({ sessionId, actorId, eventId, status:{ $ne:'cancelled' } }).lean();
+  const count = await EventCheckin.countDocuments({ eventId });
+
+  return res.json({
+    success: true,
+    data: {
+      checkedIn: true,
+      eventCheckins: count,
+      actorRole: role,
+      actor: shapeActor(role, actorDoc),
+      alreadyCheckedIn,   // report whether it was already checked before this confirm
+      lastCheckinAt
+    }
+  });
+});
+
+
+exports.adminScanSession = asyncHandler(async (req, res) => {
+  let { sessionId, eventId, actorId, actorRole, token, preview, mark = true } = req.body || {};
+
+  // Optional token support (base64url JSON: { eventId, sessionId, actorId, actorRole })
+  if (token && (!eventId || !sessionId || !actorId)) {
+    try {
+      const o = JSON.parse(Buffer.from(String(token), "base64url").toString("utf8"));
+      eventId   = o.eventId   || eventId;
+      sessionId = o.sessionId || sessionId;
+      actorId   = o.actorId   || actorId;
+      actorRole = o.actorRole || actorRole;
+    } catch {}
+  }
+
+  if (!mongoose.isValidObjectId(eventId) || !mongoose.isValidObjectId(sessionId))
+    return res.status(400).json({ message: "Bad ids" });
+  if (!mongoose.isValidObjectId(actorId))
+    return res.status(400).json({ message: "Bad ids" });
+
+  // Resolve role + load doc
+  let role = String(actorRole || "").trim().toLowerCase();
+  let actorDoc = null;
+
+  if (!role) {
+    const found = await probeActorRoleAndDoc(eventId, actorId);
+    if (!found) return res.status(404).json({ message: "Actor not in event" });
+    role = found.role;
+    actorDoc = found.doc;
+  } else {
+    const Model = resolveActorModel(role);
+    if (!Model) return res.status(400).json({ message: "Bad actorRole" });
+    actorDoc = await Model.findOne({ _id: actorId, id_event: eventId }).lean();
+    if (!actorDoc) return res.status(404).json({ message: "Actor not in event" });
+  }
+
+  // Is actor assigned to this session? (ignore cancelled)
+  const reg = await SessionRegistration
+    .findOne({ sessionId, actorId, eventId, status: { $ne: "cancelled" } })
+    .select("status")
+    .lean();
   const assigned = !!reg;
 
-  if (mark && assigned){
+  // Prior session attendance?
+  const existing = await SessionAttendance
+    .findOne({ sessionId, eventId, actorId })
+    .select("at")
+    .lean();
+  const alreadyCheckedIn = !!existing;
+  const lastCheckinAt = existing?.at || null;
+
+  // Preview only -> do not mark
+  if (preview) {
+    return res.json({
+      success: true,
+      data: {
+        preview: true,
+        actorRole: role,
+        actor: shapeActor(role, actorDoc),
+        assigned,
+        alreadyCheckedIn,
+        lastCheckinAt
+      }
+    });
+  }
+
+  // Confirm (mark) only if assigned
+  let marked = false;
+  if (mark && assigned) {
     await SessionAttendance.updateOne(
       { sessionId, eventId, actorId },
-      { $set:{ sessionId, eventId, actorId, actorRole, at:new Date(), by:req.user._id }},
-      { upsert:true }
+      { $set: { sessionId, eventId, actorId, actorRole: role, at: new Date(), by: req.user?._id || null } },
+      { upsert: true }
     );
+    marked = true;
   }
-  return res.json({ success:true, data:{ assigned, marked:Boolean(mark && assigned) }});
+
+  const sessionCheckins = await SessionAttendance.countDocuments({ sessionId });
+
+  return res.json({
+    success: true,
+    data: {
+      marked,
+      assigned,
+      alreadyCheckedIn,
+      lastCheckinAt,
+      actorRole: role,
+      actor: shapeActor(role, actorDoc),
+      sessionCheckins
+    }
+  });
 });
-exports.adminScanMeet = asyncHandler(async (req,res)=>{
-  const { meetId, actorId, kind='physical' } = req.body||{};
-  if (!mongoose.isValidObjectId(meetId) || !mongoose.isValidObjectId(actorId))
-    return res.status(400).json({ message:'Bad ids' });
-  if (!['physical','virtual'].includes(kind)) return res.status(400).json({ message:'Bad kind' });
+exports.adminScanMeet = asyncHandler(async (req, res) => {
+  let { meetId, actorId, kind = 'physical', preview } = req.body || {};
+  if (!mongoose.isValidObjectId(meetId) || !mongoose.isValidObjectId(actorId)) {
+    return res.status(400).json({ message: 'Bad ids' });
+  }
+  if (!['physical', 'virtual'].includes(String(kind))) {
+    return res.status(400).json({ message: 'Bad kind' });
+  }
 
   const meet = await MeetRequest.findById(meetId).lean();
-  if (!meet) return res.status(404).json({ message:'Meeting not found' });
+  if (!meet) return res.status(404).json({ message: 'Meeting not found' });
 
-  // upsert attendance record
-  await MeetingAttendance.updateOne(
-    { meetingId: meetId, actorId, kind },
-    { $set:{ meetingId: meetId, eventId: meet.eventId, actorId, kind, attended:true, at:new Date(), by:req.user._id }},
-    { upsert:true }
-  );
-
-  // check both actors
-  const both = await MeetingAttendance.countDocuments({ meetingId: meetId, attended:true });
-  const happened = both >= 2;
-
-  if (happened){
-    // store marker without schema migration (extra field)
-    await MeetRequest.updateOne({ _id: meetId }, { $set:{ happenedAt: new Date() }});
+  // verify actor belongs to this meet
+  const senderId   = String(meet.senderId || '');
+  const receiverId = String(meet.receiverId || '');
+  const youId      = String(actorId);
+  const isSender   = youId === senderId;
+  const isReceiver = youId === receiverId;
+  if (!isSender && !isReceiver) {
+    return res.status(403).json({ message: 'Actor is not a participant of this meeting' });
   }
 
-  const recs = await MeetingAttendance.find({ meetingId: meetId }).lean();
-  return res.json({ success:true, data:{ happened, recs }});
+  const youRole   = isSender ? meet.senderRole   : meet.receiverRole;
+  const otherId   = isSender ? receiverId        : senderId;
+  const otherRole = isSender ? meet.receiverRole : meet.senderRole;
+
+  // helper to read current checkins
+  async function readState() {
+    const recs = await MeetingAttendance.find({ meetingId: meetId }).lean();
+    const youRec   = recs.find(r => String(r.actorId) === youId);
+    const otherRec = recs.find(r => String(r.actorId) === otherId);
+    const both = recs.filter(r => !!r.attended).length;
+    const happened = both >= 2;
+
+    // earliest check-in
+    let firstArrived = null;
+    if (recs.length) {
+      const sorted = [...recs].sort((a,b) => new Date(a.at) - new Date(b.at));
+      if (sorted[0]?.at) firstArrived = { actorId: String(sorted[0].actorId), at: sorted[0].at };
+    }
+
+    return {
+      recs,
+      happened,
+      youCheckedInAt: youRec?.at || null,
+      otherCheckedInAt: otherRec?.at || null,
+      firstArrived,
+      youWereFirst: firstArrived ? String(firstArrived.actorId) === youId : false,
+      alreadyCheckedIn: !!youRec?.attended,
+      otherCheckedIn: !!otherRec?.attended
+    };
+  }
+
+  // PREVIEW — do not mark, only report membership & current state
+  if (preview) {
+    const s = await readState();
+    return res.json({
+      success: true,
+      data: {
+        preview: true,
+        you: { actorId: youId, role: youRole },
+        other: { actorId: otherId, role: otherRole },
+        happened: s.happened,
+        alreadyCheckedIn: s.alreadyCheckedIn,
+        otherCheckedIn: s.otherCheckedIn,
+        youCheckedInAt: s.youCheckedInAt,
+        otherCheckedInAt: s.otherCheckedInAt,
+        firstArrived: s.firstArrived,
+        youWereFirst: s.youWereFirst
+      }
+    });
+  }
+
+  // MARK — upsert your attendance
+  await MeetingAttendance.updateOne(
+    { meetingId: meetId, actorId: youId, kind },
+    {
+      $set: {
+        meetingId: meetId,
+        eventId: meet.eventId,
+        actorId: youId,
+        kind,
+        attended: true,
+        at: new Date(),
+        by: req.user?._id || null
+      }
+    },
+    { upsert: true }
+  );
+
+  // if first arrival not stored, set it (kept as extra fields without schema migration)
+  await MeetRequest.updateOne(
+    { _id: meetId, 'firstArrived.actorId': { $exists: false } },
+    { $set: { firstArrived: { actorId: youId, at: new Date() } } }
+  );
+
+  // recompute final state
+  const state = await readState();
+
+  // if both present, stamp happenedAt (once)
+  if (state.happened) {
+    await MeetRequest.updateOne(
+      { _id: meetId, happenedAt: { $exists: false } },
+      { $set: { happenedAt: new Date() } }
+    );
+  }
+
+  return res.json({
+    success: true,
+    data: {
+      checkedIn: true,
+      happened: state.happened,
+      you: { actorId: youId, role: youRole },
+      other: { actorId: otherId, role: otherRole },
+      alreadyCheckedIn: state.alreadyCheckedIn,
+      otherCheckedIn: state.otherCheckedIn,
+      youCheckedInAt: state.youCheckedInAt,
+      otherCheckedInAt: state.otherCheckedInAt,
+      firstArrived: state.firstArrived,
+      youWereFirst: state.youWereFirst
+    }
+  });
 });
 
 exports.exportConfirmedMeetsCSV = asyncHandler(async (req,res)=>{

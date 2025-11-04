@@ -69,6 +69,7 @@ router.delete('/chat/:msgId/react/:emoji',   protect, actor.unReactMessage);
 router.delete('/chat/msg/:msgId',            protect, actor.deleteMessageGlobal);
 router.get('/me/notifications', protect, Notif.listMine);
 router.patch('/me/notifications/:id/ack', protect, Notif.ackMine);
+router.get('/speakers/:speakerId/sessions', actor.listSpeakerAssignedSessions);
 
 /* ───────────────────  EVENTS – comments & bookmarks  ─────────── */
 // router.post  ('/event/:eventId/comments',    protect, actor.createComment);

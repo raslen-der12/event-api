@@ -452,6 +452,11 @@ exports.login = asyncHandler(async (req, res) => {
 
   /* 1️⃣  Build search order – admins last */
   const lookups = [
+    {
+      model : Admin,
+      where : { email: loginInput.toLowerCase() },
+      role  : 'admin'
+    },
     // attendee
     {
       model : attendee,
@@ -477,11 +482,7 @@ exports.login = asyncHandler(async (req, res) => {
       role  : 'speaker'
     },
     // ADMIN
-    {
-      model : Admin,
-      where : { email: loginInput.toLowerCase() },
-      role  : 'admin'
-    }
+    
   ];
 
   /* 2️⃣  Find the first matching document */

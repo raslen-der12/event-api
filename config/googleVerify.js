@@ -4,6 +4,7 @@ const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 const jwt    = require('jsonwebtoken');
 
 exports.verifyIdToken = async (idToken) => {
+ 
   const ticket = await client.verifyIdToken({
     idToken,
     audience: process.env.GOOGLE_CLIENT_ID

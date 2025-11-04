@@ -56,5 +56,6 @@ router.put('meets/admin/whitelist', protect, meetsCtrl.adminSetWhitelist);
 router.post('/admin/scan/actor-attend', protect,  meetsCtrl.adminScanActorAttend);
 router.post('/admin/scan/session',      protect,  meetsCtrl.adminScanSession);
 router.post('/admin/scan/meet',         protect,  meetsCtrl.adminScanMeet);
+router.get('/admin/events/:eventId/sessions-mini', meetsCtrl.listEventSessionsMini);
 
 module.exports = router;
