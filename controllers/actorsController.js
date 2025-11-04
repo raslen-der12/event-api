@@ -435,8 +435,6 @@ async function buildRegistrationPdf({ event, actor, role, sessions }) {
 /* ───────────────────────── Actor creation (admin) ───────────────────── */
 // CREATE: attendee | exhibitor | speaker
 exports.createActorSimple = asyncHdl(async (req, res) => {
-
-
   let { role, eventId, roleKind } = req.body || {};
   role = String(role || '').toLowerCase().trim();
 
@@ -510,6 +508,8 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
   const pwdHash = await bcrypt.hash(tmpPwd, 12);
 
   let created;
+
+  // Branch by role and create the appropriate document using the canonical fields, including jobTitle
   if (role === 'attendee') {
     created = await attendee.create({
       personal: {
@@ -572,8 +572,9 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
       pwd: pwdHash
     });
   } else {
+    // speaker (or default)
     created = await Speaker.create({
-      personal: { fullName: name, email,firstEmail:email, phone, country, city, profilePic: DEF_PHOTO },
+      personal: { fullName: name, email, firstEmail: email, phone, country, city, profilePic: DEF_PHOTO },
       organization: { orgName: orgName || 'Unknown', jobTitle: jobTitle || 'Expert', businessRole: 'Expert' },
       talk: {
         title: String(req.body?.talk?.title || 'Unknown'),
@@ -698,6 +699,7 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
     data: { id: created._id, role, roleKind: normKind || null }
   });
 });
+
 
 
 

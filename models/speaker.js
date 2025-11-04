@@ -10,24 +10,23 @@ const ROLE_KIND_ENUM = ['Business Owner','Investor','Consultant','Expert','Emplo
 
 /* ───────────────────────── A. Personal & Contact ───────────────────── */
 const PersonalSchema = new mongoose.Schema({
-  fullName        : { type:String, required:true, trim:true, minlength:2 },
-  email           : { type:String, required:true, lowercase:true, match:EMAIL_RX, index:{ unique:true } },
-  phone           : { type:String },
-  linkedIn        : { type:String, match:URL_RX },
-  country         : { type:String, required:true },
-  desc            : { type:String, maxlength:500 },
-  city            : { type:String },
-  profilePic      : { type:String },
-  firstEmail      : { type:String, required:true, lowercase:true, match:EMAIL_RX, index:{ unique:true } },
-
+  fullName   : { type:String, required:true, trim:true, minlength:2 },
+  email      : { type:String, required:true, lowercase:true, match:EMAIL_RX, index:{ unique:true } },
+  phone      : { type:String, default: "" },
+  linkedIn   : { type:String, match:URL_RX, default: "" },
+  country    : { type:String, required:true },
+  desc       : { type:String, maxlength:500, default: "" },
+  city       : { type:String, default: "" },
+  profilePic : { type:String, default: "" },
+  firstEmail : { type:String, lowercase:true, match:EMAIL_RX } // not required; will default to email in controller if absent
 }, subOpts);
 
 /* ───────────────────────── B. Organisation & Role ──────────────────── */
 const OrgRoleSchema = new mongoose.Schema({
-  orgName         : { type:String, required:true, trim:true },
-  orgWebsite      : { type:String, match:URL_RX },
-  jobTitle        : { type:String, required:true, trim:true },
-  businessRole    : { type:String, required:true }     // CEO, Expert, …
+  orgName      : { type:String, trim:true, default: "" },
+  orgWebsite   : { type:String, match:URL_RX, default: "" },
+  jobTitle     : { type:String, trim:true, default: "" },      // now optional-friendly
+  businessRole : { type:String, trim:true, default: "" }      // optional-friendly
 }, subOpts);
 
 /* ───────────────────────── C. Talk / Presentation ──────────────────── */
@@ -69,26 +68,26 @@ const MatchMetaSchema = new mongoose.Schema({
 
 /* ───────────────────────── Main schema ─────────────────────────────── */
 const speakerSchema = new mongoose.Schema({
-  personal    : PersonalSchema,
-  organization: OrgRoleSchema,
-  talk        : TalkSchema,
-  b2bIntent   : B2BIntentSchema,
-  enrichments : EnrichSchema,
-  matchMeta   : MatchMetaSchema,
-  role: { type: String, enum: ROLE_KIND_ENUM, index: true, default: null }, // <— NEW
+  personal     : PersonalSchema,
+  organization : OrgRoleSchema,
+  talk         : TalkSchema,
+  b2bIntent    : B2BIntentSchema,
+  enrichments  : EnrichSchema,
+  matchMeta    : MatchMetaSchema,
+
+  // Keep single role field (enum) if you need roleKind constraints; otherwise remove enum
+  roleKind: { type: String, enum: ROLE_KIND_ENUM, index: true, default: null },
 
   /* Core auth & event link */
   verified   : { type:Boolean, default:false },
-  pwd        : { type:String, required:true, minlength:8, select:false },
-  subRole      : { type: [String], default: [] },
-  actorType    : { type: String, trim: true, default: '' },     // BusinessOwner, Consultant, Employee, Investor, Student, Expert
-  role    : { type: String, trim: true, default: '' },
+  pwd        : { type:String, minlength:8, select:false }, // removed required:true to allow flexibility
+  subRole    : { type: [String], default: [] },
+  actorType  : { type: String, trim: true, default: '' },
+  role       : { type: String, trim: true, default: '' }, // legacy freeform role
   createdAt  : { type:Date, default:Date.now },
   id_event   : { type:mongoose.Schema.Types.ObjectId, ref:'event', required:true },
   resetToken:      { type: String, select: false },
   resetExpires:    { type: Date,   select: false },
-
-  // Change-email rollback
   emailChangeToken: { type: String, select: false },
   emailChangeExpires:{ type: Date,  select: false },
   emailChangePrev:  { type: String, select: false },
