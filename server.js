@@ -45,6 +45,7 @@ mongoose.connection.once('open', () => {
   // } catch {}
 });
 
+app.set('trust proxy', true);
 /* 2) Global middleware --------------------------------------------------- */
 
 /* 3) Static & health ----------------------------------------------------- */
@@ -74,7 +75,7 @@ app.use('/actors',  require('./routes/actorsRoutes'));
 app.use('/invites', require('./routes/inviteRoutes'));
 app.use('/biz', require('./routes/bp.admin.routes'));
 app.use('/admin/actors', require('./routes/adminActorsRoutes'));
-// 404
+
 app.use((_req, res) => {
   console.log('404 Not Found');
   res.status(404).json({ message: '404 Not Found but ready to get requests' });
