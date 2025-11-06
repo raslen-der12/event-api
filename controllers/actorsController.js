@@ -438,6 +438,16 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
   let { role, eventId, roleKind } = req.body || {};
   role = String(role || '').toLowerCase().trim();
 
+  // small HTML escaper used for email/PDF generation to avoid ReferenceError
+  const escapeHtml = (input = "") => {
+    return String(input)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  };
+
   // Normalize roleKind to canonical labels you use on the new UI
   const normKind = (() => {
     const s = String(roleKind || '').trim().toLowerCase();
@@ -450,16 +460,23 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
     return roleKind ? roleKind : null;
   })();
 
-  const name    = String(req.body?.personal?.fullName || req.body?.identity?.exhibitorName || '').trim();
-  const email   = String(req.body?.personal?.email || req.body?.identity?.email || '').toLowerCase().trim();
-  const country = String(req.body?.personal?.country || req.body?.identity?.country || '').trim().toUpperCase();
-  const phone   = String(req.body?.personal?.phone || req.body?.identity?.phone || '').trim();
-  const city    = String(req.body?.personal?.city || req.body?.identity?.city || '').trim();
-  const orgName = String(req.body?.organization?.orgName || req.body?.identity?.orgName || '').trim();
-  const jobTitle= String(req.body?.organization?.jobTitle || '').trim();
-  const website = String(req.body?.links?.website || '').trim();
-  const linkedin= String(req.body?.links?.linkedin || '').trim();
-  const gender  = String(req.body?.personal?.gender || '').trim().toLowerCase(); // 'male'|'female' optional
+  // Basic identity fields (accept nested or flat)
+  const name    = String(req.body?.personal?.fullName || req.body?.identity?.exhibitorName || req.body?.identity?.contactName || req.body?.fullName || '').trim();
+  const email   = String(req.body?.personal?.email || req.body?.identity?.email || req.body?.email || '').toLowerCase().trim();
+  const country = String(req.body?.personal?.country || req.body?.identity?.country || req.body?.country || '').trim().toUpperCase();
+  const phone   = String(req.body?.personal?.phone || req.body?.identity?.phone || req.body?.phone || '').trim();
+  const city    = String(req.body?.personal?.city || req.body?.identity?.city || req.body?.city || '').trim();
+  const orgName = String(req.body?.organization?.orgName || req.body?.identity?.orgName || req.body?.orgName || '').trim();
+  const jobTitle= String(req.body?.organization?.jobTitle || req.body?.jobTitle || '').trim();
+  const website = String(req.body?.links?.website || req.body?.links?.web || req.body?.website || '').trim();
+  const linkedin= String(req.body?.links?.linkedin || req.body?.linkedin || '').trim();
+  const gender  = String(req.body?.personal?.gender || req.body?.gender || '').trim().toLowerCase(); // 'male'|'female' optional
+
+  // Accept short bio and longer desc from nested or flat shapes; enforce schema limits
+  const descRaw = req.body?.personal?.desc || req.body?.desc || req.body?.identity?.desc || '';
+  const bioRaw  = req.body?.personal?.bio  || req.body?.bio  || req.body?.identity?.bio  || '';
+  const desc = String(descRaw || '').trim().slice(0, 500); // matches PersonalSchema.desc maxlength
+  const bio  = String(bioRaw  || '').trim().slice(0, 300);  // matches PersonalSchema.bio maxlength
 
   if (!['attendee', 'exhibitor', 'speaker'].includes(role))
     return res.status(400).json({ message: 'role must be attendee | exhibitor | speaker' });
@@ -509,7 +526,7 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
 
   let created;
 
-  // Branch by role and create the appropriate document using the canonical fields, including jobTitle
+  // Branch by role and create the appropriate document using the canonical fields, including jobTitle, desc, bio
   if (role === 'attendee') {
     created = await attendee.create({
       personal: {
@@ -522,7 +539,10 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
         gender: ['male','female'].includes(gender) ? gender : undefined,
         profilePic: DEF_PHOTO,
         preferredLanguages: Array.isArray(req.body?.businessProfile?.preferredLanguages)
-          ? req.body.businessProfile.preferredLanguages.slice(0,3) : []
+          ? req.body.businessProfile.preferredLanguages.slice(0,3) : [],
+        // include desc + bio
+        desc,
+        bio
       },
       organization: {
         orgName: orgName || 'Unknown',
@@ -557,7 +577,10 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
         city,
         logo: DEF_LOGO,
         preferredLanguages: Array.isArray(req.body?.identity?.preferredLanguages)
-          ? req.body.identity.preferredLanguages.slice(0,3) : []
+          ? req.body.identity.preferredLanguages.slice(0,3) : [],
+        // include desc + bio on identity (so exhibitor pages can show them)
+        desc,
+        bio
       },
       business: { industry: String(req.body?.business?.industry || '').trim() },
       commercial: { availableMeetings: !!req.body?.commercial?.availableMeetings },
@@ -574,7 +597,18 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
   } else {
     // speaker (or default)
     created = await Speaker.create({
-      personal: { fullName: name, email, firstEmail: email, phone, country, city, profilePic: DEF_PHOTO },
+      personal: {
+        fullName: name,
+        email,
+        firstEmail: email,
+        phone,
+        country,
+        city,
+        profilePic: DEF_PHOTO,
+        // include desc + bio for speakers
+        desc,
+        bio
+      },
       organization: { orgName: orgName || 'Unknown', jobTitle: jobTitle || 'Expert', businessRole: 'Expert' },
       talk: {
         title: String(req.body?.talk?.title || 'Unknown'),
@@ -602,14 +636,26 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
   }
 
   // Verify link like registration
+  const { randomBytes } = require('crypto');
   const raw = randomBytes(32).toString('hex');
   created.verifyToken   = await bcrypt.hash(raw, 12);
   created.verifyExpires = Date.now() + 24 * 60 * 60 * 1000;
   await created.save();
   const verifyLink = `${process.env.FRONTEND_URL}/verify-email?token=${raw}&role=${role}&id=${created._id}`;
 
-  // Build PDF + registration-style email (non-clipping table)
-  const pdf = await buildRegistrationPdf({ event: eventDoc, actor: created, role, sessions: normSessions });
+  // Build PDF + registration-style email (non-clipping table) — guarded
+  let pdf = null;
+  try {
+    if (typeof buildRegistrationPdf === 'function') {
+      pdf = await buildRegistrationPdf({ event: eventDoc, actor: created, role, sessions: normSessions });
+    } else {
+      console.warn('buildRegistrationPdf is not defined — skipping PDF generation.');
+    }
+  } catch (pdfErr) {
+    console.error('Error while generating registration PDF:', pdfErr);
+    pdf = null;
+  }
+
   const rowsHtml = normSessions.map(s => {
     const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
     const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
@@ -668,7 +714,7 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
     <p style="font:600 14px system-ui">Hello ${escapeHtml(who)},</p>
     <p style="font:600 13px system-ui">
       Thank you for registering to <b>${escapeHtml(eventDoc.title || 'the event')}</b>.
-      We attached your confirmation PDF below (with your sessions and QR).
+      ${pdf ? 'We attached your confirmation PDF below (with your sessions and QR).' : 'We saved your registration.'}
     </p>
     <p style="font:600 13px system-ui;margin:12px 0">
       Please verify your email to activate your account:
@@ -678,7 +724,8 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
     <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>IPDAYS X GITS 2025</p>
   `;
 
-  const attachments = [{ filename: 'registration.pdf', content: pdf, contentType: 'application/pdf' }];
+  const attachments = [];
+  if (pdf) attachments.push({ filename: 'registration.pdf', content: pdf, contentType: 'application/pdf' });
   if (brandLogoPath) {
     attachments.push({ filename: path.basename(brandLogoPath), path: brandLogoPath, cid: 'brandlogo@cid' });
   }
@@ -691,7 +738,10 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
       'Please see the attached PDF for your registration details. Verify your email using the link inside.',
       attachments
     );
-  } catch (_) {/* ignore send failure */}
+  } catch (mailErr) {
+    console.error('sendMail failed:', mailErr);
+    /* ignore send failure but don't abort creation */
+  }
 
   return res.status(201).json({
     success: true,
@@ -700,6 +750,74 @@ exports.createActorSimple = asyncHdl(async (req, res) => {
   });
 });
 
+
+// PATCH /actors/update/:id
+exports.updateActorSimple = asyncHdl(async (req, res) => {
+  const id = req.params.id;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: 'Invalid id' });
+
+  // prefer role from body if provided; otherwise we'll infer later
+  const role = req.body?.role ? String(req.body.role).toLowerCase() : null;
+
+  // Build allowed update object (whitelist fields only)
+  const updates = {};
+
+  if (req.body?.personal) {
+    updates.personal = {};
+    if (req.body.personal.fullName) updates.personal.fullName = String(req.body.personal.fullName).trim();
+    if (req.body.personal.email) updates.personal.email = String(req.body.personal.email).toLowerCase().trim();
+    if (req.body.personal.firstEmail) updates.personal.firstEmail = String(req.body.personal.firstEmail).toLowerCase().trim();
+    if (req.body.personal.country) updates.personal.country = String(req.body.personal.country).trim().toUpperCase();
+    if (req.body.personal.phone) updates.personal.phone = String(req.body.personal.phone).trim();
+    if (req.body.personal.city) updates.personal.city = String(req.body.personal.city).trim();
+  }
+
+  if (req.body?.organization) {
+    updates.organization = {};
+    if (req.body.organization.orgName !== undefined) updates.organization.orgName = String(req.body.organization.orgName || '').trim();
+    if (req.body.organization.jobTitle !== undefined) updates.organization.jobTitle = String(req.body.organization.jobTitle || '').trim();
+    if (req.body.organization.businessRole !== undefined) updates.organization.businessRole = String(req.body.organization.businessRole || '').trim();
+  }
+
+  if (req.body?.links) {
+    updates.links = {};
+    if (req.body.links.website !== undefined) updates.links.website = String(req.body.links.website || '').trim();
+    if (req.body.links.linkedin !== undefined) updates.links.linkedin = String(req.body.links.linkedin || '').trim();
+  }
+
+  if (req.body?.roleKind !== undefined) updates.roleKind = req.body.roleKind || null;
+  if (req.body?.role !== undefined) updates.role = req.body.role;
+
+  // session updates: optional, but if given, validate the session ids first
+  if (req.body.sessionIds) {
+    const rawSessionIds = [].concat(req.body['sessionIds[]'] || req.body.sessionIds || []).flat().filter(Boolean);
+    if (rawSessionIds.length) {
+      const normSessions = await loadAndValidateSessions(req.body.eventId || undefined, rawSessionIds);
+      updates.sessionIds = normSessions.map(s => s._id || s.id || s);
+    } else {
+      updates.sessionIds = [];
+    }
+  }
+
+  // Determine model to update: prefer role to pick model; otherwise try Speaker->Attendee->Exhibitor
+  let Model = null;
+  if (role === 'attendee') Model = attendee;
+  else if (role === 'exhibitor') Model = Exhibitor;
+  else if (role === 'speaker') Model = Speaker;
+  else {
+    // try to find which collection contains this id
+    const foundInSpeaker = await Speaker.exists({ _id: id });
+    if (foundInSpeaker) Model = Speaker;
+    else if (await attendee.exists({ _id: id })) Model = attendee;
+    else if (await Exhibitor.exists({ _id: id })) Model = Exhibitor;
+  }
+
+  if (!Model) return res.status(404).json({ message: 'Actor not found' });
+
+  // Run validators and return the updated doc
+  const updated = await Model.findByIdAndUpdate(id, { $set: updates }, { new: true, runValidators: true }).lean();
+  return res.json({ success: true, data: updated });
+});
 
 
 
