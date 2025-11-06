@@ -1,133 +1,186 @@
 // controllers/community.controller.js
-const asyncHandler = require('express-async-handler');
-const mongoose = require('mongoose');
+const mongoose = require("mongoose");
+const Event = require("../models/event");                // adjust path if different
+const attendee = require("../models/attendee");          // you shared attendee.js
+const speaker  = require("../models/speaker");           // you shared speaker.js
 
-const Attendee = require('../models/attendee');
-const Speaker  = require('../models/speaker');
+const isId = (v) => mongoose.isValidObjectId(v);
+const toNum = (v,d=0)=> (Number.isFinite(+v)?+v:d);
+const esc = s => String(s).replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
+const rxEq = v => new RegExp(`^${esc(String(v))}$`, "i");
+const str = v => (typeof v === "string" ? v : "");
 
-const toStr = v => (typeof v === 'string' ? v : '');
-const esc   = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const rxEq  = v => new RegExp(`^${esc(String(v))}$`, 'i');
-const toNum = (v,d=0) => (Number.isFinite(+v) ? +v : d);
+const normAvatar = (a)=>!a?null:(typeof a==="string"?a:(a.url||a.path||a.secure_url||a.src||null));
+const upper = (s)=>String(s||"").toUpperCase();
 
-/* ────────────────────────────────────────────────────────────────────
- * FACETS: actorType list + countries list (by event, optional)
- * GET /community/facets?eventId=<id>
- * ──────────────────────────────────────────────────────────────────── */
-exports.getCommunityFacets = asyncHandler(async (req, res) => {
-  const eventId = toStr(req.query.eventId);
-  const matchEv = (id) => (mongoose.isValidObjectId(id) ? { id_event: new mongoose.Types.ObjectId(id) } : {});
-
-  // Build small aggregations on both collections
-  const [attTypes, spkTypes, attCountries, spkCountries] = await Promise.all([
-    Attendee.aggregate([
-      { $match: matchEv(eventId) },
-      { $match: { actorType: { $ne: "" } } },
-      { $group: { _id: "$actorType", c: { $sum: 1 } } },
-      { $sort: { c: -1, _id: 1 } }
-    ]),
-    Speaker.aggregate([
-      { $match: matchEv(eventId) },
-      { $match: { actorType: { $ne: "" } } },
-      { $group: { _id: "$actorType", c: { $sum: 1 } } },
-      { $sort: { c: -1, _id: 1 } }
-    ]),
-    Attendee.aggregate([
-      { $match: matchEv(eventId) },
-      { $group: { _id: "$personal.country", c: { $sum: 1 } } },
-      { $sort: { c: -1, _id: 1 } }
-    ]),
-    Speaker.aggregate([
-      { $match: matchEv(eventId) },
-      { $group: { _id: "$personal.country", c: { $sum: 1 } } },
-      { $sort: { c: -1, _id: 1 } }
-    ]),
-  ]);
-
-  // merge counts from both models
-  const mergeCounts = (a, b) => {
-    const map = new Map();
-    for (const r of a) { map.set(r._id, (map.get(r._id)||0) + r.c); }
-    for (const r of b) { map.set(r._id, (map.get(r._id)||0) + r.c); }
-    return [...map.entries()].map(([k,v]) => ({ name: k || '', count: v })).sort((x,y)=>y.count-x.count);
+function mapAtt(d){
+  return {
+    id: String(d._id),
+    kind: "attendee",
+    subRoles: Array.isArray(d.subRole) ? d.subRole : [],
+    fullName: d?.personal?.fullName || "",
+    country: upper(d?.personal?.country || ""),
+    orgName: d?.organization?.orgName || "",
+    avatar: normAvatar(d?.personal?.profilePic),
   };
+}
+function mapSpk(d){
+  const full = d?.personal?.fullName || d?.identity?.fullName || "";
+  const email= d?.personal?.email || d?.identity?.email || "";
+  const org  = d?.organization?.orgName || "";
+  const avatar = normAvatar(d?.personal?.profilePic || d?.identity?.avatar);
+  return {
+    id: String(d._id),
+    kind: "speaker",
+    subRoles: Array.isArray(d.subRole) ? d.subRole : [],
+    fullName: full || email,
+    country: upper(d?.personal?.country || d?.identity?.country || ""),
+    orgName: org,
+    avatar,
+  };
+}
 
-  res.json({
-    success: true,
-    types: mergeCounts(attTypes, spkTypes),
-    countries: mergeCounts(attCountries, spkCountries).map(x => ({ code: (x.name||'').toUpperCase(), count: x.count }))
-  });
-});
+/* ---------- FACETS: events + subRole counts + countries ---------- */
+exports.getCommunityFacets = async (req, res, next) => {
+  try{
+    // events (pick first as default)
+    const events = await Event.find({})
+      .select("_id title startDate")
+      .sort({ startDate: -1 })
+      .lean();
 
-/* ────────────────────────────────────────────────────────────────────
- * LIST: members with filters and pagination
- * GET /community/list?eventId=&actorType=&country=&q=&page=1&limit=24
- * ──────────────────────────────────────────────────────────────────── */
-exports.getCommunityList = asyncHandler(async (req, res) => {
-  const eventId   = toStr(req.query.eventId);
-  const actorType = toStr(req.query.actorType);         // optional
-  const country   = toStr(req.query.country);           // ISO2
-  const q         = toStr(req.query.q);
-  const page      = Math.max(1, toNum(req.query.page, 1));
-  const limit     = Math.max(1, Math.min(100, toNum(req.query.limit, 24)));
-  const skip      = Math.max(0, (page-1)*limit);
+    const eventId = str(req.query.eventId) || (events[0]? String(events[0]._id) : "");
 
-  const baseAtt = mongoose.isValidObjectId(eventId) ? { id_event: new mongoose.Types.ObjectId(eventId) } : {};
-  const baseSpk = mongoose.isValidObjectId(eventId) ? { id_event: new mongoose.Types.ObjectId(eventId) } : {};
+    // subRole counts for this event
+    const subRoleAgg = async (Model, idField="id_event") => {
+      if (!Model) return [];
+      const rows = await Model.aggregate([
+        { $match: { [idField]: isId(eventId) ? new mongoose.Types.ObjectId(eventId) : null } },
+        { $unwind: { path:"$subRole", preserveNullAndEmptyArrays:true } },
+        { $group: { _id: "$subRole", c: { $sum: 1 } } },
+      ]);
+      return rows;
+    };
+    const countryAgg = async (Model, idField="id_event", path="personal.country") => {
+      if (!Model) return [];
+      const rows = await Model.aggregate([
+        { $match: { [idField]: isId(eventId) ? new mongoose.Types.ObjectId(eventId) : null } },
+        { $group: { _id: `$${path}`, c: { $sum: 1 } } },
+      ]);
+      return rows;
+    };
 
-  // Build model-specific filters
-  const attQ = { ...baseAtt };
-  const spkQ = { ...baseSpk };
-  if (actorType) { attQ.actorType = rxEq(actorType); spkQ.actorType = rxEq(actorType); }
-  if (country)   { attQ['personal.country'] = rxEq(country); spkQ['personal.country'] = rxEq(country); }
-  if (q) {
-    const r = new RegExp(esc(q), 'i');
-    Object.assign(attQ, { $or: [
-      { 'personal.fullName': r }, { 'organization.orgName': r }
-    ]});
-    Object.assign(spkQ, { $or: [
-      { 'personal.fullName': r }, { 'organization.orgName': r }
-    ]});
-  }
+    const [attSR, spkSR, attC, spkC] = await Promise.all([
+      attendee ? subRoleAgg(attendee) : [],
+      speaker  ? subRoleAgg(speaker)  : [],
+      attendee ? countryAgg(attendee) : [],
+      speaker  ? countryAgg(speaker, "id_event", "identity.country") : [],
+    ]);
 
-  // Fetch both in parallel then merge + sort by name
-  const [attList, spkList, attCnt, spkCnt] = await Promise.all([
-    Attendee.find(attQ).select('actorType personal.fullName personal.profilePic personal.country organization.orgName links').skip(skip).limit(limit).lean(),
-    Speaker.find(spkQ).select('actorType personal.fullName personal.profilePic personal.country organization.orgName enrichments').skip(skip).limit(limit).lean(),
-    Attendee.countDocuments(attQ),
-    Speaker.countDocuments(spkQ),
-  ]);
+    const roleMap = new Map();
+    [...attSR, ...spkSR].forEach(r=>{
+      const key = r._id || "Unspecified";
+      roleMap.set(key, (roleMap.get(key)||0) + r.c);
+    });
+    const subRoles = [...roleMap.entries()]
+      .sort((a,b)=> b[1]-a[1] || String(a[0]).localeCompare(String(b[0])))
+      .map(([name,count])=>({ name, count }));
 
-  const mapAtt = a => ({
-    id: String(a._id),
-    kind: 'attendee',
-    actorType: a.actorType || '',
-    fullName: a?.personal?.fullName || '',
-    country: (a?.personal?.country||'').toUpperCase(),
-    avatar: a?.personal?.profilePic || null,
-    orgName: a?.organization?.orgName || '',
-    website: a?.links?.website || '',
-    linkedin: a?.links?.linkedin || ''
-  });
+    const cMap = new Map();
+    [...attC, ...spkC].forEach(r=>{
+      const key = (r._id || "").toString().toUpperCase();
+      if (!key) return;
+      cMap.set(key, (cMap.get(key)||0) + r.c);
+    });
+    const countries = [...cMap.entries()]
+      .sort((a,b)=> b[1]-a[1] || a[0].localeCompare(b[0]))
+      .map(([code,count])=>({ code, count }));
 
-  const mapSpk = s => ({
-    id: String(s._id),
-    kind: 'speaker',
-    actorType: s.actorType || '',
-    fullName: s?.personal?.fullName || '',
-    country: (s?.personal?.country||'').toUpperCase(),
-    avatar: s?.personal?.profilePic || null,
-    orgName: s?.organization?.orgName || '',
-    website: s?.organization?.orgWebsite || '',
-    linkedin: (Array.isArray(s?.enrichments?.socialLinks) ? s.enrichments.socialLinks[0] : '') || ''
-  });
+    res.json({
+      success:true,
+      events: events.map(e=>({ id:String(e._id), title:e.title||"Event", startDate:e.startDate||null })),
+      defaultEventId: eventId,
+      subRoles,
+      countries
+    });
+  }catch(e){ next(e); }
+};
 
-  const items = [...attList.map(mapAtt), ...spkList.map(mapSpk)]
-    .sort((a,b)=>a.fullName.localeCompare(b.fullName));
+/* ---------- LIST: grouped-by-subRole OR flat by ?subRole= ---------- */
+exports.getCommunityList = async (req, res, next) => {
+  try{
+    const eventId = str(req.query.eventId);
+    const subRole = str(req.query.subRole);        // when present => flat mode
+    const country = str(req.query.country);
+    const q       = str(req.query.q);
+    const page    = Math.max(1, toNum(req.query.page, 1));
+    const limit   = Math.max(1, Math.min(100, toNum(req.query.limit, 24)));
+    const skip    = Math.max(0, (page - 1) * limit);
 
-  res.json({
-    success: true,
-    total: attCnt + spkCnt,
-    items
-  });
-});
+    // Build common filters
+    const like = q ? new RegExp(esc(q), "i") : null;
+    const baseMatch = (idField, countryPath) => {
+      const m = {};
+      if (isId(eventId)) m[idField] = new mongoose.Types.ObjectId(eventId);
+      if (country) m[countryPath] = rxEq(country);
+      if (q) {
+        m.$or = [
+          { "personal.fullName": like }, { "identity.fullName": like },
+          { "personal.email": like }, { "identity.email": like },
+          { "organization.orgName": like }
+        ];
+      }
+      return m;
+    };
+
+    // FLAT mode (when subRole provided)
+    if (subRole) {
+      const matchAtt = baseMatch("id_event","personal.country");   matchAtt.subRole = subRole;
+      const matchSpk = baseMatch("id_event","identity.country");   matchSpk.subRole = subRole;
+
+      const [attRows, spkRows, attCnt, spkCnt] = await Promise.all([
+        attendee ? attendee.find(matchAtt).skip(skip).limit(limit).lean() : [],
+        speaker  ? speaker.find(matchSpk).skip(skip).limit(limit).lean() : [],
+        attendee ? attendee.countDocuments(matchAtt) : 0,
+        speaker  ? speaker.countDocuments(matchSpk)  : 0,
+      ]);
+      const items = [
+        ...(attRows||[]).map(mapAtt),
+        ...(spkRows||[]).map(mapSpk),
+      ];
+      return res.json({ success:true, items, total: attCnt + spkCnt });
+    }
+
+    // GROUPED mode (no subRole): return groups with up to N samples each
+    const matchAtt = baseMatch("id_event","personal.country");
+    const matchSpk = baseMatch("id_event","identity.country");
+    const sampleN = Math.min(8, limit);
+
+    const [attAll, spkAll] = await Promise.all([
+      attendee ? attendee.find(matchAtt).select("_id personal organization subRole").lean() : [],
+      speaker  ? speaker.find(matchSpk).select("_id personal identity organization subRole").lean() : [],
+    ]);
+
+    const bucket = new Map(); // subRole => array of members
+    const push = (r)=>{
+      const roles = Array.isArray(r.subRole) && r.subRole.length ? r.subRole : ["Unspecified"];
+      roles.forEach(sr=>{
+        const k = String(sr||"Unspecified");
+        if (!bucket.has(k)) bucket.set(k, []);
+        bucket.get(k).push(r);
+      });
+    };
+    (attAll||[]).forEach(push);
+    (spkAll||[]).forEach(push);
+
+    const groups = [...bucket.entries()]
+      .sort((a,b)=> b[1].length - a[1].length || a[0].localeCompare(b[0]))
+      .map(([name, arr])=>({
+        name,
+        count: arr.length,
+        items: arr.slice(0, sampleN).map(x => ("personal" in x ? mapAtt(x) : mapSpk(x)))
+      }));
+
+    res.json({ success:true, groups, total: (attAll?.length||0) + (spkAll?.length||0) });
+  }catch(e){ next(e); }
+};
