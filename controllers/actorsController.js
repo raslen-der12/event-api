@@ -2127,13 +2127,7 @@ exports.searchPeople = async (req, res, next) => {
     res.json({ ok: true, data: merged });
   } catch (e) { next(e); }
 };
-/* =========================================================================================
-   ───────────────────────────────  NEW ACTOR SOCKET ONLY  ────────────────────────────────
-   This replaces the old initActorChatSockets. Do NOT keep the old one.
-   server.js must have socket auth middleware that sets socket.user.ActorId (already done).
-========================================================================================= */
 
-// ───────────────────────── helpers kept as-is ─────────────────────────
 async function isMember(roomId, actorId) {
   if (!isId(roomId) || !isId(actorId)) return false;
   const r = await ChatRoom.findById(roomId).select('members').lean();

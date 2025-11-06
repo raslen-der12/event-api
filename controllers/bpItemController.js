@@ -129,6 +129,261 @@ function coerceUploadsFromBody(body = {}) {
   return unique;
 }
 
+const esc = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const rxEq = v => new RegExp(`^${esc(String(v))}$`, "i");
+exports.getMarketFacets = async (req,res,next)=>{
+  try{
+    const tax = await BPTaxonomy.find({}).select("sector subsectors").lean();
+    const industriesAgg = await BusinessProfile.aggregate([
+      { $match:{ published:true } },
+      { $unwind:"$industries" },
+      { $group:{ _id:"$industries", c:{ $sum:1 } } },
+      { $sort:{ c:-1, _id:1 } }, { $limit:200 }
+    ]);
+    const countriesAgg = await BusinessProfile.aggregate([
+      { $match:{ published:true } },
+      { $unwind:"$countries" },
+      { $group:{ _id:"$countries", c:{ $sum:1 } } },
+      { $sort:{ c:-1, _id:1 } }, { $limit:200 }
+    ]);
+    const sizesAgg = await BusinessProfile.aggregate([
+      { $match:{ published:true } },
+      { $group:{ _id:"$size", c:{ $sum:1 } } },
+      { $sort:{ c:-1, _id:1 } }
+    ]);
+    const badgesAgg = await BusinessProfile.aggregate([
+      { $match:{ published:true } },
+      { $unwind:"$badges" },
+      { $group:{ _id:"$badges", c:{ $sum:1 } } },
+      { $sort:{ c:-1, _id:1 } }
+    ]);
+
+    res.json({
+      success:true,
+      sectors:(tax||[]).map(t=>({
+        sector:t.sector,
+        subsectors:(t.subsectors||[]).map(ss=>({ id:String(ss._id), name:ss.name }))
+      })),
+      industries:industriesAgg.map(x=>({ name:x._id, count:x.c })),
+      countries:countriesAgg.map(x=>({ code:x._id, count:x.c })),
+      sizes:sizesAgg.filter(x=>x._id).map(x=>({ size:x._id, count:x.c })),
+      badges:badgesAgg.map(x=>({ badge:x._id, count:x.c })),
+    });
+  }catch(e){ next(e); }
+};
+
+const str   = (v) => (typeof v === "string" ? v : "");
+function normalizeKind(k) {
+  const s = String(k || "").trim().toLowerCase();
+  if (!s) return "business";
+  if (s === "businesses") return "business";
+  if (s === "products")   return "product";
+  if (s === "services")   return "service";
+  if (["all","business","product","service"].includes(s)) return s;
+  return "business";
+}
+
+// map item (embed business profile)
+const mapItem = (d, pmap) => {
+  const pid = String(d.profile || "");
+  const bp  = pmap.get(pid);
+  return {
+    type: "item",
+    id: String(d._id),
+    kind: d.kind,                           // "product" | "service"
+    title: d.title,
+    summary: d.summary || "",
+    priceValue: d.priceValue ?? null,
+    priceCurrency: d.priceCurrency || null,
+    sector: d.sector || "",
+    subsectorId: d.subsectorId || null,
+    thumb: (d.images && d.images[0]) || null,
+    tags: Array.isArray(d.tags) ? d.tags : [],
+
+    profile: bp ? {
+      id: String(bp._id),
+      name: bp.name || "",
+      logo: bp.logoUpload || null,
+      countries: Array.isArray(bp.countries) ? bp.countries : []
+    } : null
+  };
+};
+
+// map business (now with top 3 tags)
+const mapBusiness = (bp, featured = [], topTags = []) => ({
+  type: "business",
+  id: String(bp._id),
+  name: bp.name,
+  tags: topTags.slice(0, 3),               // <= replaces tagline (max 3)
+  industries: bp.industries || [],
+  countries: bp.countries || [],
+  size: bp.size || "",
+  badges: bp.badges || [],
+  logo: bp.logoUpload || null,
+  featuredItems: featured.slice(0, 3).map(it => ({
+    id: String(it._id),
+    kind: it.kind,
+    thumb: (it.images && it.images[0]) || null,
+    title: it.title
+  }))
+});
+
+// aggregate top tags for a set of profiles (per business)
+async function aggregateTopTagsPerBusiness(profileIds = []) {
+  if (!profileIds.length) return new Map();
+  const rows = await BPItem.aggregate([
+    { $match: { profile: { $in: profileIds }, published: true, tags: { $exists: true, $ne: [] } } },
+    { $unwind: "$tags" },
+    { $group: { _id: { profile: "$profile", tag: "$tags" }, c: { $sum: 1 } } },
+    { $sort: { c: -1, "_id.tag": 1 } },
+    { $group: { _id: "$_id.profile", tags: { $push: { tag: "$_id.tag", c: "$c" } } } }
+  ]);
+  // Map<profileId, [tag,...]>
+  return new Map(rows.map(r => [String(r._id), r.tags.map(t => t.tag)]));
+}
+
+// aggregate global tags for current items query (not paginated, with counts)
+async function aggregateGlobalTags(itemsQ) {
+  const rows = await BPItem.aggregate([
+    { $match: Object.assign({}, itemsQ, { tags: { $exists: true, $ne: [] } }) },
+    { $unwind: "$tags" },
+    { $group: { _id: "$tags", c: { $sum: 1 } } },
+    { $sort: { c: -1, _id: 1 } },
+    { $limit: 200 }
+  ]);
+  return rows.map(r => ({ name: r._id, count: r.c }));
+}
+
+// ===== controller (full replacement) =====
+exports.getMarketItems = async (req, res, next) => {
+  try {
+    // normalize + defaults
+    const q            = str(req.query.q);
+    const K            = normalizeKind(req.query.kind);
+    const sector       = str(req.query.sector);
+    const subsectorId  = str(req.query.subsectorId);
+    const industry     = str(req.query.industry);
+    const country      = str(req.query.country);
+    const size         = str(req.query.size);
+    const badges       = str(req.query.badges);
+    const hasImages    = str(req.query.hasImages);
+    const sort         = str(req.query.sort) || "new";
+    const page         = Math.max(1, toNum(req.query.page, 1));
+    const limit        = Math.max(1, Math.min(100, toNum(req.query.limit, 24)));
+    const skip         = Math.max(0, (page - 1) * limit);
+    const badgeList    = badges.split(",").map(s => s.trim()).filter(Boolean);
+
+    // profile filters (STRICT published:true)
+    const profileQ = { published: true };
+    if (industry) profileQ.industries = rxEq(industry);
+    if (country)  profileQ.countries  = rxEq(country);
+    if (size)     profileQ.size       = rxEq(size);
+    if (badgeList.length) profileQ.badges = { $all: badgeList };
+    if (q) {
+      const r = new RegExp(esc(q), "i");
+      Object.assign(profileQ, {
+        $or: [{ name: r }, { tagline: r }, { about: r }, { industries: r }, { offering: r }, { seeking: r }]
+      });
+    }
+
+    // item filters (STRICT published:true)
+    const itemsQ = { published: true };
+    if (K === "product" || K === "service") itemsQ.kind = K;
+    if (sector) itemsQ.sector = rxEq(sector);
+    if (subsectorId && mongoose.isValidObjectId(subsectorId)) {
+      itemsQ.subsectorId = new mongoose.Types.ObjectId(subsectorId);
+    }
+    if (hasImages === "1") itemsQ.images = { $exists: true, $ne: [] };
+    if (q) {
+      const r = new RegExp(esc(q), "i");
+      Object.assign(itemsQ, { $or: [{ title: r }, { summary: r }, { details: r }, { tags: r }] });
+    }
+
+    // If any profile-only filter is active, restrict items to those profiles
+    const profileFiltersOn = Boolean(industry || country || size || badgeList.length);
+    if (profileFiltersOn) {
+      const allowedProfiles = await BusinessProfile.find(profileQ).select("_id").lean();
+      itemsQ.profile = { $in: allowedProfiles.map(x => x._id) };
+    }
+
+    // sorting
+    const sortItems =
+      sort === "priceAsc"  ? { priceValue: 1, createdAt: -1 } :
+      sort === "priceDesc" ? { priceValue: -1, createdAt: -1 } :
+      sort === "az"        ? { title: 1 } :
+                             { createdAt: -1 };
+    const sortProfiles = (sort === "az") ? { name: 1 } : { createdAt: -1 };
+
+    // what to fetch
+    const wantItems      = (K === "product" || K === "service" || K === "all");
+    const wantBusinesses = (K === "business" || K === "all");
+
+    // --- ITEMS: embed profile in the SAME object ---
+    let items = [], countItems = 0;
+    if (wantItems) {
+      const [docs, cnt] = await Promise.all([
+        BPItem.find(itemsQ).sort(sortItems).skip(skip).limit(limit).lean(),
+        BPItem.countDocuments(itemsQ)
+      ]);
+      const pids = [...new Set(docs.map(d => String(d.profile)))];
+      const pmap = pids.length
+        ? new Map(
+            (await BusinessProfile.find({ _id: { $in: pids } })
+              .select("name logoUpload countries").lean())
+            .map(p => [String(p._id), p])
+          )
+        : new Map();
+      items = docs.map(d => mapItem(d, pmap));
+      countItems = cnt;
+    }
+
+    // --- BUSINESSES: separate business cards only when requested (with top tags) ---
+    let businesses = [], countBusinesses = 0;
+    if (wantBusinesses) {
+      const [bps, cnt] = await Promise.all([
+        BusinessProfile.find(profileQ).sort(sortProfiles).skip(skip).limit(limit).lean(),
+        BusinessProfile.countDocuments(profileQ)
+      ]);
+      const bIds = bps.map(b => b._id);
+
+      // featured items (for thumbnails)
+      const featured = bIds.length
+        ? await BPItem.aggregate([
+            { $match: { profile: { $in: bIds }, published: true, images: { $ne: [] } } },
+            { $sort: { createdAt: -1 } },
+            { $group: { _id: "$profile", items: { $push: "$$ROOT" } } }
+          ])
+        : [];
+
+      // top tags per business (from items)
+      const tagsMap = await aggregateTopTagsPerBusiness(bIds);
+
+      const fmap = new Map(featured.map(g => [String(g._id), g.items]));
+      businesses = bps.map(bp => {
+        const pid = String(bp._id);
+        const topTags = tagsMap.get(pid) || [];
+        return mapBusiness(bp, fmap.get(pid) || [], topTags);
+      });
+      countBusinesses = cnt;
+    }
+
+    // merge (ALL = businesses + items)
+    const merged = wantBusinesses && wantItems ? [...businesses, ...items]
+                  : wantBusinesses ? businesses
+                  : items;
+
+    // global tags from matching items (not limited)
+    const globalTags = await aggregateGlobalTags(itemsQ);
+
+    res.json({
+      success: true,
+      items: merged,
+      total: (wantBusinesses ? countBusinesses : 0) + (wantItems ? countItems : 0),
+      counts: { businesses: countBusinesses, productsServices: countItems },
+      tags: globalTags                       // <= NEW: list of tags from items [{name,count}]
+    });
+  } catch (e) { next(e); }
+};
 /* ----------------------- create ----------------------- */
 // POST /bp/me/items
 exports.createItem = asyncHdl(async (req, res) => {
