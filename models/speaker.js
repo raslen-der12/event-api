@@ -16,6 +16,7 @@ const PersonalSchema = new mongoose.Schema({
   linkedIn   : { type:String, match:URL_RX, default: "" },
   country    : { type:String, required:true },
   desc       : { type:String, maxlength:500, default: "" },
+  bio       : { type:String, maxlength:300, default: "" },
   city       : { type:String, default: "" },
   profilePic : { type:String, default: "" },
   firstEmail : { type:String, lowercase:true, match:EMAIL_RX } // not required; will default to email in controller if absent
