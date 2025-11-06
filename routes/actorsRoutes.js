@@ -120,7 +120,6 @@ router.get('/event/:eventId/exhibitors', actor.listExhibitorsForEvent);
 router.get('/event/:eventId/speakers',   actor.listSpeakersForEvent);
 // Update Actor Route
 router.patch('/update/:id', protect, actor.updateActorSimple);
-router.get('/:id', protect, actor.getActorById); // optional but handy for prefill
 
 
 
