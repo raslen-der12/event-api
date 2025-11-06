@@ -633,6 +633,39 @@ async function notifyRegistrationPending(actorId, role, eventId) {
 
 /* ─────────────────────────── 1. attendee ─────────────────────────── */
 exports.registerAttendee = asyncHandler(async (req, res) => {
+  // -------- logging helpers --------
+  const rid = String(req.headers["x-request-id"] || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`);
+  const tag = (p) => `[registerAttendee#${rid}] ${p}`;
+  const log = (...a) => console.log(tag("LOG"), ...a);
+  const warn = (...a) => console.warn(tag("WARN"), ...a);
+  const error = (...a) => console.error(tag("ERROR"), ...a);
+  const timeStart = (label) => console.time(tag(label));
+  const timeEnd = (label) => console.timeEnd(tag(label));
+
+  // -------- request envelope --------
+  try {
+    log("BEGIN", {
+      method: req.method,
+      url: req.originalUrl || req.url,
+      ip: req.ip,
+      ips: req.ips,
+      xfwd: req.headers["x-forwarded-for"] || null,
+    });
+    log("HEADERS", {
+      origin: req.headers.origin || null,
+      referer: req.headers.referer || null,
+      "content-type": req.headers["content-type"] || null,
+      "content-length": req.headers["content-length"] || null,
+      "user-agent": req.headers["user-agent"] || null,
+    });
+    const bodyKeys = Object.keys(req.body || {});
+    log("BODY_KEYS", bodyKeys);
+  } catch (e) {
+    // never block request because of logging
+    warn("Envelope logging failed:", e?.message);
+  }
+
+  // -------- destructure inputs (unchanged) --------
   const {
     eventId,
     pwd,
@@ -658,34 +691,101 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     'links.website': website,
     'links.linkedin': linkedin,
   } = req.body || {};
-  const virtualMeetRaw = req.body.virtualMeet;
-  // Sessions
+  const virtualMeetRaw = req.body?.virtualMeet;
+
+  // Sessions (raw)
   const sessionIds = []
-    .concat(req.body['sessionIds[]'] || req.body.sessionIds || [])
+    .concat(req.body?.['sessionIds[]'] || req.body?.sessionIds || [])
     .flat()
     .filter(Boolean);
 
-  await assertEmailAvailableEverywhere(req.body.email);
+  // -------- input snapshot (sanitized) --------
+  log("INPUT_SNAPSHOT", {
+    eventId,
+    fullName,
+    email,
+    phone,
+    country,
+    city,
+    gender,
+    orgName,
+    jobTitle,
+    businessRole,
+    prefLangCsv,
+    objective,
+    openToMeetings,
+    website,
+    linkedin,
+    actorType,
+    actorHeadline,
+    inviteCode,
+    sessionIdsCount: sessionIds.length,
+    virtualMeetRawType: typeof virtualMeetRaw,
+    pwdLength: (typeof pwd === "string" ? pwd.length : 0),
+    fileUploaded: !!req.file,
+    filePath: req.file?.path || null,
+  });
 
-  // Basic validation
-  if (!isId(eventId)) return res.status(400).json({ message: 'Valid eventId is required' });
-  if (!toStr(fullName).trim()) return res.status(400).json({ message: 'Full name is required' });
-  if (!EMAIL_RX.test(toStr(email))) return res.status(400).json({ message: 'Valid email is required' });
-  if (!toStr(country).trim()) return res.status(400).json({ message: 'Country is required' });
-  if (!sessionIds.length) return res.status(400).json({ message: 'Please select at least one session' });
+  // -------- cross-email assertions --------
+  timeStart("assertEmailAvailableEverywhere");
+  try {
+    await assertEmailAvailableEverywhere(req.body?.email);
+    log("assertEmailAvailableEverywhere: OK");
+  } catch (e) {
+    timeEnd("assertEmailAvailableEverywhere");
+    error("assertEmailAvailableEverywhere: FAIL", e?.message);
+    return res.status(400).json({ message: e?.message || "Email check failed" });
+  }
+  timeEnd("assertEmailAvailableEverywhere");
+
+  // -------- basic validation (unchanged responses; just log) --------
+  if (!isId(eventId)) {
+    warn("VALIDATION_FAIL: eventId invalid", { eventId });
+    return res.status(400).json({ message: 'Valid eventId is required' });
+  }
+  if (!toStr(fullName).trim()) {
+    warn("VALIDATION_FAIL: fullName missing");
+    return res.status(400).json({ message: 'Full name is required' });
+  }
+  if (!EMAIL_RX.test(toStr(email))) {
+    warn("VALIDATION_FAIL: email invalid", { email });
+    return res.status(400).json({ message: 'Valid email is required' });
+  }
+  if (!toStr(country).trim()) {
+    warn("VALIDATION_FAIL: country missing");
+    return res.status(400).json({ message: 'Country is required' });
+  }
+  if (!sessionIds.length) {
+    warn("VALIDATION_FAIL: sessionIds empty");
+    return res.status(400).json({ message: 'Please select at least one session' });
+  }
   if (typeof virtualMeetRaw === 'undefined') {
+    warn("VALIDATION_FAIL: virtualMeet missing");
     return res.status(400).json({ message: 'Meeting mode (virtual/physical) is required' });
   }
   const PASSWORD_MIN = 8;
-  if (!toStr(pwd)) return res.status(400).json({ message: 'Password is required' });
-  if (toStr(pwd).length < PASSWORD_MIN)
+  if (!toStr(pwd)) {
+    warn("VALIDATION_FAIL: password missing");
+    return res.status(400).json({ message: 'Password is required' });
+  }
+  if (toStr(pwd).length < PASSWORD_MIN) {
+    warn("VALIDATION_FAIL: password too short", { length: toStr(pwd).length });
     return res.status(400).json({ message: `Password must be at least ${PASSWORD_MIN} characters` });
+  }
 
-  // Uniqueness
-  if (await attendee.exists({ 'personal.email': toStr(email).toLowerCase() })) {
+  // -------- uniqueness in Attendees --------
+  timeStart("attendee.exists");
+  const existsEmail = await attendee.exists({ 'personal.email': toStr(email).toLowerCase() }).catch((e) => {
+    error("attendee.exists error:", e?.message);
+    throw e;
+  });
+  timeEnd("attendee.exists");
+  if (existsEmail) {
+    warn("UNIQUENESS_FAIL: email already registered");
     return res.status(409).json({ message: 'Email already registered' });
   }
 
+  // -------- normalize flags & pwd hash --------
   const subRole = parseSubRoles(req.body);
   const actorTypeNorm = toStr(actorType).trim();
   const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
@@ -693,17 +793,28 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
   const preferredLanguages = csvToArr(prefLangCsv).slice(0, 3);
   const openFlag = normBool(openToMeetings);
   const virtualFlag = normBool(virtualMeetRaw);
+
+  log("NORMALIZED", {
+    actorTypeNorm,
+    finalSubRole,
+    preferredLanguages,
+    openFlag,
+    virtualFlag,
+  });
+
+  timeStart("bcrypt.hash");
   const salt    = await bcrypt.genSalt(12);
   const pwdHash = await bcrypt.hash(toStr(pwd), salt);
-  const inviteCodeStr = toStr(inviteCode).trim();
-  // Photo: uploaded or default
-  const DEF_PHOTO =
-    `${(process.env.DEF_ROOT || '').replace(/\/+$/,'')}/uploads/default/photodef.png`;
-  const profilePicUrl = req.file?.path
-    ? localPathToWebUrl(req.file.path)
-    : DEF_PHOTO;
+  timeEnd("bcrypt.hash");
 
-  // Persist
+  const inviteCodeStr = toStr(inviteCode).trim();
+
+  const DEF_PHOTO = `${(process.env.DEF_ROOT || '').replace(/\/+$/,'')}/uploads/default/photodef.png`;
+  const profilePicUrl = req.file?.path ? localPathToWebUrl(req.file.path) : DEF_PHOTO;
+  log("PHOTO_SELECT", { profilePicUrl, hadUpload: !!req.file });
+
+  // -------- persist attendee --------
+  timeStart("attendee.create");
   const created = await attendee.create({
     personal: {
       fullName: toStr(fullName).trim(),
@@ -712,7 +823,7 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
       phone: toStr(phone).trim(),
       country: toStr(country).toUpperCase(),
       city: toStr(city).trim(),
-      gender: toStr(gender).trim(), // <-- NEW
+      gender: toStr(gender).trim(),
       profilePic: profilePicUrl,
       preferredLanguages
     },
@@ -736,19 +847,34 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     subRole: finalSubRole,
     verified: false,
     adminVerified: 'pending'
+  }).catch((e) => {
+    error("attendee.create failed:", e?.message);
+    throw e;
   });
+  timeEnd("attendee.create");
+  log("CREATED_ATTENDEE", { id: created?._id?.toString() });
 
-  // Verify link
+  // -------- verify token + link --------
   const raw = randomBytes(32).toString('hex');
   created.verifyToken   = await bcrypt.hash(raw, 12);
   created.verifyExpires = Date.now() + 24 * 60 * 60 * 1000;
   await created.save();
   const verifyLink = `${process.env.FRONTEND_URL}/verify-email?token=${raw}&role=attendee&id=${created._id}`;
+  log("VERIFY_LINK_READY", { verifyLink });
 
-  // Sessions (normalized)
-  const normSessions = await loadAndValidateSessions(eventId, sessionIds);
+  // -------- sessions normalize & validate --------
+  timeStart("loadAndValidateSessions");
+  const normSessions = await loadAndValidateSessions(eventId, sessionIds).catch((e) => {
+    error("loadAndValidateSessions failed:", e?.message);
+    throw e;
+  });
+  timeEnd("loadAndValidateSessions");
+  log("SESSIONS_LOADED", {
+    count: normSessions.length,
+    ids: normSessions.map((s) => String(s._id)),
+  });
 
-  // ==== Conflict system (per time slot + track family) ====
+  // -------- conflict system --------
   const conflictBucket = (track) => {
     const t = String(track || '').toLowerCase();
     if (t.includes('atelier')) return 'atelier';
@@ -756,12 +882,17 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     return 'other';
   };
 
-  // Allow one selection per (startAt|bucket)
   const seen = new Map();
   for (const s of normSessions) {
     const start = s.startAt instanceof Date ? s.startAt : new Date(s.startAt);
     const key = `${start.getTime()}|${conflictBucket(s.track)}`;
     if (seen.has(key)) {
+      warn("SESSION_CONFLICT", {
+        at: String(s._id),
+        with: String(seen.get(key)?._id),
+        startAt: start,
+        bucket: conflictBucket(s.track),
+      });
       return res.status(409).json({
         message: 'Conflicting sessions selected for the same time/track family',
         conflictAt: s._id,
@@ -770,41 +901,70 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     }
     seen.set(key, s);
   }
+  log("SESSION_CONFLICT_CHECK: OK");
 
+  // -------- seat enforcement --------
+  timeStart("attachSeatsAndEnforce");
   try {
     await attachSeatsAndEnforce({ normSessions, enforce: true }); // throws if any session is full
+    log("attachSeatsAndEnforce: OK");
   } catch (e) {
+    timeEnd("attachSeatsAndEnforce");
     if (e && e.message === 'SESSION_FULL') {
+      warn("SESSION_FULL", { sessionId: e.sessionId });
       return res.status(409).json({
         message: 'One or more sessions are full',
         fullSessionId: e.sessionId
       });
     }
+    error("attachSeatsAndEnforce: FAIL", e?.message);
     throw e;
   }
+  timeEnd("attachSeatsAndEnforce");
 
-  // Create registrations
-  await createSessionRegs({ actorId: created._id, actorRole: 'attendee', eventId, sessions: normSessions });
-  await bumpScheduleSeatsTaken(normSessions.map(s => s._id), +1);
+  // -------- create regs + bump seats --------
+  timeStart("createSessionRegs");
+  await createSessionRegs({ actorId: created._id, actorRole: 'attendee', eventId, sessions: normSessions }).catch((e) => {
+    error("createSessionRegs failed:", e?.message);
+    throw e;
+  });
+  timeEnd("createSessionRegs");
+  timeStart("bumpScheduleSeatsTaken");
+  await bumpScheduleSeatsTaken(normSessions.map(s => s._id), +1).catch((e) => {
+    error("bumpScheduleSeatsTaken failed:", e?.message);
+    throw e;
+  });
+  timeEnd("bumpScheduleSeatsTaken");
   normSessions.forEach(s => { delete s.__raw; });
 
-  // Event doc for header/PDF
-  const eventDoc = await Event.findById(eventId).lean().catch(() => null) || {
-    _id: eventId, title: 'Event', startDate: new Date(), endDate: new Date(), city: '', country: ''
-  };
+  // -------- event doc for PDF --------
+  timeStart("loadEventDoc");
+  const eventDoc =
+    (await Event.findById(eventId).lean().catch((e) => {
+      warn("Event.findById failed, falling back skeleton:", e?.message);
+      return null;
+    })) || { _id: eventId, title: 'Event', startDate: new Date(), endDate: new Date(), city: '', country: '' };
+  timeEnd("loadEventDoc");
 
-  // PDF
-  const pdf = await buildRegistrationPdf({ event: eventDoc, actor: created, role: 'attendee', sessions: normSessions });
+  // -------- build PDF --------
+  timeStart("buildRegistrationPdf");
+  const pdf = await buildRegistrationPdf({ event: eventDoc, actor: created, role: 'attendee', sessions: normSessions }).catch((e) => {
+    error("buildRegistrationPdf failed:", e?.message);
+    throw e;
+  });
+  timeEnd("buildRegistrationPdf");
+  log("PDF_READY", { bytes: (pdf?.length ?? null) });
 
-  // Email + verify link
+  // -------- email compose --------
   const brandLogoPath = process.env.BRAND_LOGO_PATH;
   const who = created?.personal?.fullName || 'there';
 
-  // ----- EMAIL TABLE: no padding on <td>, padding inside inner block to force row expansion -----
+  // (the existing HTML/template stays the same)
+  // ... building rowsHtml, hdr, sessionsHtml, html (unchanged) ...
+
   const rowsHtml = normSessions.map(s => {
     const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
     const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
-
     const inner = 'padding:12px 10px;line-height:1.5;mso-line-height-rule:exactly;white-space:normal;word-break:break-word;overflow-wrap:anywhere;';
     return `
       <tr>
@@ -883,37 +1043,68 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     attachments.push({ filename: path.basename(brandLogoPath), path: brandLogoPath, cid: 'brandlogo@cid' });
   }
 
+  // -------- send email --------
+  timeStart("sendMail");
   await sendMail(
     created.personal.email,
     'GITS: Confirm your registration',
     html,
     'Please see the attached PDF for your registration details. Verify your email using the link inside.',
     attachments
-  );
+  ).then(() => {
+    log("EMAIL_SENT", {
+      to: created.personal.email,
+      attachments: attachments.length,
+      hasLogoCID: !!brandLogoPath
+    });
+  }).catch((e) => {
+    error("EMAIL_FAIL", e?.message);
+    throw e;
+  });
+  timeEnd("sendMail");
 
+  // -------- event seat increment --------
+  timeStart("incEventSeatsTakenOrThrow");
   try {
     await incEventSeatsTakenOrThrow(eventId);
+    log("incEventSeatsTakenOrThrow: OK");
   } catch (e) {
-    try { await attendee.findByIdAndDelete(created._id); } catch {}
+    timeEnd("incEventSeatsTakenOrThrow");
+    error("incEventSeatsTakenOrThrow: FAIL -> rollback attendee", e?.message);
+    try { await attendee.findByIdAndDelete(created._id); log("ROLLBACK_ATTENDEE_OK"); } catch (e2) { error("ROLLBACK_ATTENDEE_FAIL", e2?.message); }
     return res.status(409).json({ message: 'Event is full' });
   }
+  timeEnd("incEventSeatsTakenOrThrow");
 
-  await notifyRegistrationPending(created._id, 'attendee', eventId);
+  // -------- notifications --------
+  timeStart("notifyRegistrationPending");
+  await notifyRegistrationPending(created._id, 'attendee', eventId).then(() => {
+    log("notifyRegistrationPending: OK");
+  }).catch((e) => {
+    // Not fatal; but log
+    warn("notifyRegistrationPending: FAIL (non-blocking)", e?.message);
+  });
+  timeEnd("notifyRegistrationPending");
+
+  // -------- invite code usage (non-blocking) --------
   if (inviteCodeStr) {
+    timeStart("inviteCode.increment");
     try {
-      // increment usage only for enabled codes; ignore if not found/disabled
-      await ActorInviteCode.findOneAndUpdate(
+      const r = await ActorInviteCode.findOneAndUpdate(
         { code: inviteCodeStr, enabled: true },
         { $inc: { usageCount: 1 } },
         { new: false }
       ).lean();
-      // (Optional) If you want to keep a trace on attendee without changing schema:
-      // await attendee.updateOne({ _id: created._id }, { $set: { 'meta.inviteCodeUsed': inviteCodeStr } });
+      log("inviteCode.increment", { code: inviteCodeStr, foundEnabled: !!r });
     } catch (e) {
-      console.error('inviteCode increment failed:', e?.message || e);
-      // do not throw; registration already succeeded
+      error('inviteCode increment failed:', e?.message || e);
+    } finally {
+      timeEnd("inviteCode.increment");
     }
   }
+
+  // -------- success --------
+  log("END_SUCCESS", { id: created._id?.toString(), role: 'attendee' });
   return res.status(201).json({ success: true, data: { id: created._id, role: 'attendee' } });
 });
 
