@@ -75,6 +75,7 @@ app.use('/actors',  require('./routes/actorsRoutes'));
 app.use('/invites', require('./routes/inviteRoutes'));
 app.use('/biz', require('./routes/bp.admin.routes'));
 app.use('/admin/actors', require('./routes/adminActorsRoutes'));
+app.use('/community', require('./routes/community.routes'));
 
 app.use((_req, res) => {
   console.log('404 Not Found');

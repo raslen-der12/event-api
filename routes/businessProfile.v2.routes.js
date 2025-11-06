@@ -76,4 +76,5 @@ r.get('/market/items', Item.marketList);
 r.get('/market/items/:itemId', Item.getMarketItems);
 r.get('/market/facets', Item.getMarketFacets);
 r.get("/market/item/:productId", Item.getMarketItem);
+r.get("/market/businesses", Item.getMarketBusinesses);
 module.exports = r;

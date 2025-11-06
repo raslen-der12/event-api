@@ -173,20 +173,18 @@ exports.getMarketFacets = async (req,res,next)=>{
 };
 
 const str   = (v) => (typeof v === "string" ? v : "");
-function normalizeKind(k) {
-  const s = String(k || "").trim().toLowerCase();
-  if (!s) return "business";
-  if (s === "businesses") return "business";
-  if (s === "products")   return "product";
-  if (s === "services")   return "service";
-  if (["all","business","product","service"].includes(s)) return s;
-  return "business";
-}
+const pickUrl = (v) =>
+  !v ? null : (typeof v === "string" ? v : (v.url || v.path || v.secure_url || v.src || null));
 
-// map item (embed business profile)
+/** Map an item doc to API shape, embedding minimal business profile */
 const mapItem = (d, pmap) => {
   const pid = String(d.profile || "");
   const bp  = pmap.get(pid);
+
+  // prefer images[] first, then thumbnailUpload, then thumb
+  const firstImg = Array.isArray(d.images) ? d.images.map(pickUrl).find(Boolean) : null;
+  const thumb    = firstImg || pickUrl(d.thumbnailUpload) || pickUrl(d.thumb) || null;
+
   return {
     type: "item",
     id: String(d._id),
@@ -197,38 +195,41 @@ const mapItem = (d, pmap) => {
     priceCurrency: d.priceCurrency || null,
     sector: d.sector || "",
     subsectorId: d.subsectorId || null,
-    thumb: (d.images && d.images[0]) || null,
+    thumb,
     tags: Array.isArray(d.tags) ? d.tags : [],
-
-    profile: bp ? {
-      id: String(bp._id),
-      name: bp.name || "",
-      logo: bp.logoUpload || null,
-      countries: Array.isArray(bp.countries) ? bp.countries : []
-    } : null
+    profile: bp
+      ? {
+          id: String(bp._id),
+          name: bp.name || "",
+          logoUpload: bp.logoUpload || null, // <- explicit for frontend
+          countries: Array.isArray(bp.countries) ? bp.countries : [],
+        }
+      : null,
   };
 };
 
-// map business (now with top 3 tags)
+/** Map a business profile to API shape, include featured items (thumbs) */
 const mapBusiness = (bp, featured = [], topTags = []) => ({
   type: "business",
   id: String(bp._id),
-  name: bp.name,
-  tags: topTags.slice(0, 3),               // <= replaces tagline (max 3)
+  name: bp.name || "",
+  tags: topTags.slice(0, 3),               // replaces tagline
   industries: bp.industries || [],
   countries: bp.countries || [],
   size: bp.size || "",
   badges: bp.badges || [],
-  logo: bp.logoUpload || null,
-  featuredItems: featured.slice(0, 3).map(it => ({
+  logoUpload: bp.logoUpload || null,       // top banner on the card (frontend falls back to featured)
+  featuredItems: featured.slice(0, 4).map((it) => ({
     id: String(it._id),
     kind: it.kind,
-    thumb: (it.images && it.images[0]) || null,
-    title: it.title
-  }))
+    title: it.title,
+    images: it.images || [],               // frontend will prefer images[] first
+    thumbnailUpload: it.thumbnailUpload || null,
+    thumb: (Array.isArray(it.images) && it.images[0]) || null,
+  })),
 });
 
-// aggregate top tags for a set of profiles (per business)
+/** Top tags per business (from its items) */
 async function aggregateTopTagsPerBusiness(profileIds = []) {
   if (!profileIds.length) return new Map();
   const rows = await BPItem.aggregate([
@@ -236,60 +237,70 @@ async function aggregateTopTagsPerBusiness(profileIds = []) {
     { $unwind: "$tags" },
     { $group: { _id: { profile: "$profile", tag: "$tags" }, c: { $sum: 1 } } },
     { $sort: { c: -1, "_id.tag": 1 } },
-    { $group: { _id: "$_id.profile", tags: { $push: { tag: "$_id.tag", c: "$c" } } } }
+    { $group: { _id: "$_id.profile", tags: { $push: { tag: "$_id.tag", c: "$c" } } } },
   ]);
-  // Map<profileId, [tag,...]>
-  return new Map(rows.map(r => [String(r._id), r.tags.map(t => t.tag)]));
+  return new Map(rows.map((r) => [String(r._id), r.tags.map((t) => t.tag)]));
 }
 
-// aggregate global tags for current items query (not paginated, with counts)
+/** Global tag cloud for the current items query (not paginated) */
 async function aggregateGlobalTags(itemsQ) {
   const rows = await BPItem.aggregate([
     { $match: Object.assign({}, itemsQ, { tags: { $exists: true, $ne: [] } }) },
     { $unwind: "$tags" },
     { $group: { _id: "$tags", c: { $sum: 1 } } },
     { $sort: { c: -1, _id: 1 } },
-    { $limit: 200 }
+    { $limit: 200 },
   ]);
-  return rows.map(r => ({ name: r._id, count: r.c }));
+  return rows.map((r) => ({ name: r._id, count: r.c }));
 }
-
 // ===== controller (full replacement) =====
 exports.getMarketItems = async (req, res, next) => {
   try {
     // normalize + defaults
-    const q            = str(req.query.q);
-    const K            = normalizeKind(req.query.kind);
-    const sector       = str(req.query.sector);
-    const subsectorId  = str(req.query.subsectorId);
-    const industry     = str(req.query.industry);
-    const country      = str(req.query.country);
-    const size         = str(req.query.size);
-    const badges       = str(req.query.badges);
-    const hasImages    = str(req.query.hasImages);
-    const sort         = str(req.query.sort) || "new";
+    const q            = typeof req.query.q === "string" ? req.query.q : "";
+    const kindRaw      = String(req.query.kind || "").toLowerCase();
+    // allow business-first pages to show both by default
+    const K            = ["product", "service", "all", "business"].includes(kindRaw) ? kindRaw : "all";
+
+    // CSV multi-selects
+    const sectorList   = String(req.query.sector || "")
+                          .split(",").map((s) => s.trim()).filter(Boolean);
+    const sizeList     = String(req.query.size || "")
+                          .split(",").map((s) => s.trim()).filter(Boolean);
+
+    const subsectorId  = typeof req.query.subsectorId === "string" ? req.query.subsectorId : "";
+    const industry     = typeof req.query.industry === "string" ? req.query.industry : "";
+    const country      = typeof req.query.country  === "string" ? req.query.country  : "";
+    const badgesCsv    = typeof req.query.badges   === "string" ? req.query.badges   : "";
+    const badgeList    = badgesCsv.split(",").map((s) => s.trim()).filter(Boolean);
+
+    // UI removed price/media sorting; keep server support for stability
+    const hasImages    = String(req.query.hasImages || "");
+    const sort         = String(req.query.sort || "new");
     const page         = Math.max(1, toNum(req.query.page, 1));
     const limit        = Math.max(1, Math.min(100, toNum(req.query.limit, 24)));
     const skip         = Math.max(0, (page - 1) * limit);
-    const badgeList    = badges.split(",").map(s => s.trim()).filter(Boolean);
 
-    // profile filters (STRICT published:true)
+    // --- profile filters (STRICT published:true) ---
     const profileQ = { published: true };
     if (industry) profileQ.industries = rxEq(industry);
     if (country)  profileQ.countries  = rxEq(country);
-    if (size)     profileQ.size       = rxEq(size);
+    if (sizeList.length) profileQ.size = sizeList.length === 1 ? rxEq(sizeList[0]) : { $in: sizeList.map(rxEq) };
     if (badgeList.length) profileQ.badges = { $all: badgeList };
     if (q) {
       const r = new RegExp(esc(q), "i");
       Object.assign(profileQ, {
-        $or: [{ name: r }, { tagline: r }, { about: r }, { industries: r }, { offering: r }, { seeking: r }]
+        $or: [
+          { name: r }, { tagline: r }, { about: r },
+          { industries: r }, { offering: r }, { seeking: r },
+        ],
       });
     }
 
-    // item filters (STRICT published:true)
+    // --- item filters (STRICT published:true) ---
     const itemsQ = { published: true };
     if (K === "product" || K === "service") itemsQ.kind = K;
-    if (sector) itemsQ.sector = rxEq(sector);
+    if (sectorList.length) itemsQ.sector = sectorList.length === 1 ? rxEq(sectorList[0]) : { $in: sectorList.map(rxEq) };
     if (subsectorId && mongoose.isValidObjectId(subsectorId)) {
       itemsQ.subsectorId = new mongoose.Types.ObjectId(subsectorId);
     }
@@ -299,90 +310,92 @@ exports.getMarketItems = async (req, res, next) => {
       Object.assign(itemsQ, { $or: [{ title: r }, { summary: r }, { details: r }, { tags: r }] });
     }
 
-    // If any profile-only filter is active, restrict items to those profiles
-    const profileFiltersOn = Boolean(industry || country || size || badgeList.length);
+    // If any profile-only filter present, restrict items to those profiles
+    const profileFiltersOn = Boolean(industry || country || sizeList.length || badgeList.length);
     if (profileFiltersOn) {
       const allowedProfiles = await BusinessProfile.find(profileQ).select("_id").lean();
-      itemsQ.profile = { $in: allowedProfiles.map(x => x._id) };
+      itemsQ.profile = { $in: allowedProfiles.map((x) => x._id) };
     }
 
     // sorting
     const sortItems =
-      sort === "priceAsc"  ? { priceValue: 1, createdAt: -1 } :
+      sort === "priceAsc"  ? { priceValue: 1,  createdAt: -1 } :
       sort === "priceDesc" ? { priceValue: -1, createdAt: -1 } :
       sort === "az"        ? { title: 1 } :
                              { createdAt: -1 };
-    const sortProfiles = (sort === "az") ? { name: 1 } : { createdAt: -1 };
+    const sortProfiles = sort === "az" ? { name: 1 } : { createdAt: -1 };
 
     // what to fetch
-    const wantItems      = (K === "product" || K === "service" || K === "all");
-    const wantBusinesses = (K === "business" || K === "all");
+    const wantItems      = K === "product" || K === "service" || K === "all";
+    const wantBusinesses = K === "business" || K === "all";
 
-    // --- ITEMS: embed profile in the SAME object ---
+    // ----- ITEMS -----
     let items = [], countItems = 0;
     if (wantItems) {
       const [docs, cnt] = await Promise.all([
         BPItem.find(itemsQ).sort(sortItems).skip(skip).limit(limit).lean(),
-        BPItem.countDocuments(itemsQ)
+        BPItem.countDocuments(itemsQ),
       ]);
-      const pids = [...new Set(docs.map(d => String(d.profile)))];
+      const pids = [...new Set(docs.map((d) => String(d.profile)))];
       const pmap = pids.length
         ? new Map(
             (await BusinessProfile.find({ _id: { $in: pids } })
-              .select("name logoUpload countries").lean())
-            .map(p => [String(p._id), p])
+              .select("name logoUpload countries")
+              .lean()
+            ).map((p) => [String(p._id), p])
           )
         : new Map();
-      items = docs.map(d => mapItem(d, pmap));
+      items = docs.map((d) => mapItem(d, pmap));
       countItems = cnt;
     }
 
-    // --- BUSINESSES: separate business cards only when requested (with top tags) ---
+    // ----- BUSINESSES (with featured thumbs + top tags) -----
     let businesses = [], countBusinesses = 0;
     if (wantBusinesses) {
       const [bps, cnt] = await Promise.all([
         BusinessProfile.find(profileQ).sort(sortProfiles).skip(skip).limit(limit).lean(),
-        BusinessProfile.countDocuments(profileQ)
+        BusinessProfile.countDocuments(profileQ),
       ]);
-      const bIds = bps.map(b => b._id);
+      const bIds = bps.map((b) => b._id);
 
-      // featured items (for thumbnails)
+      // Featured items per business (for thumbnails)
       const featured = bIds.length
         ? await BPItem.aggregate([
             { $match: { profile: { $in: bIds }, published: true, images: { $ne: [] } } },
             { $sort: { createdAt: -1 } },
-            { $group: { _id: "$profile", items: { $push: "$$ROOT" } } }
+            { $group: { _id: "$profile", items: { $push: "$$ROOT" } } },
           ])
         : [];
 
-      // top tags per business (from items)
+      // Top tags per business
       const tagsMap = await aggregateTopTagsPerBusiness(bIds);
-
-      const fmap = new Map(featured.map(g => [String(g._id), g.items]));
-      businesses = bps.map(bp => {
+      const fmap    = new Map(featured.map((g) => [String(g._id), g.items]));
+      businesses    = bps.map((bp) => {
         const pid = String(bp._id);
-        const topTags = tagsMap.get(pid) || [];
-        return mapBusiness(bp, fmap.get(pid) || [], topTags);
+        return mapBusiness(bp, fmap.get(pid) || [], tagsMap.get(pid) || []);
       });
       countBusinesses = cnt;
     }
 
-    // merge (ALL = businesses + items)
-    const merged = wantBusinesses && wantItems ? [...businesses, ...items]
-                  : wantBusinesses ? businesses
-                  : items;
+    // ----- MERGE (businesses first on "all") -----
+    const merged =
+      wantBusinesses && wantItems ? [...businesses, ...items]
+      : wantBusinesses            ? businesses
+      :                              items;
 
-    // global tags from matching items (not limited)
-    const globalTags = await aggregateGlobalTags(itemsQ);
+    // Global tag cloud for current query
+    const tags = await aggregateGlobalTags(itemsQ);
 
     res.json({
       success: true,
       items: merged,
       total: (wantBusinesses ? countBusinesses : 0) + (wantItems ? countItems : 0),
       counts: { businesses: countBusinesses, productsServices: countItems },
-      tags: globalTags                       // <= NEW: list of tags from items [{name,count}]
+      tags,
     });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 };
 /* ----------------------- create ----------------------- */
 // POST /bp/me/items
@@ -936,3 +949,104 @@ exports.getMarketItem = asyncHdl(async (req, res) => {
     createdAt: doc.createdAt,
   });
 });
+
+// NEW: business-first endpoint
+exports.getMarketBusinesses = async (req, res, next) => {
+  try {
+    const esc   = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rxEq  = (v) => new RegExp(`^${esc(String(v))}$`, "i");
+    const pick  = (v) => !v ? null : (typeof v === "string" ? v : (v.url || v.path || v.secure_url || v.src || null));
+    const toNum = (v, d=0) => (Number.isFinite(+v) ? +v : d);
+
+    const str = (v) => (typeof v === "string" ? v : "");
+    const q           = str(req.query.q);
+    const industry    = str(req.query.industry);
+    const country     = str(req.query.country);
+
+    // multi-selects (CSV)
+    const sizeList    = str(req.query.size).split(",").map(s=>s.trim()).filter(Boolean);
+    const badgeList   = str(req.query.badges).split(",").map(s=>s.trim()).filter(Boolean);
+    const sectorList  = str(req.query.sector).split(",").map(s=>s.trim()).filter(Boolean);
+
+    const page        = Math.max(1, toNum(req.query.page, 1));
+    const limit       = Math.max(1, Math.min(100, toNum(req.query.limit, 24)));
+    const skip        = Math.max(0, (page - 1) * limit);
+    const sort        = str(req.query.sort) || "new";
+    const sortProfiles= sort === "az" ? { name: 1 } : { createdAt: -1 };
+
+    // ---- Build BusinessProfile filter (STRICT published:true)
+    const profileQ = { published: true };
+    if (industry) profileQ.industries = rxEq(industry);
+    if (country)  profileQ.countries  = rxEq(country);
+    if (sizeList.length) profileQ.size = sizeList.length === 1 ? rxEq(sizeList[0]) : { $in: sizeList.map(rxEq) };
+    if (badgeList.length) profileQ.badges = { $all: badgeList };
+    if (q) {
+      const r = new RegExp(esc(q), "i");
+      Object.assign(profileQ, { $or:[
+        { name:r }, { tagline:r }, { about:r }, { industries:r }, { offering:r }, { seeking:r }
+      ]});
+    }
+
+    // sector constraint: only businesses that have at least one published item in those sectors
+    if (sectorList.length) {
+      const profIds = await BPItem.distinct("profile", {
+        published: true,
+        sector: sectorList.length === 1 ? rxEq(sectorList[0]) : { $in: sectorList.map(rxEq) }
+      });
+      profileQ._id = { $in: profIds };
+    }
+
+    const [bps, total] = await Promise.all([
+      BusinessProfile.find(profileQ).sort(sortProfiles).skip(skip).limit(limit).lean(),
+      BusinessProfile.countDocuments(profileQ),
+    ]);
+    const bIds = bps.map(b => b._id);
+
+    // fetch recent items per business for thumbnails
+    const featured = bIds.length
+      ? await BPItem.aggregate([
+          { $match: { profile: { $in: bIds }, published: true } },
+          { $sort: { createdAt: -1 } },
+          { $group: { _id: "$profile", items: { $push: "$$ROOT" } } }
+        ])
+      : [];
+    const fmap    = new Map(featured.map(g => [String(g._id), g.items]));
+
+    // top tags per business (from its items)
+    const tagRows = await BPItem.aggregate([
+      { $match: { profile: { $in: bIds }, published: true, tags: { $exists: true, $ne: [] } } },
+      { $unwind: "$tags" },
+      { $group: { _id: { profile: "$profile", tag: "$tags" }, c: { $sum: 1 } } },
+      { $sort: { c: -1, "_id.tag": 1 } },
+      { $group: { _id: "$_id.profile", tags: { $push: { tag: "$_id.tag", c: "$c" } } } }
+    ]);
+    const tagsMap = new Map(tagRows.map(r => [String(r._id), r.tags.map(t => t.tag)]));
+
+    // map businesses
+    const items = bps.map(bp => {
+      const pid   = String(bp._id);
+      const feats = (fmap.get(pid) || []).slice(0, 4).map(it => ({
+        id: String(it._id),
+        kind: it.kind,
+        title: it.title,
+        // prefer images[] first, then thumbnailUpload, then thumb
+        thumb: (Array.isArray(it.images) && it.images.map(pick).find(Boolean)) ||
+               pick(it.thumbnailUpload) || pick(it.thumb) || null,
+      }));
+      return {
+        type: "business",
+        id: pid,
+        name: bp.name || "",
+        logoUpload: bp.logoUpload || null,   // used by UI as top hero
+        industries: bp.industries || [],
+        countries: bp.countries  || [],
+        size: bp.size || "",
+        badges: bp.badges || [],
+        tags: (tagsMap.get(pid) || []).slice(0,3),
+        featuredItems: feats,
+      };
+    });
+
+    res.json({ success:true, items, total, counts:{ businesses: total, productsServices: 0 } });
+  } catch (e) { next(e); }
+};
