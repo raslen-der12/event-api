@@ -8,6 +8,7 @@ const isId = (v) => mongoose.isValidObjectId(v);
 const toNum = (v,d=0)=> (Number.isFinite(+v)?+v:d);
 const esc = s => String(s).replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
 const rxEq = v => new RegExp(`^${esc(String(v))}$`, "i");
+const rxEqTrim = v => new RegExp(`^\\s*${esc(String(v))}\\s*$`, "i");
 const str = v => (typeof v === "string" ? v : "");
 
 const normAvatar = (a)=>!a?null:(typeof a==="string"?a:(a.url||a.path||a.secure_url||a.src||null));
@@ -77,14 +78,19 @@ exports.getCommunityFacets = async (req, res, next) => {
       speaker  ? countryAgg(speaker, "id_event", "identity.country") : [],
     ]);
 
-    const roleMap = new Map();
+    const roleMap = new Map();  // key = normalized, val = count
+    const labelOf = new Map();  // key = normalized, val = first seen trimmed label
     [...attSR, ...spkSR].forEach(r=>{
-      const key = r._id || "Unspecified";
-      roleMap.set(key, (roleMap.get(key)||0) + r.c);
+      const raw = (typeof r._id === "string" ? r._id : "");
+      const t = raw.trim();
+      if (!t) return; // drop empty/null => no "Unspecified"
+      const k = t.toLowerCase();
+      if (!labelOf.has(k)) labelOf.set(k, t);
+      roleMap.set(k, (roleMap.get(k)||0) + r.c);
     });
     const subRoles = [...roleMap.entries()]
-      .sort((a,b)=> b[1]-a[1] || String(a[0]).localeCompare(String(b[0])))
-      .map(([name,count])=>({ name, count }));
+      .sort((a,b)=> b[1]-a[1] || (labelOf.get(a[0])||a[0]).localeCompare(labelOf.get(b[0])||b[0]))
+      .map(([k,count])=>({ name: labelOf.get(k) || k, count }));
 
     const cMap = new Map();
     [...attC, ...spkC].forEach(r=>{
@@ -135,8 +141,8 @@ exports.getCommunityList = async (req, res, next) => {
 
     // FLAT mode (when subRole provided)
     if (subRole) {
-      const matchAtt = baseMatch("id_event","personal.country");   matchAtt.subRole = subRole;
-      const matchSpk = baseMatch("id_event","identity.country");   matchSpk.subRole = subRole;
+      const matchAtt = baseMatch("id_event","personal.country");   matchAtt.subRole = rxEqTrim(subRole);
+      const matchSpk = baseMatch("id_event","identity.country");   matchSpk.subRole = rxEqTrim(subRole);
 
       const [attRows, spkRows, attCnt, spkCnt] = await Promise.all([
         attendee ? attendee.find(matchAtt).skip(skip).limit(limit).lean() : [],
@@ -161,22 +167,25 @@ exports.getCommunityList = async (req, res, next) => {
       speaker  ? speaker.find(matchSpk).select("_id personal identity organization subRole").lean() : [],
     ]);
 
-    const bucket = new Map(); // subRole => array of members
+    const bucket = new Map();   // key = normalized subRole => members[]
+    const labelOf = new Map();  // key => first seen trimmed label
     const push = (r)=>{
-      const roles = Array.isArray(r.subRole) && r.subRole.length ? r.subRole : ["Unspecified"];
+      const roles = Array.isArray(r.subRole) ? r.subRole : [];
       roles.forEach(sr=>{
-        const k = String(sr||"Unspecified");
-        if (!bucket.has(k)) bucket.set(k, []);
+        const t = String(sr||"").trim();
+        if (!t) return;                  // no “Unspecified” bucket
+        const k = t.toLowerCase();
+        if (!bucket.has(k)) { bucket.set(k, []); labelOf.set(k, t); }
         bucket.get(k).push(r);
       });
     };
     (attAll||[]).forEach(push);
     (spkAll||[]).forEach(push);
 
-    const groups = [...bucket.entries()]
-      .sort((a,b)=> b[1].length - a[1].length || a[0].localeCompare(b[0]))
-      .map(([name, arr])=>({
-        name,
+   const groups = [...bucket.entries()]
+      .sort((a,b)=> b[1].length - a[1].length || (labelOf.get(a[0])||a[0]).localeCompare(labelOf.get(b[0])||b[0]))
+      .map(([k, arr])=>({
+        name: labelOf.get(k) || k,
         count: arr.length,
         items: arr.slice(0, sampleN).map(x => ("personal" in x ? mapAtt(x) : mapSpk(x)))
       }));
