@@ -49,11 +49,11 @@ r.get('/bp/facets/selects', Search.getFacets);
 
 r.get('/bp/:profileId/overview', Stats.getProfileOverview);
 r.get('/bp/:profileId/rating', Stats.getProfileRating);
-r.post('/bp/:profileId/rating', protect, Stats.postProfileRating);
-r.post('/bp/:profileId/innovation', protect, Stats.postProfileInnovation);
-r.post('/bp/:profileId/presence',   protect, Stats.postProfilePresence);
+r.post('/bp/:profileId/rating',  Stats.postProfileRating);
+r.post('/bp/:profileId/innovation', Stats.postProfileInnovation);
+r.post('/bp/:profileId/presence',    Stats.postProfilePresence);
 
-r.get('/bp/team/search', protect, Prof.searchTeamCandidates);
+r.get('/bp/team/search', Prof.searchTeamCandidates);
 r.get   ('/bp/me/team',                        protect, Prof.getMyTeam);
 r.post  ('/bp/me/team',                        protect, Prof.addTeamMember);
 r.delete('/bp/me/team/:entityType/:entityId',  protect, Prof.removeTeamMember);
