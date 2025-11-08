@@ -1414,7 +1414,26 @@ exports.sendChatMessage = asyncHdl(async (req, res) => {
   const msg = await ChatMsg.create({
     roomId, senderId, text: text || '', files: Array.isArray(files) ? files : [], seenBy: [senderId]
   });
+  try {
+  const ActorNotification = require('../models/actorNotification');
+  const room = await ChatRoom.findById(roomId).select('members').lean();
+  const recipients = (room?.members || []).filter(id => String(id) !== String(req.user._id));
 
+  if (recipients.length) {
+    const note = {
+      title: 'New message',
+      body: (text || '').slice(0, 160),
+      link: `/messages?room=${roomId}`,
+      priority: 3
+    };
+    await ActorNotification.insertMany(recipients.map(actorId => ({ actorId, ...note })), { ordered: false });
+
+    // Optional: tell online recipients they have a fresh unread
+    req.app.locals.io.to(String(roomId)).emit('chat:unread-poke', { roomId });
+  }
+} catch (e) {
+  console.warn('notif insert failed:', e?.message);
+}
   // sender roles on the event payloads
   const [bo, co, em, ex, inv, st] = await Promise.all([
     RoleBusinessOwner.exists({ actor: senderId }),
@@ -1447,8 +1466,10 @@ exports.sendChatMessage = asyncHdl(async (req, res) => {
 exports.listChat = asyncHdl(async (req, res) => {
   const { roomId } = req.params;
   const { before, limit = 40 } = req.query;
-
+ console.log("test erorr 1", req.user);
   const meId = req.user._id;
+  console.log("test erorr 2", meId);
+  console.log("test erorr 3", roomId);
   const room = await ChatRoom.findById(roomId);
   if (!room) return res.status(404).json({ message:'Room not found' });
   if (!room.members.some(id => String(id) === String(meId)))
@@ -1735,7 +1756,42 @@ exports.unreadCounts = asyncHdl(async (req,res)=>{
   const table = Object.fromEntries(agg.map(a => [ a._id, a.count ]));
   res.json({ success:true, data: table });
 });
+// recent messages across my rooms, unread first then newest
+exports.listRecentMessages = asyncHdl(async (req, res) => {
+  const me = req.user._id;
+  const rooms = await ChatRoom.find({ members: me }).select('_id').lean();
+  const roomIds = rooms.map(r => r._id);
 
+  const feed = await ChatMsg.aggregate([
+    { $match: { roomId: { $in: roomIds } } },
+    { $addFields: { isUnread: { $not: [{ $in: [me, '$seenBy'] }] } } },
+    { $sort: { isUnread: -1, createdAt: -1 } },
+    { $limit: 50 },
+    { $project: {
+        _id: 1, roomId: 1, senderId: 1, text: 1, files: 1, createdAt: 1,
+        isUnread: 1
+    } }
+  ]);
+
+  res.json({ success: true, data: feed });
+});
+exports.listRecentMessages = asyncHdl(async (req, res) => {
+  const me = req.user._id;
+  const rooms = await ChatRoom.find({ members: me }).select('_id').lean();
+  const roomIds = rooms.map(r => r._id);
+
+  const feed = await ChatMsg.aggregate([
+    { $match: { roomId: { $in: roomIds } } },
+    { $addFields: { isUnread: { $not: [{ $in: [me, '$seenBy'] }] } } },
+    { $sort: { isUnread: -1, createdAt: -1 } },
+    { $limit: 50 },
+    { $project: {
+        _id: 1, roomId: 1, senderId: 1, text: 1, files: 1, createdAt: 1,
+        isUnread: 1
+    } }
+  ]);
+  res.json({ success: true, data: feed });
+});
 /* ───────────────────────── File upload (actor) ───────────────────── */
 const uploadDir = path.join(__dirname, '../uploads/chat');
 fs.mkdirSync(uploadDir, { recursive: true });

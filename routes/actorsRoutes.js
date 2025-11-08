@@ -31,9 +31,21 @@ router.get('/attendees/for-meeting', actor.getAttendeesForMeeting);
 /* ───────────────────  CHAT – DMs & Groups  ───────────────────── */
 // Ensure / create a DM
 router.post('/chat',                    protect, actor.getOrCreateDM);
+router.get('/chat/recent',              protect, actor.unreadCounts);
+router.get('/chat/unread',              protect, actor.listRecentMessages);
+router.get   ('/prefs',                      protect, actor.getPrefs);
+router.patch ('/prefs',                      protect, actor.updatePrefs);
+
+router.post  ('/profile',                    protect, actor.getActorProfile);
+router.patch ('/profile/update',             protect, actor.updateActorProfile);
+
+// Keeping your existing route as-is (even though the path is a bit odd)
+router.post  ('/actor/profile/',                      actor.getActorProfileById);
 
 // Create group
+router.get('/chat',                     protect, actor.listMyRooms);
 router.post('/chat/group',              protect, actor.createGroupChat);
+router.get('/me/notifications', protect, Notif.listMine);
 
 // Invite users to group
 router.patch('/chat/:roomId/invite',    protect, actor.inviteMembers);
@@ -42,32 +54,22 @@ router.patch('/chat/:roomId/invite',    protect, actor.inviteMembers);
 router.patch('/chat/:roomId/leave',     protect, actor.leaveGroup);
 
 // List my rooms (with last message)
-router.get('/chat',                     protect, actor.listMyRooms);
 
 // Send message (HTTP fallback; socket preferred on client)
 router.post('/chat/:roomId',            protect, chatBlockGuard, actor.sendChatMessage);
 
 // List messages (keep BOTH endpoints for safety)
-router.get('/chat/:roomId',             protect, actor.listChat);               // legacy
-router.get('/chat/:roomId/messages',    protect, actor.listChat);               // preferred
-
-// Mark messages seen
-router.patch('/chat/:roomId/seen',      protect, actor.markSeen);
-
-// Upload files to a room (creates a message)
-router.post('/chat/:roomId/files',      protect, chatBlockGuard, actor.uploadFiles);
 
 // Unread counters per room
-router.get('/chat/unread',              protect, actor.unreadCounts);
 
 // Full-text search within my rooms
+router.get('/people/search', protect, actor.searchPeople );
 router.get('/chat/search',              protect, actor.searchChat);
 
 /* message extras */
 router.post  ('/chat/:msgId/react',          protect, actor.reactMessage);
 router.delete('/chat/:msgId/react/:emoji',   protect, actor.unReactMessage);
 router.delete('/chat/msg/:msgId',            protect, actor.deleteMessageGlobal);
-router.get('/me/notifications', protect, Notif.listMine);
 router.patch('/me/notifications/:id/ack', protect, Notif.ackMine);
 router.get('/speakers/:speakerId/sessions', actor.listSpeakerAssignedSessions);
 
@@ -101,18 +103,9 @@ router.get('/speakers/:speakerId/sessions', actor.listSpeakerAssignedSessions);
 // router.patch ('/notifs/:id/read',            protect, actor.markNotifRead);
 
 /* ───────────────────  PREFERENCES & PROFILE  ─────────────────── */
-router.get   ('/prefs',                      protect, actor.getPrefs);
-router.patch ('/prefs',                      protect, actor.updatePrefs);
-
-router.post  ('/profile',                    protect, actor.getActorProfile);
-router.patch ('/profile/update',             protect, actor.updateActorProfile);
-
-// Keeping your existing route as-is (even though the path is a bit odd)
-router.post  ('/actor/profile/',                      actor.getActorProfileById);
 
 
 
-router.get('/people/search', protect, actor.searchPeople );
 
 // Lists by role (event-scoped)
 router.get('/event/:eventId/attendees',  actor.listAttendeesForEvent);
@@ -121,6 +114,14 @@ router.get('/event/:eventId/speakers',   actor.listSpeakersForEvent);
 // Update Actor Route
 router.patch('/update/:id', protect, actor.updateActorSimple);
 
+router.get('/chat/:roomId',             protect, actor.listChat);               // legacy
+router.get('/chat/:roomId/messages',    protect, actor.listChat);               // preferred
+
+// Mark messages seen
+router.patch('/chat/:roomId/seen',      protect, actor.markSeen);
+
+// Upload files to a room (creates a message)
+router.post('/chat/:roomId/files',      protect, chatBlockGuard, actor.uploadFiles);
 
 
 

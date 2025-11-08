@@ -430,6 +430,7 @@ exports.getMyTeam = async (req, res) => {
 };
 
 exports.searchTeamCandidates = async (req, res) => {
+  console.log("test",req.user);
   const actorId = req.user?._id || req.user?.id;
   if (!actorId) return res.status(401).json({ message: 'Unauthorized' });
 
