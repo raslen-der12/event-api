@@ -72,6 +72,7 @@ app.use('/bp-public', require('./routes/bp.public.routes'));  // Must exist befo
 app.use('/admin/chat', require('./routes/adminChatRoutes'));
 // Actor-facing API (DMs, groups, comments, etc.)
 app.use('/actors',  require('./routes/actorsRoutes'));
+app.use('/actor', require('./routes/actorsRoutes'));
 app.use('/invites', require('./routes/inviteRoutes'));
 app.use('/biz', require('./routes/bp.admin.routes'));
 app.use('/admin/actors', require('./routes/adminActorsRoutes'));
