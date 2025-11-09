@@ -257,7 +257,7 @@ exports.adminListProfiles = async (req, res) => {
     BusinessProfile.find(filter)
       .sort({ createdAt: -1 })
       .skip(skip).limit(limit)
-      .select('_id name slug published featured logoUpload industries countries createdAt updatedAt')
+      .select('_id name slug published featured logoUpload industries countries createdAt updatedAt isExibitor')
       .lean(),
     BusinessProfile.countDocuments(filter)
   ]);
@@ -504,7 +504,7 @@ exports.adminGetProfile = async (req, res) => {
     .select([
       '_id','name','slug','tagline','about','size','industries','countries','languages',
       'offering','seeking','innovation','logoUpload','bannerUpload','gallery','contacts',
-      'socials','published','featured','createdAt','updatedAt','event'
+      'socials','published','featured','createdAt','updatedAt','event','isExibitor'
     ].join(' '))
     .lean();
 
@@ -539,6 +539,7 @@ exports.adminGetProfile = async (req, res) => {
       socials: Array.isArray(p.socials) ? p.socials : [],
       published: !!p.published,
       featured: !!p.featured,
+      isExibitor: !!p.isExibitor,
       createdAt: p.createdAt || null,
       updatedAt: p.updatedAt || null,
       event: p.event || null,
@@ -546,3 +547,59 @@ exports.adminGetProfile = async (req, res) => {
     }
   });
 };
+exports.adminSetExhibitor = asyncHdl(async (req, res) => {
+  const id = req.params.profileId;
+  if (!isId(id)) return res.status(400).json({ ok:false, message:'Bad profileId' });
+  const flag = !!req.body.isExibitor; // NOTE: property name matches schema
+  const p = await BusinessProfile.findByIdAndUpdate(
+    id, { $set: { isExibitor: !flag } }, { new: true }
+  ).select('_id isExibitor').lean();
+  if (!p) return res.status(404).json({ ok:false, message:'Not found' });
+  return res.json({ ok:true, data:{ id:String(p._id), isExibitor: !!p.isExibitor }});
+});
+// GET /bp/public-exhibitors?page=&limit=&q=&eventId=
+exports.publicListExhibitors = asyncHdl(async (req, res) => {
+  const toInt = (v, def, min, max) => {
+    const n = Math.max(min, Math.min(max, Number(v || def)));
+    return Number.isFinite(n) ? n : def;
+  };
+  const isId = (s) => mongoose.isValidObjectId(String(s || ''));
+
+  const page  = toInt(req.query.page, 1, 1, 100000);
+  const limit = toInt(req.query.limit, 20, 1, 200);
+  const q     = String(req.query.q || '').trim();
+  const event = req.query.eventId && isId(req.query.eventId) ? req.query.eventId : null;
+
+  const filter = { isExibitor: true, published: true };
+  if (event) filter.event = event;
+  if (q) {
+    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    Object.assign(filter, { $or: [{ name: rx }, { tagline: rx }, { industries: rx }] });
+  }
+
+  const skip = (page - 1) * limit;
+  const [rows, total] = await Promise.all([
+    BusinessProfile.find({ isExibitor: true, published: true })
+      .sort({ createdAt: -1 })
+      .skip(skip).limit(limit)
+      .select('_id owner.actor name slug logoUpload industries countries event tagline createdAt')
+      .lean(),
+    BusinessProfile.countDocuments(filter)
+  ]);
+
+  res.json({
+    ok: true, page, limit, total,
+    data: rows.map(r => ({
+      id: String(r._id),               // BusinessProfile Id
+      ownerId: String(r?.owner?.actor || ''), // Actor ownerId for profile links
+      name: r.name || '',
+      slug: r.slug || '',
+      logoUpload: r.logoUpload || null,
+      industries: r.industries || [],
+      countries: r.countries || [],
+      event: r.event || null,
+      tagline: r.tagline || '',
+      createdAt: r.createdAt || null
+    }))
+  });
+});

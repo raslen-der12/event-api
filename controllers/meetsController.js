@@ -5992,3 +5992,122 @@ exports.getSuggestedListAdmin = asyncHandler(async (req, res) => {
 
   return res.json({ success: true, count: data.length, data });
 });
+// ───────────────────────── ADMIN: generate Google Meet (platform link) ─────────────────────────
+// POST /admin/meets/:id/gmeet
+exports.adminGenerateGoogleMeetLink = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Bad id" });
+
+  const row = await MeetRequest.findById(id);
+  if (!row) return res.status(404).json({ message: "Meeting not found" });
+
+  // use same platform link scheme you already use for virtual room
+  const FRONT = process.env.FRONTEND_URL || "";
+  const vlink = `${FRONT}/vmeet/${String(row._id)}`; // same pattern as elsewhere
+  row.meetLink = vlink; // persists/overwrites as the “Google Meet link” entry point
+  row.markModified?.('meetLink');
+  await row.save();
+
+  // notify both parties (reuse your mailer template utilities)
+  const subj = "Your virtual meeting room is ready";
+  const html = `
+    <p>Hello,</p>
+    <p>The virtual room for your meeting on <b>${new Date(row.slotISO).toLocaleString()}</b> is now available.</p>
+    <p><a href="${vlink}">Open the virtual room</a></p>
+    <p><em>Important:</em> Please join exactly on time and avoid leaving once you enter.</p>
+  `;
+
+  // sender + receiver emails via your existing participant helpers (attachParticipants/getMeta)
+  const [enriched] = await attachParticipants([row.toObject()]);
+  const toList = []
+    .concat(enriched?.sender?.email || [])
+    .concat(enriched?.receiver?.email || [])
+    .filter(Boolean);
+
+  // use the same sendMail helper already used in this controller
+  for (const to of toList) {
+    try { await sendMail({ to, subject: subj, html }); } catch (_) {}
+  }
+
+  return res.json({ success: true, link: vlink });
+});
+// ───────────────────────── ACTOR: get link & mark virtual attendance ─────────────────────────
+// GET /meets/:meetId/vlink/:actorId
+// - returns the platform link if generated
+// - also upserts a virtual attendance record for that actor (same method as adminScanMeet)
+exports.actorGetVirtualLinkAndAttend = asyncHandler(async (req, res) => {
+  const { meetId, actorId } = req.params || {};
+  if (!mongoose.isValidObjectId(meetId) || !mongoose.isValidObjectId(actorId)) {
+    return res.status(400).json({ message: "Bad ids" });
+  }
+
+  const meet = await MeetRequest.findById(meetId).lean();
+  if (!meet) return res.status(404).json({ message: "Meeting not found" });
+
+  // membership check — same logic used in adminScanMeet
+  const senderId   = String(meet.senderId || "");
+  const receiverId = String(meet.receiverId || "");
+  const youId      = String(actorId);
+  const isSender   = youId === senderId;
+  const isReceiver = youId === receiverId;
+  if (!isSender && !isReceiver) {
+    return res.status(403).json({ message: "Actor is not a participant of this meeting" });
+  } // :contentReference[oaicite:4]{index=4}
+
+  if (!meet.meetLink) return res.status(409).json({ message: "Virtual link not generated yet" });
+
+  const youRole = isSender ? meet.senderRole : meet.receiverRole;
+
+  // mark attendance like adminScanMeet does (upsert with time/by)
+  await MeetingAttendance.updateOne(
+    { meetingId: meetId, actorId: youId },
+    {
+      $set: {
+        meetingId: meetId,
+        actorId: youId,
+        actorRole: youRole,
+        kind: "virtual",
+        attended: true,
+        at: new Date(),
+        by: youId
+      }
+    },
+    { upsert: true }
+  ); // :contentReference[oaicite:5]{index=5}
+
+  return res.json({ success: true, link: meet.meetLink });
+});
+// ───────────────────────── ADMIN: list virtual & hybrid meets (+link existence) ───────────────
+// GET /admin/meets/virtual-list?eventId=&status=accepted
+exports.adminListVirtualHybridWithLink = asyncHandler(async (req, res) => {
+  const { eventId, status } = req.query || {};
+  const find = {};
+  if (eventId && mongoose.isValidObjectId(eventId)) find.eventId = eventId;
+  if (status) find.status = status;
+
+  const rows = await MeetRequest.find(find).sort({ slotISO: 1 }).lean();
+
+  const out = [];
+  for (const r of rows) {
+    // compute virtual flags exactly like elsewhere via loadVirtualFlags()
+    const flags = await loadVirtualFlags(r.senderRole, r.senderId, r.receiverRole, r.receiverId, r.eventId);
+    const bothVirtual = !!(flags?.senderVirtual && flags?.receiverVirtual);
+    const halfVirtual = !!((flags?.senderVirtual && !flags?.receiverVirtual) || (!flags?.senderVirtual && flags?.receiverVirtual));
+    const mode = bothVirtual ? "virtual" : halfVirtual ? "hybrid" : "physical";
+
+    if (mode === "physical") continue; // show only virtual/hybrid as requested
+
+    out.push({
+      _id: r._id,
+      eventId: r.eventId,
+      slotISO: r.slotISO,
+      mode,
+      hasLink: !!r.meetLink,
+      meetLink: r.meetLink || null,
+      sender: { role: r.senderRole, actorId: r.senderId },
+      receiver: { role: r.receiverRole, actorId: r.receiverId },
+    });
+  }
+
+  return res.json({ success: true, count: out.length, data: out });
+});

@@ -44,6 +44,7 @@ r.get('/bp/search', Search.searchProfiles);
 r.get('/bp/items/search', Search.searchItems);
 r.get('/bp/facets', Search.facets);
 r.get('/bp/facets/selects', Search.getFacets);
+r.get('/bp/public-exhibitors', Adm.publicListExhibitors);
 
 
 

@@ -13,6 +13,7 @@ r.get('/admin/bp', protect, isAdmin, Adm.adminListProfiles);
 r.patch('/admin/bp/:profileId/publish', protect, isAdmin, Adm.adminPublishProfile);
 r.patch('/admin/bp/publish', protect, isAdmin, Adm.adminBulkPublish);
 r.patch('/admin/bp/:profileId/feature', protect, isAdmin, Adm.adminFeatureProfile);
+r.patch('/admin/bp/:profileId/exhibitor', protect, isAdmin, Adm.adminSetExhibitor);
 
 // delete profile (with items cascade)
 r.delete('/admin/bp/:profileId', protect, isAdmin, Adm.adminDeleteProfile);

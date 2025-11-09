@@ -58,5 +58,9 @@ router.post('/admin/scan/actor-attend', protect,  meetsCtrl.adminScanActorAttend
 router.post('/admin/scan/session',      protect,  meetsCtrl.adminScanSession);
 router.post('/admin/scan/meet',         protect,  meetsCtrl.adminScanMeet);
 router.get('/admin/events/:eventId/sessions-mini', meetsCtrl.listEventSessionsMini);
+router.post('/admin/:id/gmeet', protect, meetsCtrl.adminGenerateGoogleMeetLink);
+router.get('/admin/virtuals', protect, meetsCtrl.adminListVirtualHybridWithLink);
 
+// routes/meetRoutes.js (actors)
+router.get('/meets/:meetId/vlink/:actorId', protect, meetsCtrl.actorGetVirtualLinkAndAttend);
 module.exports = router;
