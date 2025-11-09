@@ -824,7 +824,7 @@ exports.marketGetOne = asyncHdl(async (req, res) => {
   if (!item) return res.status(404).json({ message: 'Item not found' });
 
   const prof = await BusinessProfile.findById(item.profile)
-    .select('name slug logoUpload industries countries languages')
+    .select('name slug logoUpload bannerUpload industries countries languages')
     .lean();
 
   return res.json({
@@ -835,6 +835,7 @@ exports.marketGetOne = asyncHdl(async (req, res) => {
       profile: prof ? {
         id: String(prof._id), name: prof.name, slug: prof.slug,
         logoUpload: prof.logoUpload, industries: prof.industries,
+        bannerUpload:prof.bannerUpload,
         countries: prof.countries, languages: prof.languages
       } : { id: String(item.profile) }
     }
@@ -903,7 +904,7 @@ exports.getMarketItem = asyncHdl(async (req, res) => {
   let profile = null;
   if (doc.profile && mongoose.isValidObjectId(doc.profile)) {
     const p = await BusinessProfile.findById(doc.profile)
-      .select("name slug logoUpload industries countries languages")
+      .select("name slug logoUpload industries countries languages bannerUpload")
       .lean();
 
     if (p) {
@@ -912,6 +913,7 @@ exports.getMarketItem = asyncHdl(async (req, res) => {
         name: p.name || "",
         slug: p.slug || "",
         logoUpload: p.logoUpload || "",
+        bannerUpload: p.bannerUpload || "",
         industries: Array.isArray(p.industries) ? p.industries : [],
         countries: Array.isArray(p.countries) ? p.countries : [],
         languages: Array.isArray(p.languages) ? p.languages : [],
@@ -1038,6 +1040,7 @@ exports.getMarketBusinesses = async (req, res, next) => {
         id: pid,
         name: bp.name || "",
         logoUpload: bp.logoUpload || null,   // used by UI as top hero
+        bannerUpload : bp.bannerUpload,
         industries: bp.industries || [],
         countries: bp.countries  || [],
         size: bp.size || "",

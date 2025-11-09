@@ -28,7 +28,7 @@ exports.queue = async (req, res) => {
     BusinessProfile.find(filter)
       .sort({ createdAt: -1 })
       .skip(skip).limit(limit)
-      .select('_id name slug published logoUpload createdAt')
+      .select('_id name slug published logoUpload createdAt isExibitor')
       .lean(),
     BusinessProfile.countDocuments(filter),
   ]);
@@ -43,6 +43,7 @@ exports.queue = async (req, res) => {
         name: r.name || '',
         slug: r.slug || '',
         published: !!r.published,                // should be false here
+        isExibitor: !!r.isExibitor,
         logoUpload: r.logoUpload || null,
         createdAt: r.createdAt || null,
       }))
@@ -269,6 +270,7 @@ exports.adminListProfiles = async (req, res) => {
       name: r.name,
       slug: r.slug,
       published: !!r.published,
+      isExibitor: !!r.isExibitor,
       featured: !!r.featured,
       industries: r.industries || [],
       countries: r.countries || [],
