@@ -493,15 +493,16 @@ function renderEmail({
 exports.requestMeeting = asyncHandler(async (req, res) => {
   // Body expected from your UI:
   // { eventId, receiverId, receiverRole, dateTimeISO, subject, message }
-  const senderId = req.user?._id;
-  const senderRole = req.user?.role;
+  const senderId = req.user?.role === "admin" ? req.body?.senderId : req.user?._id;
+  const senderRole = req.user?.role === "admin" ? (req.body?.receiverRole || "attendee") : req.body?.senderRole;
   const eventId = req.body?.eventId;
   const receiverId = req.body?.receiverId;
-  const receiverRole = req.body?.receiverRole;
+  const receiverRole = req.body?.receiverRole ;
   const slotISO = req.body?.dateTimeISO; // 30-min ISO (UTC recommended)
-  const subject = String(req.body?.subject || "").trim();
-  const message = String(req.body?.message || "").trim();
-
+  const subject = String(req.body?.subject || "suggested by AI matchmaking tool").trim();
+  const message = String(req.body?.message || "You’re a strong match. We hope this meeting happens. Great fit detected. Looking forward to your meeting. Excellent match—hoping you can connect soon. Strong alignment—let’s make this meeting happen. High match score. We’re excited for your meetup.").trim();
+  console.log("senderId 1",senderId);
+  console.log("senderRole 2",senderRole);
   if (!mongoose.isValidObjectId(senderId))
     return res.status(401).json({ message: "Auth required" });
   if (!mongoose.isValidObjectId(eventId))
@@ -756,6 +757,26 @@ if (counterKind === 'hybrid') {
   } catch (e) {
     mailErrors.push("receiver");
   }
+  try {
+  const meetUrl = `/meetings/${String(doc._id)}`;
+  await ActorNotification.create([
+    {
+      actorId: doc.receiverId,
+      title: 'New meeting request',
+      body: `You have a meeting request from ${String(doc.senderId)}`,
+      link: meetUrl,
+      priority: 5
+    },
+    {
+      actorId: doc.senderId,
+      title: 'Meeting request sent',
+      body: `Your request to ${String(doc.receiverId)} was created`,
+      link: meetUrl,
+      priority: 3
+    }
+  ]);
+} catch(e){ console.error('[notif][requestMeeting]', e?.message || e); }
+
 
   return res.status(201).json({
     success: true,
@@ -2153,6 +2174,28 @@ if (act === 'confirm') {
   $set.slotISO = new Date(finalISO);
   $unset.proposedNewAt = 1;
   $unset.proposedBy = 1;
+  try {
+  const meetUrl = `/meetings/${String(updated._id)}`;
+  const actLabel = act === 'confirm' ? 'confirmed'
+                   : act === 'reject' ? 'rejected'
+                   : act === 'reschedule' ? 'rescheduled' : 'cancelled';
+  await ActorNotification.create([
+    {
+      actorId: updated.senderId,
+      title: `Meeting ${actLabel}`,
+      body: `Your meeting with ${String(updated.receiverId)} was ${actLabel}.`,
+      link: meetUrl,
+      priority: 4
+    },
+    {
+      actorId: updated.receiverId,
+      title: `Meeting ${actLabel}`,
+      body: `Your meeting with ${String(updated.senderId)} was ${actLabel}.`,
+      link: meetUrl,
+      priority: 4
+    }
+  ]);
+} catch(e){ console.error('[notif][makeMeetingAction]', e?.message || e); }
 }
 
 
@@ -4707,4 +4750,198 @@ exports.exportConfirmedMeetsCSV = asyncHandler(async (req,res)=>{
   res.setHeader('Content-Type','text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="confirmed_meetings_${eventId}.csv"`);
   return res.end(csv);
+});
+const ActorNotification = require('../models/actorNotification'); // existing schema
+const toId = (v) => new mongoose.Types.ObjectId(String(v));
+const suggIdOf = (a, b) => {
+  const [x, y] = [String(a), String(b)].sort();
+  return `${x}_${y}`;
+};
+const words = (x=[]) => Array.from(new Set([].concat(x).flatMap(s => String(s||'')
+  .split(/[,/|]+|\s+/g)).map(s=>s.trim().toLowerCase()).filter(Boolean)));
+
+async function bpFor(actorId, eventId) {
+  const bp = await BusinessProfile.findOne({ 'owner.actor': actorId, event: eventId })
+    .select('industries offering seeking languages countries name slug owner logo images').lean();
+  return bp || null;
+}
+
+const t = (d) => (d instanceof Date ? d.getTime() : new Date(d).getTime());
+function intersectSortedTimes(aTimes, bTimes) {
+  // aTimes/bTimes are ascending arrays of Numbers (ms)
+  const res = [];
+  let i=0, j=0;
+  while (i<aTimes.length && j<bTimes.length) {
+    if (aTimes[i] === bTimes[j]) { res.push(aTimes[i]); i++; j++; }
+    else if (aTimes[i] < bTimes[j]) i++;
+    else j++;
+  }
+  return res;
+}
+
+function jaccard(a, b) {
+  if (!a.length && !b.length) return 0;
+  const A = new Set(a), B = new Set(b);
+  let inter = 0;
+  A.forEach(v => { if (B.has(v)) inter++; });
+  const uni = A.size + B.size - inter;
+  return inter / (uni || 1);
+}
+
+function scorePair(meA, meB, metaA={}, metaB={}) {
+  // Cross-intent hits (offering⇄seeking) both ways
+  const lxo = meA.seeking.filter(t => meB.offering.includes(t)).length;
+  const oxl = meA.offering.filter(t => meB.seeking.includes(t)).length;
+  // Jaccard similarities
+  const ind = jaccard(meA.industries, meB.industries);
+  const lng = jaccard(meA.languages,  meB.languages);
+  const cnt = jaccard(meA.countries,  meB.countries);
+  // verified boost (tiny)
+  const ver = (metaA.verified ? 0.05 : 0) + (metaB.verified ? 0.05 : 0);
+  // weighted sum (tuned quickly) — DO NOT CHANGE
+  return lxo*5 + oxl*5 + ind*3 + lng*1.5 + cnt*2 + ver;
+}
+
+// ========== SUGGESTIONS ==========
+exports.getSuggestedListAdmin = asyncHandler(async (req, res) => {
+  // Admin calls this. If token has actor, we accept it; otherwise require eventId in query
+  const q = req.query || {};
+  const eventId = q.eventId && mongoose.isValidObjectId(q.eventId) ? toId(q.eventId) : null;
+  const limit   = Math.min(200, Math.max(1, Number(q.limit || 50)));
+  const pool    = Math.min(2000, Math.max(2, Number(q.pool || 400))); // candidates considered
+
+  if (!eventId) return res.status(400).json({ message: 'eventId is required' });
+
+  // Pool: attendees in event who are open to meetings
+  const base = { id_event: eventId, 'matchingIntent.openToMeetings': { $ne: false } };
+  const rows = await attendee.find(base)
+    .select('_id personal.fullName personal.country personal.preferredLanguages organization.orgName verified personal.profilePic')
+    .limit(pool)
+    .lean();
+
+  // Preload SlotWhitelist for all candidates
+  let wlMap = new Map();
+  if (SlotWhitelist) {
+    const ids = rows.map(r => r._id);
+    const wls = await SlotWhitelist.find({ eventId, actorId: { $in: ids } })
+      .select('actorId slots').lean();
+    wlMap = new Map(
+      wls.map(w => [ String(w.actorId), (w.slots||[]).map(t).sort((a,b)=>a-b) ])
+    );
+  }
+
+  // Preload busy slots from existing requests for these actors (blockers only)
+  const idStrs = rows.map(r => String(r._id));
+  const busy = new Map(); // actorId -> Set(ms)
+  const busyDocs = await MeetRequest.find({
+    eventId,
+    status: { $in: ['pending','accepted','reschedule-proposed'] },
+    $or: [{ senderId: { $in: idStrs } }, { receiverId: { $in: idStrs } }]
+  }).select('senderId receiverId slotISO').lean();
+  for (const d of busyDocs) {
+    const ms = t(d.slotISO);
+    const sId = String(d.senderId), rId = String(d.receiverId);
+    if (!busy.has(sId)) busy.set(sId, new Set());
+    if (!busy.has(rId)) busy.set(rId, new Set());
+    busy.get(sId).add(ms);
+    busy.get(rId).add(ms);
+  }
+
+  // Prepare feature vectors using BusinessProfile if exists; also keep a tiny bp cache for logo fallback
+  const vectors = new Map();  // actorId -> vector
+  const bpLogo  = new Map();  // actorId -> logo url if any
+  await Promise.all(rows.map(async r => {
+    const bp = await bpFor(r._id, eventId);
+    const v = {
+      actorId: String(r._id),
+      industries: words(bp?.industries||[]),
+      offering  : words(bp?.offering||[]),
+      seeking   : words(bp?.seeking||[]),
+      languages : words(bp?.languages||r?.personal?.preferredLanguages||[]),
+      countries : words(bp?.countries||[r?.personal?.country].filter(Boolean))
+    };
+    vectors.set(String(r._id), v);
+    const logo = bp?.logo?.url || bp?.logo || (Array.isArray(bp?.images) ? bp.images[0] : null);
+    if (logo) bpLogo.set(String(r._id), String(logo));
+  }));
+
+  // Helper to extract a photo from attendee row or bp cache
+  const photoOf = (row) => {
+    console.log("row >>",row);
+    const r = row || {};
+    return (
+      r?.personal?.profilePic || r?.personal?.photo || bpLogo.get(String(r?._id)) || ''
+    );
+  };
+
+  const ids = rows.map(r => String(r._id));
+  const pairs = [];
+  for (let i=0;i<ids.length;i++){
+    for (let j=i+1;j<ids.length;j++){
+      const A = vectors.get(ids[i]);
+      const B = vectors.get(ids[j]);
+      const metaA = rows[i] || {}, metaB = rows[j] || {};
+      const sc = scorePair(A, B, metaA, metaB) + scorePair(B, A, metaB, metaA);
+      if (sc > 0) pairs.push({ a: ids[i], b: ids[j], score: sc });
+    }
+  }
+  pairs.sort((x,y)=> y.score - x.score);
+
+  const used = new Set();
+  const picked = [];
+  for (const p of pairs){
+    if (picked.length >= limit) break;
+    if (used.has(p.a) || used.has(p.b)) continue;
+
+    const wa = wlMap.get(String(p.a)) || [];
+    const wb = wlMap.get(String(p.b)) || [];
+    if (!wa.length || !wb.length) continue; // missing whitelist => skip
+
+    // common whitelist times
+    const common = intersectSortedTimes(wa, wb);
+    if (!common.length) continue;
+
+    // find first slot free for BOTH actors (no meeting request at that time)
+    const busyA = busy.get(String(p.a)) || new Set();
+    const busyB = busy.get(String(p.b)) || new Set();
+    let chosen = null;
+    for (const ms of common) {
+      if (!busyA.has(ms) && !busyB.has(ms)) { chosen = ms; break; }
+    }
+    if (!chosen) continue; // all common slots are busy
+
+    used.add(p.a); used.add(p.b);
+    picked.push({ ...p, slotMs: chosen });
+  }
+
+  // Attach payload for UI (guaranteed slotISO)
+  const actorsMap = new Map(rows.map(r => [String(r._id), r]));
+  const data = [];
+  for (const p of picked){
+    const [aId, bId] = [p.a, p.b];
+    const ra = actorsMap.get(aId), rb = actorsMap.get(bId);
+    data.push({
+      suggId: suggIdOf(aId, bId),
+      eventId: String(eventId),
+      score: p.score,
+      slotISO: new Date(p.slotMs).toISOString(),
+      slotReason: 'ok',
+      a: {
+        id: aId,
+        name: ra?.personal?.fullName || '',
+        role: 'attendee',
+        photo: photoOf(ra),
+        adminLinks: { attendee: `/admin/members/attendees?id=${aId}` }
+      },
+      b: {
+        id: bId,
+        name: rb?.personal?.fullName || '',
+        role: 'attendee',
+        photo: photoOf(rb),
+        adminLinks: { attendee: `/admin/members/attendees?id=${bId}` }
+      }
+    });
+  }
+
+  return res.json({ success:true, count: data.length, data });
 });
