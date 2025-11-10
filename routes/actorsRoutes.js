@@ -18,6 +18,7 @@ const { chatBlockGuard } = require('../controllers/actorsController');
 /* ───────────────────  ACTORS (admin tools)  ───────────────────── */
 router.post('/',            protect, actor.getActorsList);
 router.get('/:id',          protect, actor.getActorFullById);
+router.get('/links/:actorId', actor.getActorLinksById);
 router.post('/create',      protect, actor.createActorSimple);
 router.post('/requests',    protect, actor.getRequests);
 router.patch('/requests',   protect, actor.setAdminVerify);

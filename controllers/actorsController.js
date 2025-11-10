@@ -2086,6 +2086,7 @@ function mapRow(x, entityType) {
 }
 
 exports.updateActorProfile = asyncHdl(async (req, res) => {
+
   const { role, id, data } = req.body || {};
   if (!role || !id || !isObj(data))
     return res.status(400).json({ message: 'Missing role, id or data' });
@@ -2103,6 +2104,7 @@ exports.updateActorProfile = asyncHdl(async (req, res) => {
     .exec();
   if (!existing) return res.status(404).json({ message: 'Actor not found' });
 
+  
   // 2) Build flat set from incoming data, but strip immutable keys
   const flat = flatten(data);
   for (const key of Object.keys(flat)) {
@@ -3743,4 +3745,31 @@ exports.listSpeakerAssignedSessions = asyncHdl(async (req, res) => {
   ]).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
 
   return res.json({ success: true, count: merged.length, data: merged });
+});
+
+
+exports.getActorLinksById = asyncHdl(async (req, res) => {
+  const actorId = req.params.actorId || req.body?.actorId;
+  if (!mongoose.isValidObjectId(actorId)) {
+    return res.status(400).json({ message: 'Bad actorId' });
+  }
+
+  // Try to find actor in any role
+  let actorDoc = null;
+  const roleTry = [
+    { role: 'attendee',  M: attendee },
+    { role: 'exhibitor', M: Exhibitor },
+    { role: 'speaker',   M: Speaker },
+  ];
+
+  for (const { role, M } of roleTry) {
+    actorDoc = await M.findById(actorId).select('links').lean();
+    if (actorDoc) break;
+  }
+
+  if (!actorDoc) {
+    return res.status(404).json({ message: 'Actor not found' });
+  }
+
+  return res.json({ success: true, data: actorDoc.links || {} });
 });

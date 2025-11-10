@@ -125,7 +125,7 @@ exports.listSessionsRegister = asyncHdl(async (req, res) => {
   }
 
   if (track && String(track).trim()) {
-    // case-insensitive exact match to avoid “AI” matching “AIsomething”
+    // case-insensitive exact match to avoid "AI" matching "AIsomething"
     match.track = { $regex: `^${escapeRegExp(String(track).trim())}$`, $options: 'i' };
   }
 
@@ -139,6 +139,8 @@ exports.listSessionsRegister = asyncHdl(async (req, res) => {
   const pipeline = [
     { $match: match },
     { $sort: { startTime: 1 } },
+    
+    // Lookup room information
     {
       $lookup: {
         from: 'programrooms',
@@ -148,6 +150,36 @@ exports.listSessionsRegister = asyncHdl(async (req, res) => {
       }
     },
     { $addFields: { roomDoc: { $first: '$roomDoc' } } },
+    
+    // Lookup REAL-TIME registration count from SessionRegistration collection
+    {
+      $lookup: {
+        from: 'sessionregistrations',
+        let: { sessionId: '$_id' },
+        pipeline: [
+          { 
+            $match: { 
+              $expr: { $eq: ['$sessionId', '$$sessionId'] } 
+            } 
+          },
+          { $count: 'total' }
+        ],
+        as: 'regCount'
+      }
+    },
+    
+    // Calculate seats taken from actual registrations
+    {
+      $addFields: {
+        actualSeatsTaken: { 
+          $ifNull: [
+            { $first: '$regCount.total' }, 
+            0
+          ] 
+        }
+      }
+    },
+    
     {
       $project: {
         _id: 1,
@@ -161,7 +193,19 @@ exports.listSessionsRegister = asyncHdl(async (req, res) => {
         tags: { $ifNull: ['$tags', []] },
         
         speakers: { $ifNull: ['$speakers', []] },
-        seatsTaken: { $ifNull: ['$seatsTaken', { $ifNull: ['$seats_taken', 0] }] },
+
+        // Use REAL-TIME count from SessionRegistration
+        seatsTaken: '$actualSeatsTaken',
+        
+        // Calculate seats capacity and remaining
+        seatsCapacity: {
+          $cond: {
+            if: { $gt: [{ $ifNull: ['$roomDoc.capacity', 0] }, 0] },
+            then: { $ifNull: ['$roomDoc.capacity', 0] },
+            else: { $ifNull: ['$capacity', 0] }
+          }
+        },
+        
         // embedded minimal room
         room: {
           _id: '$roomId',
@@ -170,27 +214,42 @@ exports.listSessionsRegister = asyncHdl(async (req, res) => {
           capacity: { $ifNull: ['$roomDoc.capacity', 0] },
         }
       }
+    },
+    
+    // Add calculated remaining seats
+    {
+      $addFields: {
+        seatsRemaining: {
+          $cond: {
+            if: { $gt: ['$seatsCapacity', 0] },
+            then: { 
+              $max: [
+                0, 
+                { $subtract: ['$seatsCapacity', '$seatsTaken'] }
+              ] 
+            },
+            else: null
+          }
+        }
+      }
     }
   ];
 
-  const rows = await Schedule.aggregate(pipeline);
-
-  let counts = {};
-  const needCounts = (includeCounts === '1' || includeCounts === 1 || includeCounts === true || includeCounts === 'true');
-  if (needCounts && rows.length) {
-    const ids = rows.map(r => r._id);
-    const agg = await Reg.aggregate([
-      { $match: { sessionId: { $in: ids }, status: { $in: ['registered','waitlisted'] } } },
-      { $group: { _id: { sessionId: '$sessionId', status: '$status' }, n: { $sum: 1 } } }
-    ]);
-    agg.forEach(a => {
-      const sid = String(a._id.sessionId);
-      if (!counts[sid]) counts[sid] = { registered: 0, waitlisted: 0 };
-      counts[sid][a._id.status] = a.n;
+  try {
+    const sessions = await Schedule.aggregate(pipeline);
+    
+    return res.status(200).json({
+      success: true,
+      count: sessions.length,
+      data: sessions
+    });
+  } catch (error) {
+    console.error('listSessionsRegister error:', error);
+    return res.status(500).json({ 
+      message: 'Failed to fetch sessions',
+      error: error.message 
     });
   }
-
-  return res.json({ success: true, data: rows, counts });
 });
 
 

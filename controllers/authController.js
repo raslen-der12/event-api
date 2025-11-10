@@ -171,7 +171,7 @@ async function attachSeatsAndEnforce({ normSessions, enforce=false }) {
 
   for (const s of normSessions) {
     const cap = readSessionCapacity(s.__raw || {});
-    const taken = takenMap.get(String(s._id)) || 0;
+    const taken = (takenMap.get(String(s._id))) || 0;
     const remaining = cap > 0 ? Math.max(0, cap - taken) : null;
 
     s.seats = { capacity: cap, taken, remaining }; // <- name it like “other data expect it”
@@ -631,7 +631,11 @@ async function notifyRegistrationPending(actorId, role, eventId) {
   } catch (_) {}
 }
 
+
+
+
 /* ─────────────────────────── 1. attendee ─────────────────────────── */
+
 exports.registerAttendee = asyncHandler(async (req, res) => {
   // -------- logging helpers --------
   const rid = String(req.headers["x-request-id"] || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`);
@@ -665,7 +669,7 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     warn("Envelope logging failed:", e?.message);
   }
 
-  // -------- destructure inputs (unchanged) --------
+  // -------- destructure inputs --------
   const {
     eventId,
     pwd,
@@ -677,7 +681,7 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     'personal.phone': phone,
     'personal.country': country,
     'personal.city': city,
-    'personal.gender': gender, // <-- NEW
+    'personal.gender': gender,
 
     'organization.orgName': orgName,
     'organization.jobTitle': jobTitle,
@@ -738,7 +742,7 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
   }
   timeEnd("assertEmailAvailableEverywhere");
 
-  // -------- basic validation (unchanged responses; just log) --------
+  // -------- basic validation --------
   if (!isId(eventId)) {
     warn("VALIDATION_FAIL: eventId invalid", { eventId });
     return res.status(400).json({ message: 'Valid eventId is required' });
@@ -813,7 +817,90 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
   const profilePicUrl = req.file?.path ? localPathToWebUrl(req.file.path) : DEF_PHOTO;
   log("PHOTO_SELECT", { profilePicUrl, hadUpload: !!req.file });
 
-  // -------- persist attendee --------
+  // -------- sessions normalize & validate (MOVED BEFORE CREATE) --------
+  timeStart("loadAndValidateSessions");
+  const normSessions = await loadAndValidateSessions(eventId, sessionIds).catch((e) => {
+    error("loadAndValidateSessions failed:", e?.message);
+    throw e;
+  });
+  timeEnd("loadAndValidateSessions");
+  log("SESSIONS_LOADED", {
+    count: normSessions.length,
+    ids: normSessions.map((s) => String(s._id)),
+  });
+
+  // -------- conflict system (MOVED BEFORE CREATE) --------
+  const conflictBucket = (track) => {
+    const t = String(track || '').toLowerCase();
+    if (t.includes('atelier')) return 'atelier';
+    if (t.includes('masterclass')) return 'masterclass';
+    return 'other';
+  };
+
+  const seen = new Map();
+  for (const s of normSessions) {
+    const start = s.startAt instanceof Date ? s.startAt : new Date(s.startAt);
+    const key = `${start.getTime()}|${conflictBucket(s.track)}`;
+    if (seen.has(key)) {
+      warn("SESSION_CONFLICT", {
+        at: String(s._id),
+        with: String(seen.get(key)?._id),
+        startAt: start,
+        bucket: conflictBucket(s.track),
+      });
+      return res.status(409).json({
+        message: 'Conflicting sessions selected for the same time/track family',
+        conflictAt: s._id,
+        conflictWith: seen.get(key)._id
+      });
+    }
+    seen.set(key, s);
+  }
+  log("SESSION_CONFLICT_CHECK: OK");
+
+  // -------- seat enforcement (MOVED BEFORE CREATE) --------
+  timeStart("attachSeatsAndEnforce");
+  try {
+    await attachSeatsAndEnforce({ normSessions, enforce: true });
+    log("attachSeatsAndEnforce: OK");
+  } catch (e) {
+    timeEnd("attachSeatsAndEnforce");
+    if (e && e.message === 'SESSION_FULL') {
+      warn("SESSION_FULL", { sessionId: e.sessionId });
+      return res.status(409).json({
+        message: 'One or more sessions are full',
+        fullSessionId: e.sessionId
+      });
+    }
+    error("attachSeatsAndEnforce: FAIL", e?.message);
+    throw e;
+  }
+  timeEnd("attachSeatsAndEnforce");
+
+  // -------- event capacity check (MOVED BEFORE CREATE) --------
+  timeStart("checkEventCapacity");
+  try {
+    const eventDoc = await Event.findById(eventId).lean();
+    if (!eventDoc) {
+      warn("EVENT_NOT_FOUND", { eventId });
+      return res.status(404).json({ message: 'Event not found' });
+    }
+    
+    if (eventDoc.seatsTaken >= eventDoc.seatsCapacity) {
+      warn("EVENT_FULL", { seatsTaken: eventDoc.seatsTaken, seatsCapacity: eventDoc.seatsCapacity });
+      return res.status(409).json({ message: 'Event is full' });
+    }
+    log("checkEventCapacity: OK");
+  } catch (e) {
+    error("checkEventCapacity: FAIL", e?.message);
+    throw e;
+  }
+  timeEnd("checkEventCapacity");
+
+  // ============================================================
+  // NOW CREATE THE ATTENDEE - ALL VALIDATIONS PASSED
+  // ============================================================
+  
   timeStart("attendee.create");
   const created = await attendee.create({
     personal: {
@@ -823,7 +910,7 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
       phone: toStr(phone).trim(),
       country: toStr(country).toUpperCase(),
       city: toStr(city).trim(),
-      gender: toStr(gender).trim(),
+      gender: toStr(gender).trim(), 
       profilePic: profilePicUrl,
       preferredLanguages
     },
@@ -862,78 +949,40 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
   const verifyLink = `${process.env.FRONTEND_URL}/verify-email?token=${raw}&role=attendee&id=${created._id}`;
   log("VERIFY_LINK_READY", { verifyLink });
 
-  // -------- sessions normalize & validate --------
-  timeStart("loadAndValidateSessions");
-  const normSessions = await loadAndValidateSessions(eventId, sessionIds).catch((e) => {
-    error("loadAndValidateSessions failed:", e?.message);
-    throw e;
-  });
-  timeEnd("loadAndValidateSessions");
-  log("SESSIONS_LOADED", {
-    count: normSessions.length,
-    ids: normSessions.map((s) => String(s._id)),
-  });
-
-  // -------- conflict system --------
-  const conflictBucket = (track) => {
-    const t = String(track || '').toLowerCase();
-    if (t.includes('atelier')) return 'atelier';
-    if (t.includes('masterclass')) return 'masterclass';
-    return 'other';
-  };
-
-  const seen = new Map();
-  for (const s of normSessions) {
-    const start = s.startAt instanceof Date ? s.startAt : new Date(s.startAt);
-    const key = `${start.getTime()}|${conflictBucket(s.track)}`;
-    if (seen.has(key)) {
-      warn("SESSION_CONFLICT", {
-        at: String(s._id),
-        with: String(seen.get(key)?._id),
-        startAt: start,
-        bucket: conflictBucket(s.track),
-      });
-      return res.status(409).json({
-        message: 'Conflicting sessions selected for the same time/track family',
-        conflictAt: s._id,
-        conflictWith: seen.get(key)._id
-      });
-    }
-    seen.set(key, s);
-  }
-  log("SESSION_CONFLICT_CHECK: OK");
-
-  // -------- seat enforcement --------
-  timeStart("attachSeatsAndEnforce");
-  try {
-    await attachSeatsAndEnforce({ normSessions, enforce: true }); // throws if any session is full
-    log("attachSeatsAndEnforce: OK");
-  } catch (e) {
-    timeEnd("attachSeatsAndEnforce");
-    if (e && e.message === 'SESSION_FULL') {
-      warn("SESSION_FULL", { sessionId: e.sessionId });
-      return res.status(409).json({
-        message: 'One or more sessions are full',
-        fullSessionId: e.sessionId
-      });
-    }
-    error("attachSeatsAndEnforce: FAIL", e?.message);
-    throw e;
-  }
-  timeEnd("attachSeatsAndEnforce");
-
   // -------- create regs + bump seats --------
   timeStart("createSessionRegs");
-  await createSessionRegs({ actorId: created._id, actorRole: 'attendee', eventId, sessions: normSessions }).catch((e) => {
+  try {
+    await createSessionRegs({ actorId: created._id, actorRole: 'attendee', eventId, sessions: normSessions });
+    log("createSessionRegs: OK");
+  } catch (e) {
     error("createSessionRegs failed:", e?.message);
+    // Rollback attendee
+    try {
+      await attendee.findByIdAndDelete(created._id);
+      log("ROLLBACK_ATTENDEE_OK (after createSessionRegs failure)");
+    } catch (e2) {
+      error("ROLLBACK_ATTENDEE_FAIL", e2?.message);
+    }
     throw e;
-  });
+  }
   timeEnd("createSessionRegs");
+  
   timeStart("bumpScheduleSeatsTaken");
-  await bumpScheduleSeatsTaken(normSessions.map(s => s._id), +1).catch((e) => {
+  try {
+    await bumpScheduleSeatsTaken(normSessions.map(s => s._id), +1);
+    log("bumpScheduleSeatsTaken: OK");
+  } catch (e) {
     error("bumpScheduleSeatsTaken failed:", e?.message);
+    // Rollback attendee and session registrations
+    try {
+      await attendee.findByIdAndDelete(created._id);
+      // Also need to delete session registrations here
+      log("ROLLBACK_ATTENDEE_OK (after bumpScheduleSeatsTaken failure)");
+    } catch (e2) {
+      error("ROLLBACK_ATTENDEE_FAIL", e2?.message);
+    }
     throw e;
-  });
+  }
   timeEnd("bumpScheduleSeatsTaken");
   normSessions.forEach(s => { delete s.__raw; });
 
@@ -948,19 +997,27 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
 
   // -------- build PDF --------
   timeStart("buildRegistrationPdf");
-  const pdf = await buildRegistrationPdf({ event: eventDoc, actor: created, role: 'attendee', sessions: normSessions }).catch((e) => {
+  let pdf;
+  try {
+    pdf = await buildRegistrationPdf({ event: eventDoc, actor: created, role: 'attendee', sessions: normSessions });
+    log("PDF_READY", { bytes: (pdf?.length ?? null) });
+  } catch (e) {
     error("buildRegistrationPdf failed:", e?.message);
+    // Rollback attendee
+    try {
+      await attendee.findByIdAndDelete(created._id);
+      await bumpScheduleSeatsTaken(normSessions.map(s => s._id), -1);
+      log("ROLLBACK_ATTENDEE_OK (after PDF failure)");
+    } catch (e2) {
+      error("ROLLBACK_ATTENDEE_FAIL", e2?.message);
+    }
     throw e;
-  });
+  }
   timeEnd("buildRegistrationPdf");
-  log("PDF_READY", { bytes: (pdf?.length ?? null) });
 
   // -------- email compose --------
   const brandLogoPath = process.env.BRAND_LOGO_PATH;
   const who = created?.personal?.fullName || 'there';
-
-  // (the existing HTML/template stays the same)
-  // ... building rowsHtml, hdr, sessionsHtml, html (unchanged) ...
 
   const rowsHtml = normSessions.map(s => {
     const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
@@ -995,7 +1052,7 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
       </div>
       <div style="font:600 12px/1.4 system-ui;color:#64748b">
         ${new Date(eventDoc.startDate||Date.now()).toLocaleDateString()} → ${new Date(eventDoc.endDate||Date.now()).toLocaleDateString()}
-        ${eventDoc.city ? `• ${escapeHtml(eventDoc.city)}` : ''} ${eventDoc.country ? `• ${escapeHtml(eventDoc.country)}` : ''}
+        ${eventDoc.city ? `• ${escapeHtml(eventDoc.city)}` : ''}${eventDoc.country ? ` • ${escapeHtml(eventDoc.country)}` : ''}
       </div>
     </div>`;
 
@@ -1045,22 +1102,31 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
 
   // -------- send email --------
   timeStart("sendMail");
-  await sendMail(
-    created.personal.email,
-    'GITS: Confirm your registration',
-    html,
-    'Please see the attached PDF for your registration details. Verify your email using the link inside.',
-    attachments
-  ).then(() => {
+  try {
+    await sendMail(
+      created.personal.email,
+      'GITS: Confirm your registration',
+      html,
+      'Please see the attached PDF for your registration details. Verify your email using the link inside.',
+      attachments
+    );
     log("EMAIL_SENT", {
       to: created.personal.email,
       attachments: attachments.length,
       hasLogoCID: !!brandLogoPath
     });
-  }).catch((e) => {
+  } catch (e) {
     error("EMAIL_FAIL", e?.message);
+    // Rollback attendee
+    try {
+      await attendee.findByIdAndDelete(created._id);
+      await bumpScheduleSeatsTaken(normSessions.map(s => s._id), -1);
+      log("ROLLBACK_ATTENDEE_OK (after email failure)");
+    } catch (e2) {
+      error("ROLLBACK_ATTENDEE_FAIL", e2?.message);
+    }
     throw e;
-  });
+  }
   timeEnd("sendMail");
 
   // -------- event seat increment --------
@@ -1071,7 +1137,13 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
   } catch (e) {
     timeEnd("incEventSeatsTakenOrThrow");
     error("incEventSeatsTakenOrThrow: FAIL -> rollback attendee", e?.message);
-    try { await attendee.findByIdAndDelete(created._id); log("ROLLBACK_ATTENDEE_OK"); } catch (e2) { error("ROLLBACK_ATTENDEE_FAIL", e2?.message); }
+    try {
+      await attendee.findByIdAndDelete(created._id);
+      await bumpScheduleSeatsTaken(normSessions.map(s => s._id), -1);
+      log("ROLLBACK_ATTENDEE_OK");
+    } catch (e2) {
+      error("ROLLBACK_ATTENDEE_FAIL", e2?.message);
+    }
     return res.status(409).json({ message: 'Event is full' });
   }
   timeEnd("incEventSeatsTakenOrThrow");
@@ -1107,11 +1179,6 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
   log("END_SUCCESS", { id: created._id?.toString(), role: 'attendee' });
   return res.status(201).json({ success: true, data: { id: created._id, role: 'attendee' } });
 });
-
-
-
-
-
 
 
 // local file path -> web URL (same idea you used in uploadProfilePic)
