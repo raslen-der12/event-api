@@ -60,7 +60,17 @@ router.post('/admin/scan/meet',         protect,  meetsCtrl.adminScanMeet);
 router.get('/admin/events/:eventId/sessions-mini', meetsCtrl.listEventSessionsMini);
 router.post('/admin/:id/gmeet', protect, meetsCtrl.adminGenerateGoogleMeetLink);
 router.get('/admin/virtuals', protect, meetsCtrl.adminListVirtualHybridWithLink);
-
+router.post('/admin/remind-pending',
+            protect, isAdmin, meetsCtrl.adminNudgePendingInvitesNow);
 // routes/meetRoutes.js (actors)
+router.get('/admin/events/:eventId/sessions/attendance',
+  protect,
+  meetsCtrl.adminListSessionAttendance);
 router.get('/meets/:meetId/vlink/:actorId', protect, meetsCtrl.actorGetVirtualLinkAndAttend);
+// Admin lists
+router.get('/admin/attendance', protect, meetsCtrl.adminListEventAttendance);
+router.get('/admin/meets/:eventId/attendance', protect, meetsCtrl.adminListMeetingAttendance);
+router.get('/feedback/pending', protect, meetsCtrl.actorGetPendingFeedback);
+router.post('/feedback/mark-shown', protect, meetsCtrl.actorMarkFeedbackShown);
+router.post('/feedback/submit', protect, meetsCtrl.actorSubmitFeedback);
 module.exports = router;

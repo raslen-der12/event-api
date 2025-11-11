@@ -3430,53 +3430,64 @@ exports.listSpeakersForEvent = asyncHdl(async (req, res) => {
 });
 
 exports.getAttendeesForMeeting = asyncHdl(async (req, res) => {
-  // === Auth: must have a logged-in actor (use token) ===
   const meId = req.user?._id || req.query.meId;
-  console.log(req.user);
   if (!mongoose.isValidObjectId(meId)) {
     return res.status(401).json({ message: "Auth required" });
   }
 
-  const { eventId, country, q } = req.query || {};
-  const onlyOpen = String(req.query?.onlyOpen ?? 'true').toLowerCase() !== 'false'; // default true
+  // resolve logged actor early (attendee/exhibitor/speaker)
+  let meDoc = null;
+  const roles = [{M: attendee}, {M: Exhibitor}, {M: Speaker}];
+  for (const r of roles) {
+    try { const d = await r.M.findById(meId).lean(); if (d) { meDoc = d; break; } } catch {}
+  }
+  if (!meDoc) return res.status(401).json({ message: "Auth required (actor not found)" });
 
-  // ---- Filters -----------------------------------------------------
+  // inputs
+  const country   = req.query?.country;
+  const q         = req.query?.q;
+  const onlyOpen  = String(req.query?.onlyOpen ?? "true").toLowerCase() !== "false";
+  const attendedOnly = (()=>{
+    if (typeof req.query.attendedOnly !== "undefined") {
+      return ["1","true","yes","y","on"].includes(String(req.query.attendedOnly).toLowerCase());
+    }
+    // your special date default (kept)
+    const d = new Date();
+    return d.getFullYear()===2025 && d.getMonth()===10 && d.getDate()===13;
+  })();
+
+  // eventId: query -> meDoc.id_event -> null
+  let eventId = null;
+  if (req.query.eventId && mongoose.isValidObjectId(req.query.eventId)) {
+    eventId = req.query.eventId;
+  } else if (mongoose.isValidObjectId(meDoc?.id_event)) {
+    eventId = String(meDoc.id_event);
+  }
+
+  // base match
   const match = {};
-  match['adminVerified'] = { $in: ['yes'] }; // only admin-verified or unset
-  if (eventId && mongoose.isValidObjectId(eventId)) {
-    match.id_event = new mongoose.Types.ObjectId(eventId);
-  }
-  if (country && String(country).trim()) {
-    match['personal.country'] = String(country).trim().toUpperCase();
-  }
-  if (onlyOpen) {
-    match['matchingIntent.openToMeetings'] = true;
-  }
-  if (q && String(q).trim()) {
-    const rx = new RegExp(String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-    match.$or = [
-      { 'personal.fullName': rx },
-      { 'organization.orgName': rx },
-      { 'organization.jobTitle': rx },
-      { 'matchingIntent.objectives': rx },
-      { 'links.linkedin': rx },
-      { 'links.website': rx },
-      { 'personal.preferredLanguages': rx },
-      { 'personal.email': rx },
-    ];
+  match['adminVerified'] = { $in: ['yes', true] };
+  if (eventId) match.id_event = new mongoose.Types.ObjectId(eventId);
+  if (country && String(country).trim()) match['personal.country'] = String(country).trim().toUpperCase();
+  if (onlyOpen) match['matchingIntent.openToMeetings'] = true;
+
+  // attended filter
+  if (attendedOnly) {
+    const cq = { actorRole: 'attendee' };
+    if (eventId) cq.eventId = new mongoose.Types.ObjectId(eventId);
+    const attendedIds = await EventCheckin.distinct('actorId', cq);
+    if (!attendedIds.length) return res.json({ success: true, data: [] });
+    match._id = { $in: attendedIds.map(id => new mongoose.Types.ObjectId(id)) };
   }
 
-  // ---- Limit -------------------------------------------------------
   const limit = Math.min(Math.max(parseInt(req.query.limit || '500', 10) || 500, 20), 2000);
 
-  // ---- Pull candidates (attendees only for this endpoint) ----------
   const rows = await attendee.aggregate([
     { $match: match },
     { $sort: { id_event: 1, 'personal.fullName': 1 } },
     {
       $project: {
-        _id: 1,
-        id_event: 1,
+        _id: 1, id_event: 1,
         verified:      { $ifNull: ['$verified', false] },
         adminVerified: { $ifNull: ['$adminVerified', false] },
         links: {
@@ -3490,11 +3501,7 @@ exports.getAttendeesForMeeting = asyncHdl(async (req, res) => {
           city:      { $ifNull: ['$personal.city',      '' ] },
           profilePic:{ $ifNull: ['$personal.profilePic','' ] },
           preferredLanguages: {
-            $cond: [
-              { $isArray: '$personal.preferredLanguages' },
-              '$personal.preferredLanguages',
-              []
-            ]
+            $cond: [{ $isArray: '$personal.preferredLanguages' }, '$personal.preferredLanguages', []]
           }
         },
         organization: {
@@ -3504,117 +3511,43 @@ exports.getAttendeesForMeeting = asyncHdl(async (req, res) => {
         businessProfile: {
           primaryIndustry: {
             $cond: [
-              { $isArray: '$businessProfile.primaryIndustry' },
-              '$businessProfile.primaryIndustry',
-              {
-                $cond: [
-                  { $gt: [ { $type: '$businessProfile.primaryIndustry' }, 'missing' ] },
-                  [ '$businessProfile.primaryIndustry' ],
-                  []
-                ]
-              }
+              { $isArray: '$businessProfile.primaryIndustry' }, '$businessProfile.primaryIndustry',
+              { $cond: [{ $gt: [ { $type: '$businessProfile.primaryIndustry' }, 'missing' ] }, [ '$businessProfile.primaryIndustry' ], []] }
             ]
           },
           offering: {
             $cond: [
-              { $isArray: '$businessProfile.offering' },
-              '$businessProfile.offering',
-              {
-                $cond: [
-                  { $gt: [ { $type: '$businessProfile.offering' }, 'missing' ] },
-                  [ '$businessProfile.offering' ],
-                  []
-                ]
-              }
+              { $isArray: '$businessProfile.offering' }, '$businessProfile.offering',
+              { $cond: [{ $gt: [ { $type: '$businessProfile.offering' }, 'missing' ] }, [ '$businessProfile.offering' ], []] }
             ]
           }
         },
         matchingIntent: {
           openToMeetings: { $toBool: { $ifNull: ['$matchingIntent.openToMeetings', false] } },
-          objectives: {
-            $cond: [
-              { $isArray: '$matchingIntent.objectives' },
-              '$matchingIntent.objectives',
-              []
-            ]
-          }
+          objectives: { $cond: [{ $isArray: '$matchingIntent.objectives' }, '$matchingIntent.objectives', []] }
         }
       }
     },
     { $limit: limit }
   ]);
 
-  // ---- Scoring (mirrors getSuggestedList) --------------------------
+  // scoring (unchanged from your version) …
   const toStr  = (v) => (v == null ? "" : String(v));
   const norm   = (s) => toStr(s).trim().toLowerCase();
   const arrify = (x) => (Array.isArray(x) ? x.filter(Boolean) : x ? [x] : []);
   const uniq   = (a) => Array.from(new Set((a || []).filter(Boolean)));
-  const words  = (x) =>
-    uniq(
-      arrify(x)
-        .flatMap((s) => String(s).split(/[,;/|]+|\s+/g))
-        .map(norm)
-        .filter((t) => t && t.length >= 2 && t !== "and" && t !== "or")
-    );
-  const langAliases = {
-    en: "english", eng: "english", english: "english",
-    fr: "french",  french: "french",
-    ar: "arabic",  arabic: "arabic",
-    es: "spanish", spanish: "spanish",
-    de: "german",  german: "german",
-    it: "italian", italian: "italian"
-  };
+  const words  = (x) => uniq(arrify(x).flatMap((s) => String(s).split(/[,;/|]+|\s+/g)).map(norm).filter((t) => t && t.length >= 2 && t !== "and" && t !== "or"));
+  const langAliases = { en:"english",eng:"english",english:"english", fr:"french",french:"french", ar:"arabic",arabic:"arabic", es:"spanish",spanish:"spanish", de:"german",german:"german", it:"italian",italian:"italian" };
   const langTokens = (x) => uniq(words(x).map((t) => langAliases[t] || t));
   const DEFAULT_PHOTO_RX = /\/default\/photodef\.png$/i;
 
-  // ---- Load "me" from token (attendee/exhibitor/speaker) -----------
-  let meDoc = null, meRole = null;
-  const roleTry = [
-    { role: 'attendee',  M: attendee },
-    { role: 'exhibitor', M: Exhibitor },
-    { role: 'speaker',   M: Speaker },
-  ];
-  for (const t of roleTry){
-    try {
-      const d = await t.M.findById(meId).lean().catch(() => null);
-      if (d) { meDoc = d; meRole = t.role; break; }
-    } catch {}
-  }
-  if (!meDoc) {
-    // If we can't resolve the actor from token, fail (this page requires it)
-    return res.status(401).json({ message: "Auth required (actor not found)" });
-  }
-
-  const read = (obj, path) =>
-    String(path || '')
-      .split('.')
-      .reduce((o, k) => (o && o[k] !== undefined && o[k] !== null ? o[k] : undefined), obj);
-
+  const read = (obj, path) => String(path||'').split('.').reduce((o,k)=> (o&&o[k]!==undefined&&o[k]!==null?o[k]:undefined), obj);
   const meV = (() => {
-    const rawLangs =
-      read(meDoc, 'personal.preferredLanguages') ??
-      read(meDoc, 'identity.preferredLanguages') ??
-      read(meDoc, 'talk.language') ?? [];
-    const rawIndustries =
-      read(meDoc, 'businessProfile.primaryIndustry') ??
-      read(meDoc, 'business.industry') ??
-      read(meDoc, 'b2bIntent.businessSector') ?? [];
-    const rawOffering =
-      read(meDoc, 'businessProfile.offering') ??
-      read(meDoc, 'commercial.offering') ??
-      read(meDoc, 'b2bIntent.offering') ?? [];
-    const rawLooking =
-      read(meDoc, 'matchingIntent.objectives') ??
-      read(meDoc, 'commercial.lookingFor') ??
-      read(meDoc, 'b2bIntent.lookingFor') ?? [];
-
-    return {
-      looking:    words(arrify(rawLooking)),
-      offering:   words(arrify(rawOffering)),
-      industries: words(arrify(rawIndustries)),
-      languages:  uniq(langTokens(arrify(rawLangs))),
-      regions:    []
-    };
+    const rawLangs = read(meDoc,'personal.preferredLanguages') ?? read(meDoc,'identity.preferredLanguages') ?? read(meDoc,'talk.language') ?? [];
+    const rawIndustries = read(meDoc,'businessProfile.primaryIndustry') ?? read(meDoc,'business.industry') ?? read(meDoc,'b2bIntent.businessSector') ?? [];
+    const rawOffering = read(meDoc,'businessProfile.offering') ?? read(meDoc,'commercial.offering') ?? read(meDoc,'b2bIntent.offering') ?? [];
+    const rawLooking = read(meDoc,'matchingIntent.objectives') ?? read(meDoc,'commercial.lookingFor') ?? read(meDoc,'b2bIntent.lookingFor') ?? [];
+    return { looking: words(arrify(rawLooking)), offering: words(arrify(rawOffering)), industries: words(arrify(rawIndustries)), languages: uniq(langTokens(arrify(rawLangs))), regions: [] };
   })();
 
   const scorePair = (mine, other) => {
@@ -3622,62 +3555,40 @@ exports.getAttendeesForMeeting = asyncHdl(async (req, res) => {
     const syn = (t)=>({partners:"partnership",partner:"partnership",investment:"investor",invest:"investor",hire:"recruitment",recruit:"recruitment"}[t]||t);
     const meL = mine.looking.map(syn), meO = mine.offering.map(syn);
     const otL = other.looking.map(syn), otO = other.offering.map(syn);
-    const lxo = meL.filter((t) => otO.includes(t)).length; s += lxo * 5.5;
-    const oxl = meO.filter((t) => otL.includes(t)).length; s += oxl * 4.5;
-    const ind = mine.industries.filter((t) => other.industries.includes(t)).length; s += ind * 3;
-    const lng = mine.languages.filter((t) => other.languages.includes(t)).length; s += lng * 1.5;
+    s += meL.filter((t)=> otO.includes(t)).length * 5.5;
+    s += meO.filter((t)=> otL.includes(t)).length * 4.5;
+    s += mine.industries.filter((t)=> other.industries.includes(t)).length * 3;
+    s += mine.languages.filter((t)=> other.languages.includes(t)).length * 1.5;
     return s;
   };
 
-  // Build vectors & compute score for each attendee
   const now = Date.now();
   const scored = rows.map((r) => {
-    const languages  = uniq(langTokens(r?.personal?.preferredLanguages || []));
-    const industries = words(r?.businessProfile?.primaryIndustry || []);
-    const offering   = words(r?.businessProfile?.offering || []);
-    const looking    = words(r?.matchingIntent?.objectives || []);
-    const vec = { languages, industries, offering, looking, regions: [] };
+   const languages  = uniq(langTokens(r?.personal?.preferredLanguages || []));
+   const industries = words(r?.businessProfile?.primaryIndustry || []);
+   const offering   = words(r?.businessProfile?.offering || []);
+   const looking    = words(r?.matchingIntent?.objectives || []);
+   const vec = { languages, industries, offering, looking, regions: [] };
 
-    let score = scorePair(meV, vec);
-
-    const hasPhoto = !!r?.personal?.profilePic && !DEFAULT_PHOTO_RX.test(String(r?.personal?.profilePic || ""));
-    const verifiedBoost =
-      (r?.verified ? 1 : 0) + ((r?.adminVerified === 'yes' || r?.adminVerified === true) ? 0.5 : 0);
-    const completeness =
-      [
-        r?.personal?.fullName,
-        offering.length ? 'x' : '',
-        industries.length ? 'x' : '',
-        languages.length ? 'x' : '',
-        looking.length ? 'x' : '',
-      ].filter(Boolean).length / 5;
-
-    const updated = now; // aggregated rows may not carry updatedAt reliably
-    const recency = 0.5 + 0.5 * Math.exp(-(now - updated) / (1000 * 60 * 60 * 24 * 60));
-
-    score = score * 1.0 + verifiedBoost * 2.0 + completeness * 3.0 + recency * 1.0;
-    score *= hasPhoto ? 1.05 : 0.72;
-    score *= 0.97 + Math.random() * 0.06;
-
-    return { ...r, _rawScore: Math.max(1e-6, score) };
+   let score = scorePair(meV, vec);
+   const hasPhoto = !!r?.personal?.profilePic && !DEFAULT_PHOTO_RX.test(String(r?.personal?.profilePic || ""));
+   const verifiedBoost = (r?.verified ? 1 : 0) + ((r?.adminVerified === 'yes' || r?.adminVerified === true) ? 0.5 : 0);
+   const completeness = [r?.personal?.fullName, offering.length ? 'x':'' , industries.length ? 'x':'' , languages.length ? 'x':'' , looking.length ? 'x':'' ].filter(Boolean).length / 5;
+   const updated = now;
+   const recency = 0.5 + 0.5 * Math.exp(-(now - updated) / (1000*60*60*24*60));
+   score = score * 1.0 + verifiedBoost * 2.0 + completeness * 3.0 + recency * 1.0;
+   score *= hasPhoto ? 1.05 : 0.72;
+   score *= 0.97 + Math.random() * 0.06;
+   return { ...r, _rawScore: Math.max(1e-6, score) };
   });
 
-  // Normalize 0..100 and sort desc
   const min = Math.min(...scored.map(x => x._rawScore));
   const max = Math.max(...scored.map(x => x._rawScore));
   const normScore = (x, lo, hi) => (hi <= lo ? 1 : (x - lo) / (hi - lo));
-  const withPct = scored.map(r => ({
-    ...r,
-    matchPct: Math.round(normScore(r._rawScore, min, max) * 100)
-  }));
-  withPct.sort((a,b) =>
-    (b.matchPct - a.matchPct) ||
-    String(a.personal.fullName).localeCompare(String(b.personal.fullName))
-  );
+  const withPct = scored.map(r => ({ ...r, matchPct: Math.round(normScore(r._rawScore, min, max) * 100) }));
+  withPct.sort((a,b) => (b.matchPct - a.matchPct) || String(a.personal.fullName).localeCompare(String(b.personal.fullName)));
 
-  // Remove temp
   const out = withPct.map(({ _rawScore, ...rest }) => rest);
-
   return res.json({ success: true, data: out });
 });
 const uniqById = (arr) => {

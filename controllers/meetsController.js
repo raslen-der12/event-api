@@ -102,6 +102,40 @@ const SessionAttendance =
       { versionKey: false, timestamps: false }
     )
   );
+  const FeedbackPrompt = mongoose.models.FeedbackPrompt || mongoose.model(
+  'FeedbackPrompt',
+  new mongoose.Schema({
+    eventId : { type: mongoose.Schema.Types.ObjectId, ref: 'event', index: true },
+    kind    : { type: String, enum: ['meet','session','event'], required: true, index: true },
+    refId   : { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, // meetId/sessionId/eventId
+    actorId : { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
+    role    : { type: String, enum: ['attendee','exhibitor','speaker','admin'], required: true },
+
+    dueAt   : { type: Date, required: true, index: true },
+    status  : { type: String, enum: ['pending','shown','completed','expired'], default: 'pending', index: true },
+    shownAt : { type: Date },
+    completedAt: { type: Date },
+
+    // dedupe safety (one prompt per ref per actor)
+  }, { timestamps: true })
+    .index({ kind:1, refId:1, actorId:1 }, { unique: true })
+);
+
+const FeedbackResponse = mongoose.models.FeedbackResponse || mongoose.model(
+  'FeedbackResponse',
+  new mongoose.Schema({
+    promptId: { type: mongoose.Schema.Types.ObjectId, ref: 'FeedbackPrompt', required: true, index: true },
+    eventId : { type: mongoose.Schema.Types.ObjectId, ref: 'event', index: true },
+    kind    : { type: String, enum: ['meet','session','event'], required: true, index: true },
+    refId   : { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
+    actorId : { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
+    role    : { type: String, enum: ['attendee','exhibitor','speaker','admin'], required: true },
+
+    stars   : { type: Number, min:1, max:5, required: true },
+    comment : { type: String, trim: true, maxlength: 1000 },
+  }, { timestamps: true })
+);
+
 
 function resolveActorModel(role) {
   switch (String(role || "").toLowerCase()) {
@@ -2705,7 +2739,9 @@ exports.makeMeetingAction = asyncHandler(async (req, res) => {
       console.error("[notif][makeMeetingAction]", e?.message || e);
     }
   try {
-    if (act === "confirm") await sendConfirmEmailsWithPDF(updated);
+    if (act === "confirm"){ await sendConfirmEmailsWithPDF(updated); await scheduleMeetingReminder(updated);
+}
+    
     else if (act === "reject") await sendActionEmail(updated, "rejected");
     else if (act === "reschedule")
       await sendActionEmail(updated, "rescheduled");
@@ -3783,54 +3819,56 @@ const JOB_NAME = "meeting:remind";
 let agenda; // Agenda instance shared by all modules
 
 /* ───────────────────── init – call from server.js ────────────────── */
-exports.initMeetingReminderEngine = (app) => {
+exports.initMeetingReminderEngine = async (app) => {
   if (agenda) return; // avoid double-init in dev hot-reload
+
+  const mongoUri = process.env.REMINDER_DB_URI || process.env.MONGO_URI;
+  if (!mongoUri) throw new Error("Missing REMINDER_DB_URI (or MONGO_URI) for Agenda");
+
   agenda = new Agenda({
-    db: {
-      address: process.env.REMINDER_DB_URI,
-      collection: "agendaJobs",
-    },
+    db: { address: mongoUri, collection: "agendaJobs" },
   });
 
-  /* define once */
+  /* existing 1h-before job */
   agenda.define(JOB_NAME, async (job) => {
-    const { meetingId } = job.attrs.data;
+    const { meetingId } = job.attrs.data || {};
     const meet = await MeetRequest.findById(meetingId).lean();
-    if (!meet || meet.status !== "accepted") return job.remove(); // no longer valid
+    // Use the real confirmed meeting
+    if (!meet || meet.status !== "confirmed") return job.remove();
 
     const event = await Event.findById(meet.eventId).lean();
     if (!event) return job.remove();
 
     const [sDoc, rDoc] = await Promise.all([
-      ROLE_MODEL[meet.senderRole].findById(meet.senderId).lean(),
-      ROLE_MODEL[meet.receiverRole].findById(meet.receiverId).lean(),
+      ROLE_MODEL[meet.senderRole]?.findById(meet.senderId).lean(),
+      ROLE_MODEL[meet.receiverRole]?.findById(meet.receiverId).lean(),
     ]);
+
     const emailOf = (doc, role) =>
-      role === "exhibitor" ? doc.identity.email : doc.personal.email;
+      role === "exhibitor" ? doc?.identity?.email : doc?.personal?.email;
+
+    const whenText = new Date(meet.slotISO || meet.requestedAt).toUTCString();
 
     await Promise.all([
       sendMail(
         emailOf(sDoc, meet.senderRole),
-        `Reminder: your meeting in 1 hour`,
-        `<p>This is a reminder: <strong>${meet.subject}</strong><br/>
-         Time: ${new Date(meet.requestedAt).toUTCString()}</p>`
+        "Reminder: your meeting in 1 hour",
+        `<p>This is a reminder for your B2B meeting.</p><p>Time: ${whenText}</p>`
       ),
       sendMail(
         emailOf(rDoc, meet.receiverRole),
-        `Reminder: your meeting in 1 hour`,
-        `<p>This is a reminder for your meeting with
-         ${sDoc.personal?.fullName || sDoc.identity?.exhibitorName}.<br/>
-         Time: ${new Date(meet.requestedAt).toUTCString()}</p>`
+        "Reminder: your meeting in 1 hour",
+        `<p>This is a reminder for your B2B meeting.</p><p>Time: ${whenText}</p>`
       ),
     ]);
   });
 
-  agenda.on("ready", () => agenda.start());
+
   app.locals.agenda = agenda;
 };
 
 /* ────────────────── helper to schedule one reminder ──────────────── */
-exports.scheduleMeetingReminder = async (meetDoc) => {
+const scheduleMeetingReminder = async (meetDoc) => {
   if (!agenda) return; // ensure init called
 
   /* F  ire 60 min before meeting start */
@@ -3845,6 +3883,7 @@ exports.scheduleMeetingReminder = async (meetDoc) => {
     .schedule(runAt)
     .save();
 };
+exports.scheduleMeetingReminder = scheduleMeetingReminder;
 
 /* ─────────────── GET /meets/reminders/:eventId (admin) ───────────── */
 exports.listMeetingReminders = asyncHandler(async (req, res) => {
@@ -5427,9 +5466,22 @@ exports.adminScanActorAttend = asyncHandler(async (req, res) => {
     },
     { upsert: true }
   );
+  try {
+    await scheduleFeedbackPrompt({
+      kind: 'event',
+      eventId,
+      actorId,
+      refId: eventId,
+      role: role,
+      at: new Date(Date.now() + 60 * 60 * 1000),
+    });
+    console.log("[feedback][queued] kind=event ref=%s actor=%s", String(eventId), String(actorId));
 
+  } catch (e) {
+    console.error('[feedback][event] schedule failed:', e?.message || e);
+  }
   const count = await EventCheckin.countDocuments({ eventId });
-
+  
   return res.json({
     success: true,
     data: {
@@ -5552,7 +5604,19 @@ exports.adminScanSession = asyncHandler(async (req, res) => {
   }
 
   const sessionCheckins = await SessionAttendance.countDocuments({ sessionId });
-
+  try {
+      await scheduleFeedbackPrompt({
+        kind: 'session',
+        eventId,
+        refId: sessionId,
+        actorId,
+        role: role,
+        at: new Date(Date.now() + 60 * 60 * 1000),
+      });
+      console.log("[feedback][queued] kind=session ref=%s actor=%s", String(sessionId), String(actorId));
+    } catch (e) {
+      console.error('[feedback][session] schedule failed:', e?.message || e);
+    }
   return res.json({
     success: true,
     data: {
@@ -5666,7 +5730,21 @@ exports.adminScanMeet = asyncHandler(async (req, res) => {
     { _id: meetId, "firstArrived.actorId": { $exists: false } },
     { $set: { firstArrived: { actorId: youId, at: new Date() } } }
   );
+  try {
+    await scheduleFeedbackPrompt({
+      kind: 'meet',
+      eventId: meet.eventId,
+      meetId,
+      actorId: youId,
+      role: youRole,
+      refId: meetId,
+      at: new Date(Date.now() + 60 * 60 * 1000),
+    });
+    console.log("[feedback][queued] kind=meet ref=%s actor=%s", String(meetId), String(youId));
 
+  } catch (e) {
+    console.error('[feedback][meet] schedule failed:', e?.message || e);
+  }
   // recompute final state
   const state = await readState();
 
@@ -6111,3 +6189,662 @@ exports.adminListVirtualHybridWithLink = asyncHandler(async (req, res) => {
 
   return res.json({ success: true, count: out.length, data: out });
 });
+const JOB_NUDGE_PENDING = "meeting:pending-nudge";
+
+/** Internal: scan all pending-like requests and email receivers once */
+async function _sendPendingInvitesNudges({ eventId } = {}) {
+  // pending buckets
+  const PENDING_ST = ["pending", "reschedule-proposed"];
+
+  const q = { status: { $in: PENDING_ST } };
+  if (eventId) q.eventId = eventId;
+
+  // We only need who must take action => the receiver
+  const list = await MeetRequest.find(q)
+    .select("receiverId receiverRole eventId")
+    .lean();
+
+  if (!list.length) return { scanned: 0, recipients: 0, sent: 0 };
+
+  // de-dup per actor (role+id)
+  const uniqKeys = new Set(list.map(r => `${r.receiverRole}:${r.receiverId}`));
+
+  // resolve docs+emails
+  const recipients = [];
+  for (const key of uniqKeys) {
+    const [role, id] = key.split(":");
+    const Model = ROLE_MODEL[role];
+    if (!Model) continue;
+    const doc = await Model.findById(id).lean();
+    if (!doc) continue;
+    const email =
+      role === "exhibitor" ? doc?.identity?.email : doc?.personal?.email;
+    const displayName =
+      role === "exhibitor"
+        ? (doc?.identity?.exhibitorName || doc?.name || "there")
+        : (doc?.personal?.fullName || "there");
+    if (!email) continue;
+    recipients.push({ key, role, id, email, displayName });
+  }
+
+  // Compose once
+  const FRONT =
+    process.env.MEETINGS_URL+"/meetings" ||
+    process.env.FRONTEND_URL+"/meetings" ||
+    process.env.FRONT_URL+"/meetings" ||
+    "https://eventra.cloud/meetings";
+  const subject = "You have pending B2B meeting invitations";
+  const html = `
+    <p>Hello,</p>
+    <p>We noticed that you still have pending B2B meeting invitations on the platform.</p>
+    <p>Please take a moment to review and confirm your invitations before they expire, this ensures you don’t miss valuable networking opportunities during the event.</p>
+    <p>To do so, simply log in to your Eventra account, go to <em>“View Meetings”</em> under your profile, and check your pending invitations.</p>
+    <p>If you need any assistance, feel free to reach out to our support team.<br/>
+    Let’s make your B2B experience a success!</p>
+    <p>Best regards,<br/>The Eventra Team</p>
+    <p><a href="${FRONT}" target="_blank" rel="noopener noreferrer">View Meetings</a></p>
+  `;
+
+  let sent = 0;
+  await Promise.all(
+    recipients.map((r) =>
+      sendMail(r.email, subject, html).then(() => (sent += 1))
+    )
+  );
+
+  return { scanned: list.length, recipients: recipients.length, sent };
+}
+
+/** POST /api/admin/meets/remind-pending[?eventId=...]  (admin) */
+// --- ADMIN: send reminder emails to all actors who still have pending meeting invites.
+// POST /meets/admin/remind-pending?eventId=<optional>
+exports.adminNudgePendingInvitesNow = asyncHandler(async (req, res) => {
+  if (!req.user || String(req.user.role) !== 'admin') {
+    return res.status(403).json({ ok:false, error:'Admin only' });
+  }
+
+  const eventId = req.query.eventId && isId(req.query.eventId) ? req.query.eventId : null;
+
+  // pending buckets we consider “needs nudge”
+  const match = { status: { $in: ['pending', 'reschedule-proposed'] } };
+  if (eventId) match.eventId = eventId;
+
+  const meets = await MeetRequest.find(match)
+    .select('_id eventId senderId senderRole receiverId receiverRole')
+    .lean();
+
+  // collect unique actors (avoid spamming same person if they have many pending)
+  const byRole = { attendee:new Set(), exhibitor:new Set(), speaker:new Set() };
+  for (const m of meets) {
+    byRole[m.senderRole]?.add(String(m.senderId));
+    byRole[m.receiverRole]?.add(String(m.receiverId));
+  }
+
+  // hydrate actors by role in bulk
+  const roleDocs = {};
+  await Promise.all(Object.keys(byRole).map(async role => {
+    const ids = Array.from(byRole[role]);
+    const Model = ROLE_MODEL[role];
+    if (!Model || !ids.length) { roleDocs[role] = {}; return; }
+    const docs = await Model.find({ _id: { $in: ids } }).lean();
+    const map = {};
+    docs.forEach(d => { map[String(d._id)] = d; });
+    roleDocs[role] = map;
+  }));
+
+  // email extractor per role
+  const emailOf = (doc, role) => {
+    if (!doc) return '';
+    if (role === 'exhibitor') return doc.identity?.email || '';
+    if (role === 'speaker')   return doc.personal?.email || '';
+    return doc.personal?.email || ''; // attendee default
+  };
+  const FRONT =
+    "https://eventra.cloud/meetings";
+  const subject = 'Reminder: you have pending B2B meetings';
+  const html = `
+    <p>Hello,</p>
+    <p>We noticed that you still have pending B2B meeting invitations on the platform.</p>
+    <p>Please take a moment to review and confirm your invitations before they expire, this ensures you don’t miss valuable networking opportunities during the event.</p>
+    <p>To do so, simply log in to your Eventra account, go to <em>“View Meetings”</em> under your profile, and check your pending invitations.</p>
+    <p>If you need any assistance, feel free to reach out to our support team.<br/>
+    Let’s make your B2B experience a success!</p>
+    <p>Best regards,<br/>The Eventra Team</p>
+    <p><a href="${FRONT}" target="_blank" rel="noopener noreferrer">View Meetings</a></p>
+  `;
+
+  let targeted = 0, sent = 0, skipped = 0;
+  for (const role of Object.keys(byRole)) {
+    for (const actorId of byRole[role]) {
+      targeted += 1;
+      try {
+        const doc = roleDocs[role]?.[actorId];
+        const to = emailOf(doc, role);
+        if (!to) { skipped += 1; continue; }
+        await sendMail(to, subject, html);
+        sent += 1;
+      } catch (e) {
+        skipped += 1;
+      }
+    }
+  }
+
+  return res.json({
+    ok: true,
+    scope: eventId ? { eventId } : 'all-events',
+    matchedMeets: meets.length,
+    targetedActors: targeted,
+    sent,
+    skipped
+  });
+});
+
+exports.adminListSessionAttendance = asyncHandler(async (req, res) => {
+  const eventId   = req.params.eventId || req.query.eventId;
+  const sessionId = req.params.sessionId || req.query.sessionId;
+  const qTxt      = String(req.query.q || "").trim();
+  const includeEmpty = String(req.query.includeEmpty || "") === "1";
+
+  if (!mongoose.isValidObjectId(eventId)) {
+    return res.status(400).json({ message: "Bad eventId" });
+  }
+
+  const $match = { eventId: new mongoose.Types.ObjectId(eventId) };
+  if (sessionId && mongoose.isValidObjectId(sessionId)) {
+    $match.sessionId = new mongoose.Types.ObjectId(sessionId);
+  }
+
+  // 1) Load all scans for the event (or session)
+  const scans = await SessionAttendance.find($match).sort({ at: -1 }).lean();
+
+  // 2) Collect ids for batching
+  const sessionIds = Array.from(new Set(scans.map(s => String(s.sessionId))));
+  const roleIds = { attendee: new Set(), exhibitor: new Set(), speaker: new Set() };
+  for (const s of scans) {
+    const r = String(s.actorRole || "").toLowerCase();
+    if (roleIds[r]) roleIds[r].add(String(s.actorId));
+  }
+
+  // 3) Load sessions meta
+  const sesIdsForQuery = sessionId
+    ? [new mongoose.Types.ObjectId(sessionId)]
+    : sessionIds.map(id => new mongoose.Types.ObjectId(id));
+
+  const sessions = await EventSchedule.find(
+      sesIdsForQuery.length ? { _id: { $in: sesIdsForQuery } } : { id_event: new mongoose.Types.ObjectId(eventId) }
+    )
+    .select("_id sessionTitle startTime endTime room roomId track")
+    .sort({ startTime: 1, _id: 1 })
+    .lean();
+
+  // 4) Load actors by role (only the ones scanned)
+  const [attDocs, exDocs, spDocs] = await Promise.all([
+    roleIds.attendee.size
+      ? attendee.find({ _id: { $in: Array.from(roleIds.attendee) } })
+          .select("_id personal.fullName personal.email")
+          .lean()
+      : [],
+    roleIds.exhibitor.size
+      ? Exhibitor.find({ _id: { $in: Array.from(roleIds.exhibitor) } })
+          .select("_id identity.exhibitorName identity.email")
+          .lean()
+      : [],
+    roleIds.speaker.size
+      ? Speaker.find({ _id: { $in: Array.from(roleIds.speaker) } })
+          .select("_id personal.fullName personal.email")
+          .lean()
+      : [],
+  ]);
+
+  // 5) Index helpers
+  const mapById = (arr) => {
+    const m = new Map();
+    for (const d of arr || []) m.set(String(d._id), d);
+    return m;
+  };
+  const sessionMap = mapById(sessions);
+  const attMap = mapById(attDocs);
+  const exMap  = mapById(exDocs);
+  const spMap  = mapById(spDocs);
+
+  const labelFor = (role, doc) => {
+    if (!doc) return { name: "—", email: "" };
+    if (role === "exhibitor") {
+      return { name: doc.identity?.exhibitorName || "Exhibitor", email: doc.identity?.email || "" };
+    }
+    return { name: doc.personal?.fullName || (role === "speaker" ? "Speaker" : "Attendee"),
+             email: doc.personal?.email || "" };
+  };
+
+  // 6) Group scans under their session
+  const groups = new Map();
+  for (const s of scans) {
+    const sid = String(s.sessionId);
+    const sess = sessionMap.get(sid);
+    if (!sess) continue;
+
+    const g = groups.get(sid) || {
+      sessionId: sid,
+      title: sess.sessionTitle || "Session",
+      startAt: sess.startTime || null,
+      endAt:   sess.endTime   || null,
+      room:    sess.room || null,
+      track:   sess.track || "",
+      attendees: []
+    };
+
+    let doc;
+    if (s.actorRole === "exhibitor") doc = exMap.get(String(s.actorId));
+    else if (s.actorRole === "speaker") doc = spMap.get(String(s.actorId));
+    else doc = attMap.get(String(s.actorId));
+
+    const { name, email } = labelFor(s.actorRole, doc);
+    g.attendees.push({
+      actorId: String(s.actorId),
+      role: s.actorRole,
+      name,
+      email,
+      at: s.at,
+      by: s.by ? String(s.by) : null,
+    });
+
+    groups.set(sid, g);
+  }
+
+  // 7) Optionally include empty sessions (no scans yet)
+  if (includeEmpty) {
+    for (const sess of sessions) {
+      const sid = String(sess._id);
+      if (!groups.has(sid)) {
+        groups.set(sid, {
+          sessionId: sid,
+          title: sess.sessionTitle || "Session",
+          startAt: sess.startTime || null,
+          endAt:   sess.endTime   || null,
+          room:    sess.room || null,
+          track:   sess.track || "",
+          attendees: []
+        });
+      }
+    }
+  }
+
+  // 8) Text filter (name/email)
+  const q = qTxt.toLowerCase();
+  let data = Array.from(groups.values()).sort((a,b) => (a.startAt || 0) - (b.startAt || 0));
+
+  if (q) {
+    data = data
+      .map(g => ({
+        ...g,
+        attendees: g.attendees.filter(a =>
+          (a.name || "").toLowerCase().includes(q) || (a.email || "").toLowerCase().includes(q)
+        )
+      }))
+      .filter(g => g.attendees.length);
+  }
+
+  return res.json({ success: true, count: data.length, data });
+});
+
+exports.adminListEventAttendance = asyncHandler(async (req, res) => {
+  const eventId = req.query.eventId && isId(req.query.eventId) ? req.query.eventId : null;
+  const q = String(req.query.q || '').trim().toLowerCase();
+  if (!eventId) return res.status(400).json({ ok: false, error: 'eventId required' });
+
+  // Pull scans and sort by newest first. NOTE: EventCheckin uses { actorRole, at, by }
+  const scans = await EventCheckin
+    .find({ eventId })
+    .sort({ at: -1 })
+    .lean();
+
+  // Group actor ids by role from scan docs (role key is s.actorRole)
+  const idsByRole = scans.reduce((acc, s) => {
+    const role = String(s.actorRole || '').toLowerCase();
+    if (!role) return acc;
+    if (!acc[role]) acc[role] = new Set();
+    acc[role].add(String(s.actorId));
+    return acc;
+  }, {});
+
+  // Bulk fetch minimal docs per role
+  const roleDocs = {};
+  await Promise.all(
+    Object.keys(idsByRole).map(async (role) => {
+      const ids = Array.from(idsByRole[role]);
+      const Model = (typeof resolveActorModel === 'function')
+        ? resolveActorModel(role)
+        : (ROLE_MODEL ? ROLE_MODEL[role] : null);
+      if (!Model || ids.length === 0) { roleDocs[role] = {}; return; }
+
+      const docs = await Model
+        .find({ _id: { $in: ids } })
+        .lean();
+
+      const map = {};
+      docs.forEach(d => { map[String(d._id)] = d; });
+      roleDocs[role] = map;
+    })
+  );
+
+  // Normalize a doc into {name, org, email}
+  const normActor = (role, doc) => {
+    if (!doc) return { name: '', org: '', email: '' };
+
+    // exhibitor
+    if (role === 'exhibitor') {
+      return {
+        name:  doc.identity?.contactName || doc.identity?.exhibitorName || '',
+        org:   doc.identity?.exhibitorName || doc.identity?.orgName || '',
+        email: doc.identity?.email || ''
+      };
+    }
+
+    // speaker
+    if (role === 'speaker') {
+      return {
+        name:  doc.personal?.fullName || '',
+        org:   doc.organization?.orgName || '',
+        email: doc.personal?.email || ''
+      };
+    }
+
+    // attendee (default)
+    return {
+      name:  doc.personal?.fullName || '',
+      org:   doc.organization?.orgName || '',
+      email: doc.personal?.email || ''
+    };
+  };
+
+  // Shape response rows
+  const data = scans.map((s) => {
+    const role = String(s.actorRole || '').toLowerCase();
+    const id   = String(s.actorId || '');
+    const doc  = roleDocs[role]?.[id];
+    const meta = normActor(role, doc);
+
+    return {
+      actorId  : id,
+      role     : role,
+      name     : meta.name,
+      org      : meta.org,
+      email    : meta.email,
+      scannedAt: s.at || s.scannedAt || s.createdAt || null,
+      scannerId: s.by || s.scannerId || null,
+      source   : s.source || 'qr',
+    };
+  });
+
+  // Count by role
+  const byRole = data.reduce((acc, r) => {
+    acc[r.role] = (acc[r.role] || 0) + 1;
+    return acc;
+  }, { attendee: 0, exhibitor: 0, speaker: 0 });
+
+  // Optional text filter
+  const filtered = q
+    ? data.filter(x => (`${x.name} ${x.org} ${x.email} ${x.role}`).toLowerCase().includes(q))
+    : data;
+
+  res.json({
+    ok: true,
+    eventId,
+    total: filtered.length,
+    byRole,
+    data: filtered,
+  });
+});
+
+
+
+exports.adminListMeetingAttendance = asyncHandler(async (req, res) => {
+  const eventId = req.params.eventId || req.query.eventId && isId(req.query.eventId) ? req.query.eventId : null;
+  const q = String(req.query.q || '').trim().toLowerCase();
+  if (!eventId) return res.status(400).json({ ok: false, error: 'eventId required' });
+
+  // Pull accepted/active meets for the event
+  const meets = await MeetRequest.find({
+    eventId,
+    status: { $in: ['accepted', 'confirmed', 'rescheduled'] }
+  })
+    .select('_id subject slotISO requestedAt senderId senderRole receiverId receiverRole vmeetLink')
+    .sort({ slotISO: -1, requestedAt: -1 })
+    .lean();
+
+  const meetIds = meets.map((m) => m._id);
+  const allAttendance = meetIds.length
+    ? await MeetingAttendance.find({ meetId: { $in: meetIds } }).lean()
+    : [];
+
+  // collect all actorIds by role to hydrate once
+  const need = { attendee: new Set(), exhibitor: new Set(), speaker: new Set() };
+  for (const m of meets) {
+    if (m.senderRole && ROLE_MODEL[m.senderRole]) need[m.senderRole].add(String(m.senderId));
+    if (m.receiverRole && ROLE_MODEL[m.receiverRole]) need[m.receiverRole].add(String(m.receiverId));
+  }
+  for (const a of allAttendance) {
+    if (a.role && ROLE_MODEL[a.role]) need[a.role].add(String(a.actorId));
+  }
+
+  const roleDocs = {};
+  await Promise.all(
+    Object.keys(need).map(async (role) => {
+      const Model = ROLE_MODEL[role];
+      if (!Model) { roleDocs[role] = {}; return; }
+      const ids = Array.from(need[role]);
+      if (!ids.length) { roleDocs[role] = {}; return; }
+      const docs = await Model.find({ _id: { $in: ids } })
+        .select('personal organization identity') // minimal
+        .lean();
+      const map = {};
+      docs.forEach((d) => { map[String(d._id)] = d; });
+      roleDocs[role] = map;
+    })
+  );
+
+  const normActor = (role, doc) => {
+    if (!doc) return { name: '', org: '', email: '' };
+    if (role === 'exhibitor') {
+      return {
+        name: doc.identity?.contactName || doc.identity?.exhibitorName || '',
+        org: doc.identity?.exhibitorName || doc.identity?.orgName || '',
+        email: doc.identity?.email || '',
+      };
+    }
+    if (role === 'speaker') {
+      return {
+        name: doc.personal?.fullName || '',
+        org: doc.organization?.orgName || '',
+        email: doc.personal?.email || '',
+      };
+    }
+    // attendee default
+    return {
+      name: doc.personal?.fullName || '',
+      org: doc.organization?.orgName || '',
+      email: doc.personal?.email || '',
+    };
+  };
+
+  // group attendance by meetId
+  const attByMeet = new Map();
+  for (const a of allAttendance) {
+    const k = String(a.meetId);
+    if (!attByMeet.has(k)) attByMeet.set(k, []);
+    const doc = roleDocs[a.role]?.[String(a.actorId)];
+    const meta = normActor(a.role, doc);
+    attByMeet.get(k).push({
+      actorId: String(a.actorId),
+      role: a.role,
+      name: meta.name,
+      org: meta.org,
+      email: meta.email,
+      attendedAt: a.attendedAt || a.createdAt || null,
+      scannerId: a.scannerId || null,
+      source: a.source || 'qr',
+    });
+  }
+
+  // build blocks
+  let data = meets.map((m) => {
+    const whenISO = m.slotISO || m.requestedAt || null;
+    const senderDoc = roleDocs[m.senderRole]?.[String(m.senderId)];
+    const receiverDoc = roleDocs[m.receiverRole]?.[String(m.receiverId)];
+    const sender = { role: m.senderRole, id: String(m.senderId), ...normActor(m.senderRole, senderDoc) };
+    const receiver = { role: m.receiverRole, id: String(m.receiverId), ...normActor(m.receiverRole, receiverDoc) };
+    const attendance = attByMeet.get(String(m._id)) || [];
+
+    // compute attended-by flags (0/2)
+    const attendedSender = attendance.some(x => x.actorId === sender.id);
+    const attendedReceiver = attendance.some(x => x.actorId === receiver.id);
+
+    return {
+      meetId: String(m._id),
+      subject: m.subject || '',
+      when: whenISO,
+      hasVLink: !!m.vmeetLink,
+      sender,
+      receiver,
+      attendedCount: (attendedSender ? 1 : 0) + (attendedReceiver ? 1 : 0),
+      attendedBy: {
+        sender: attendedSender,
+        receiver: attendedReceiver
+      },
+      attendance
+    };
+  });
+
+  // q filter (subject/participants/email/org)
+  if (q) {
+    const hits = (blk) => {
+      const base = `${blk.subject} ${blk.sender.name} ${blk.sender.org} ${blk.sender.email} ${blk.receiver.name} ${blk.receiver.org} ${blk.receiver.email}`.toLowerCase();
+      const att = blk.attendance.map(x => `${x.name} ${x.org} ${x.email}`.toLowerCase()).join(' ');
+      return (base + ' ' + att).includes(q);
+    };
+    data = data.filter(hits);
+  }
+
+  res.json({
+    ok: true,
+    eventId,
+    totalMeets: data.length,
+    totalAttendance: data.reduce((n, b) => n + b.attendance.length, 0),
+    data,
+  });
+});
+
+// guard re-definition in dev
+
+// Helper: schedule a prompt exactly +60 minutes from a given base time
+async function _scheduleFeedback({ eventId, kind, refId, actorId, role, baseTime }) {
+  const due = new Date((baseTime ? new Date(baseTime) : new Date()).getTime() + 60 * 60 * 1000);
+  try {
+    await FeedbackPrompt.updateOne(
+      { kind, refId, actorId },
+      {
+        $setOnInsert: {
+          eventId, kind, refId, actorId, role,
+          dueAt: due,
+          status: 'pending',
+          createdAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+  } catch (e) {
+    // ignore duplicate key races
+    if (!String(e?.message || '').includes('duplicate key')) throw e;
+  }
+}
+
+// PUBLIC export to be called from your existing attendance flows:
+//
+// - When you mark a meeting attendance → call with kind:'meet', refId:meetId
+// - When you mark a session attendance → call with kind:'session', refId:sessionId
+// - When you check in at event gate → call with kind:'event', refId:eventId
+//
+const scheduleFeedbackPrompt = async ({ eventId, kind, refId, actorId, role, at }) => {
+  if (!eventId || !kind || !refId || !actorId || !role) return;
+  await _scheduleFeedback({ eventId, kind, refId, actorId, role, at });
+};
+exports.scheduleFeedbackPrompt = scheduleFeedbackPrompt;
+// Actor: fetch due prompts (now or overdue) that are not completed/expired
+exports.actorGetPendingFeedback = asyncHandler(async (req, res) => {
+  const meId = req.user?._id;
+  const meRole = String(req.user?.role || '').toLowerCase();
+  if (!meId) return res.status(401).json({ ok:false, error:'auth-required' });
+
+  const now = new Date();
+  const rows = await FeedbackPrompt.find({
+    actorId: meId,
+    status: { $in: ['pending','shown'] },
+    dueAt: { $lte: now }
+  })
+  .sort({ dueAt: 1, createdAt: 1 })
+  .limit(5)
+  .lean();
+
+  res.json({
+    ok: true,
+    count: rows.length,
+    data: rows.map(r => ({
+      id: String(r._id),
+      eventId: String(r.eventId || ''),
+      kind: r.kind,
+      refId: String(r.refId),
+      dueAt: r.dueAt,
+      status: r.status,
+    }))
+  });
+});
+
+// Actor: mark prompt as shown (so we don’t flicker it every fetch)
+exports.actorMarkFeedbackShown = asyncHandler(async (req, res) => {
+  const meId = String(req.user?._id || '');
+  const { promptId } = req.body || {};
+  if (!mongoose.isValidObjectId(promptId)) return res.status(400).json({ ok:false, error:'bad-promptId' });
+
+  const upd = await FeedbackPrompt.findOneAndUpdate(
+    { _id: promptId, actorId: meId, status: { $in: ['pending','shown'] } },
+    { $set: { status: 'shown', shownAt: new Date() } },
+    { new: true }
+  ).lean();
+
+  if (!upd) return res.status(404).json({ ok:false, error:'not-found' });
+  res.json({ ok:true });
+});
+
+// Actor: submit feedback (stars/comment) → completes the prompt
+exports.actorSubmitFeedback = asyncHandler(async (req, res) => {
+  const meId = String(req.user?._id || '');
+  const meRole = String(req.user?.role || '').toLowerCase();
+  const { promptId, stars, comment } = req.body || {};
+
+  if (!mongoose.isValidObjectId(promptId)) return res.status(400).json({ ok:false, error:'bad-promptId' });
+  const v = Number(stars);
+  if (!(v >= 1 && v <= 5)) return res.status(400).json({ ok:false, error:'stars-must-be-1-5' });
+
+  const prompt = await FeedbackPrompt.findOne({ _id: promptId, actorId: meId }).lean();
+  if (!prompt) return res.status(404).json({ ok:false, error:'prompt-not-found' });
+  if (prompt.status === 'completed') return res.json({ ok:true, already:true });
+
+  await FeedbackResponse.create({
+    promptId: prompt._id,
+    eventId : prompt.eventId,
+    kind    : prompt.kind,
+    refId   : prompt.refId,
+    actorId : prompt.actorId,
+    role    : prompt.role,
+    stars   : v,
+    comment : String(comment || '').slice(0, 1000)
+  });
+
+  await FeedbackPrompt.updateOne(
+    { _id: prompt._id },
+    { $set: { status:'completed', completedAt: new Date() } }
+  );
+
+  res.json({ ok:true });
+});
+

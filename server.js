@@ -60,6 +60,7 @@ app.use('/auth',    require('./routes/authRoutes'));
 app.use('/pay',     require('./routes/financeRoutes'));
 app.use('/events',  require('./routes/eventRoutes'));
 app.use('/meets',   require('./routes/meetsRoutes'));
+
 app.use('/admin',   require('./routes/adminRoutes'));
 app.use('/program', require('./routes/programRoutes'));
 app.use('/selects', require('./routes/selectsRoutes'));
