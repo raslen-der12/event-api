@@ -5585,7 +5585,7 @@ exports.adminScanSession = asyncHandler(async (req, res) => {
 
   // Confirm (mark) only if assigned
   let marked = false;
-  if (mark && assigned) {
+  if (mark) {
     await SessionAttendance.updateOne(
       { sessionId, eventId, actorId },
       {
