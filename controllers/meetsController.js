@@ -755,7 +755,12 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
       { upsert: true }
     );
   }
-
+  if (!bothVirtual && !halfVirtual) {
+    await MeetRequest.updateOne(
+      { _id: created._id },
+      { $unset: { vmeetLink: 1 } }
+    );
+  }
   // Email both parties
   const FRONT = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
   let eventObj = null;
@@ -892,19 +897,19 @@ Eventra - Connect. Grow, Globalize`
     mailErrors.push("receiver");
   }
   try {
-    const meetUrl = `/meetings/${String(doc._id)}`;
+    const meetUrl = `/meetings/${String(created._id)}`;
     await ActorNotification.create([
       {
-        actorId: doc.receiverId,
+        actorId: receiverId,
         title: "New meeting request",
-        body: `You have a meeting request from ${String(doc.senderId)}`,
+        body: `You have a meeting request from ${String(senderId)}`,
         link: meetUrl,
         priority: 5,
       },
       {
-        actorId: doc.senderId,
+        actorId: senderId,
         title: "Meeting request sent",
-        body: `Your request to ${String(doc.receiverId)} was created`,
+        body: `Your request to ${String(receiverId)} was created`,
         link: meetUrl,
         priority: 3,
       },
@@ -5657,6 +5662,19 @@ exports.adminScanMeet = asyncHandler(async (req, res) => {
   const youRole = isSender ? meet.senderRole : meet.receiverRole;
   const otherId = isSender ? receiverId : senderId;
   const otherRole = isSender ? meet.receiverRole : meet.senderRole;
+  const YouModel   = resolveActorModel(String(youRole || "").toLowerCase());
+  const OtherModel = resolveActorModel(String(otherRole || "").toLowerCase());
+  const [youDoc, otherDoc] = await Promise.all([
+    YouModel?.findById(youId)
+      .select("personal.fullName personal.email personal.profilePic organization.orgName")
+      .lean(),
+    OtherModel?.findById(otherId)
+      .select("personal.fullName personal.email personal.profilePic organization.orgName")
+      .lean(),
+  ]);
+  const nameOf  = (d) => d?.personal?.fullName || d?.organization?.orgName || "";
+  const emailOf = (d) => d?.personal?.email || "";
+  const avatarOf= (d) => d?.personal?.profilePic || "";
 
   // helper to read current checkins
   async function readState() {
@@ -5695,8 +5713,8 @@ exports.adminScanMeet = asyncHandler(async (req, res) => {
       success: true,
       data: {
         preview: true,
-        you: { actorId: youId, role: youRole },
-        other: { actorId: otherId, role: otherRole },
+        you:   { actorId: youId,   role: youRole,   name: nameOf(youDoc),   email: emailOf(youDoc),   avatar: avatarOf(youDoc) },
+        other: { actorId: otherId, role: otherRole, name: nameOf(otherDoc), email: emailOf(otherDoc), avatar: avatarOf(otherDoc) },
         happened: s.happened,
         alreadyCheckedIn: s.alreadyCheckedIn,
         otherCheckedIn: s.otherCheckedIn,
@@ -5761,8 +5779,8 @@ exports.adminScanMeet = asyncHandler(async (req, res) => {
     data: {
       checkedIn: true,
       happened: state.happened,
-      you: { actorId: youId, role: youRole },
-      other: { actorId: otherId, role: otherRole },
+      you:   { actorId: youId,   role: youRole,   name: nameOf(youDoc),   email: emailOf(youDoc),   avatar: avatarOf(youDoc) },
+      other: { actorId: otherId, role: otherRole, name: nameOf(otherDoc), email: emailOf(otherDoc), avatar: avatarOf(otherDoc) },
       alreadyCheckedIn: state.alreadyCheckedIn,
       otherCheckedIn: state.otherCheckedIn,
       youCheckedInAt: state.youCheckedInAt,
@@ -6070,45 +6088,151 @@ exports.getSuggestedListAdmin = asyncHandler(async (req, res) => {
 
   return res.json({ success: true, count: data.length, data });
 });
+const { google } = require("googleapis");
 // ───────────────────────── ADMIN: generate Google Meet (platform link) ─────────────────────────
 // POST /admin/meets/:id/gmeet
+// FULL REPLACEMENT
 exports.adminGenerateGoogleMeetLink = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Bad id" });
+  if (!mongoose.isValidObjectId(id)) {
+    return res.status(400).json({ message: "Bad id" });
+  }
 
   const row = await MeetRequest.findById(id);
   if (!row) return res.status(404).json({ message: "Meeting not found" });
 
-  // use same platform link scheme you already use for virtual room
-  const FRONT = process.env.FRONTEND_URL || "";
-  const vlink = `${FRONT}/vmeet/${String(row._id)}`; // same pattern as elsewhere
-  row.meetLink = vlink; // persists/overwrites as the “Google Meet link” entry point
-  row.markModified?.('meetLink');
-  await row.save();
-
-  // notify both parties (reuse your mailer template utilities)
-  const subj = "Your virtual meeting room is ready";
-  const html = `
-    <p>Hello,</p>
-    <p>The virtual room for your meeting on <b>${new Date(row.slotISO).toLocaleString()}</b> is now available.</p>
-    <p><a href="${vlink}">Open the virtual room</a></p>
-    <p><em>Important:</em> Please join exactly on time and avoid leaving once you enter.</p>
-  `;
-
-  // sender + receiver emails via your existing participant helpers (attachParticipants/getMeta)
-  const [enriched] = await attachParticipants([row.toObject()]);
-  const toList = []
-    .concat(enriched?.sender?.email || [])
-    .concat(enriched?.receiver?.email || [])
-    .filter(Boolean);
-
-  // use the same sendMail helper already used in this controller
-  for (const to of toList) {
-    try { await sendMail({ to, subject: subj, html }); } catch (_) {}
+  // Load participants + event
+  const SenderModel   = getModelByRole(row.senderRole);
+  const ReceiverModel = getModelByRole(row.receiverRole);
+  if (!SenderModel || !ReceiverModel) {
+    return res.status(400).json({ message: "Unsupported roles" });
   }
 
-  return res.json({ success: true, link: vlink });
+  const [sDoc, rDoc, evDoc] = await Promise.all([
+    SenderModel.findById(row.senderId).lean(),
+    ReceiverModel.findById(row.receiverId).lean(),
+    Event.findById(row.eventId).select("timezone title name").lean().catch(() => null),
+  ]);
+  if (!sDoc || !rDoc) return res.status(404).json({ message: "Participants not found" });
+
+  const emailOf = (role, doc) => {
+    if (!doc) return "";
+    if (role === "exhibitor") return String(doc.identity?.email || "");
+    return String(doc.personal?.email || ""); // attendee/speaker
+  };
+  const senderEmail = emailOf(row.senderRole, sDoc);
+  const receiverEmail = emailOf(row.receiverRole, rDoc);
+
+  // mode: only generate for virtual/hybrid
+  const senderVirtual   = !!sDoc.virtualMeet;
+  const receiverVirtual = !!rDoc.virtualMeet;
+  const bothVirtual = senderVirtual && receiverVirtual;
+  const halfVirtual = senderVirtual !== receiverVirtual;
+  if (!bothVirtual && !halfVirtual) {
+    return res.status(409).json({ message: "This meeting is fully in-person; no virtual link can be generated." });
+  }
+
+  // If we already have a Google Meet link, return it
+  if (row.meetLink && /^https:\/\/meet\.google\.com\//.test(String(row.meetLink))) {
+    return res.json({ success: true, link: row.meetLink, reused: true });
+  }
+
+  // ===== Google Service Account + Impersonation =====
+  const SA_EMAIL   = process.env.GOOGLE_SA_EMAIL;
+  const SA_KEY_RAW = process.env.GOOGLE_SA_PRIVATE_KEY || "";
+  const SUBJECT    = process.env.GOOGLE_IMPERSONATE || process.env.GOOGLE_CALENDAR_ID; // email of a Workspace user
+
+  if (!SA_EMAIL || !SA_KEY_RAW || !SUBJECT) {
+    return res.status(500).json({
+      message: "Google Meet not configured. Require GOOGLE_SA_EMAIL, GOOGLE_SA_PRIVATE_KEY and GOOGLE_IMPERSONATE (or GOOGLE_CALENDAR_ID)."
+    });
+  }
+  const SA_KEY = SA_KEY_RAW.includes("\\n") ? SA_KEY_RAW.replace(/\\n/g, "\n") : SA_KEY_RAW;
+
+  const auth = new google.auth.JWT({
+    email: SA_EMAIL,
+    key: SA_KEY,
+    scopes: ["https://www.googleapis.com/auth/calendar"],
+    subject: SUBJECT,   // <-- impersonate this user
+  });
+  const calendar = google.calendar({ version: "v3", auth });
+
+  // Times (default to 30m if slot missing)
+  const tz = evDoc?.timezone || "UTC";
+  const start = row.slotISO ? new Date(row.slotISO) : new Date(Date.now() + 5 * 60 * 1000);
+  const defaultMinutes = Number(process.env.MEETING_SLOT_MINUTES) > 0 ? Number(process.env.MEETING_SLOT_MINUTES) : 30;
+  const end = new Date(start.getTime() + defaultMinutes * 60 * 1000);
+
+  // Attendees (optional; only valid emails)
+  const toAttendee = (e) => (/.+@.+\..+/.test(String(e || "")) ? { email: String(e) } : null);
+  const attendees = [toAttendee(senderEmail), toAttendee(receiverEmail)].filter(Boolean);
+
+  // Create event on the impersonated user's PRIMARY calendar
+  const requestId = `mr_${String(row._id)}_${Date.now()}`;
+  let ev;
+  try {
+    ev = await calendar.events.insert({
+      calendarId: "primary",
+      conferenceDataVersion: 1,
+      sendUpdates: "all",
+      requestBody: {
+        summary: `Eventra B2B: ${row.subject || "Meeting"}`,
+        description: "Auto-generated Google Meet for your Eventra B2B meeting.",
+        start: { dateTime: start.toISOString(), timeZone: tz },
+        end:   { dateTime: end.toISOString(),   timeZone: tz },
+        attendees,
+        conferenceData: {
+          createRequest: {
+            requestId,
+            conferenceSolutionKey: { type: "hangoutsMeet" },
+          },
+        },
+      },
+    });
+  } catch (e) {
+    const code = e?.errors?.[0]?.reason || e?.code || "";
+    return res.status(502).json({ message: "Google Calendar create failed", code, error: e?.message || e });
+  }
+
+  const meetLink =
+    ev?.data?.hangoutLink ||
+    (ev?.data?.conferenceData?.entryPoints || []).find(x => x.entryPointType === "video")?.uri ||
+    "";
+
+  if (!meetLink) {
+    return res.status(502).json({ message: "Google did not return a Meet link." });
+  }
+
+  // Persist on meeting row
+  row.meetLink      = meetLink;
+  row.meetProvider  = "google-meet";
+  row.gcEventId     = ev?.data?.id || null;
+  row.gcCalendarId  = "primary";
+  row.markModified?.("meetLink");
+  await row.save();
+
+  // Notify both parties
+  const prettyWhen = start.toLocaleString("en-GB", { hour12: false, timeZone: tz });
+  const subj = "Your Google Meet link is ready";
+  const html = `
+    <p>Hello,</p>
+    <p>The Google Meet for your meeting <b>${row.subject || ""}</b> on <b>${prettyWhen} (${tz})</b> is ready.</p>
+    <p><a href="${meetLink}">${meetLink}</a></p>
+    <p><em>Join exactly on time.</em></p>
+  `;
+  for (const to of [senderEmail, receiverEmail].filter(Boolean)) {
+    try { await sendMail(to, subj, html); } catch {}
+  }
+
+  return res.json({
+    success: true,
+    link: meetLink,
+    provider: "google-meet",
+    calendarId: row.gcCalendarId,
+    eventId: row.gcEventId,
+  });
 });
+
 // ───────────────────────── ACTOR: get link & mark virtual attendance ─────────────────────────
 // GET /meets/:meetId/vlink/:actorId
 // - returns the platform link if generated
@@ -6598,129 +6722,164 @@ exports.adminListEventAttendance = asyncHandler(async (req, res) => {
 
 
 
+// FULL REPLACEMENT
 exports.adminListMeetingAttendance = asyncHandler(async (req, res) => {
-  const eventId = req.params.eventId || req.query.eventId && isId(req.query.eventId) ? req.query.eventId : null;
-  const q = String(req.query.q || '').trim().toLowerCase();
-  if (!eventId) return res.status(400).json({ ok: false, error: 'eventId required' });
+  const eventId = req.query.eventId && isId(req.query.eventId) ? req.query.eventId : null;
+  const q = String(req.query.q || "").trim().toLowerCase();
+  if (!eventId) return res.status(400).json({ ok: false, error: "eventId required" });
 
-  // Pull accepted/active meets for the event
+  // 1) Get accepted/confirmed meets for this event
   const meets = await MeetRequest.find({
     eventId,
-    status: { $in: ['accepted', 'confirmed', 'rescheduled'] }
+    status: { $in: ["accepted", "confirmed"] },
   })
-    .select('_id subject slotISO requestedAt senderId senderRole receiverId receiverRole vmeetLink')
-    .sort({ slotISO: -1, requestedAt: -1 })
+    .select("_id subject requestedAt senderId senderRole receiverId receiverRole vmeetLink slotISO")
+    .sort({ requestedAt: -1 })
     .lean();
 
-  const meetIds = meets.map((m) => m._id);
-  const allAttendance = meetIds.length
-    ? await MeetingAttendance.find({ meetId: { $in: meetIds } }).lean()
-    : [];
+  if (!meets.length) {
+    return res.json({
+      ok: true,
+      eventId,
+      totalMeets: 0,
+      totalAttendance: 0,
+      data: [],
+    });
+  }
 
-  // collect all actorIds by role to hydrate once
+  const meetIds = meets.map((m) => m._id);
+
+  // 2) Read attendance records — support BOTH `meetingId` (new) and `meetId` (old)
+  const allAttendance = await MeetingAttendance.find({
+    $or: [
+      { meetingId: { $in: meetIds } },
+      { meetId: { $in: meetIds } },
+    ],
+  }).lean();
+
+  // 3) Collect all actorIds we need to hydrate (senders/receivers + everyone who attended)
   const need = { attendee: new Set(), exhibitor: new Set(), speaker: new Set() };
+
   for (const m of meets) {
-    if (m.senderRole && ROLE_MODEL[m.senderRole]) need[m.senderRole].add(String(m.senderId));
-    if (m.receiverRole && ROLE_MODEL[m.receiverRole]) need[m.receiverRole].add(String(m.receiverId));
+    if (m.senderRole) need[m.senderRole]?.add(String(m.senderId));
+    if (m.receiverRole) need[m.receiverRole]?.add(String(m.receiverId));
   }
   for (const a of allAttendance) {
-    if (a.role && ROLE_MODEL[a.role]) need[a.role].add(String(a.actorId));
+    const role = String(a.role || "").toLowerCase();
+    if (need[role]) need[role].add(String(a.actorId));
   }
 
+  // 4) Bulk-load actor docs by role -> maps
   const roleDocs = {};
   await Promise.all(
     Object.keys(need).map(async (role) => {
-      const Model = ROLE_MODEL[role];
-      if (!Model) { roleDocs[role] = {}; return; }
       const ids = Array.from(need[role]);
-      if (!ids.length) { roleDocs[role] = {}; return; }
-      const docs = await Model.find({ _id: { $in: ids } })
-        .select('personal organization identity') // minimal
-        .lean();
+      const Model = ROLE_MODEL[role];
+      if (!Model || ids.length === 0) {
+        roleDocs[role] = {};
+        return;
+      }
+      const docs = await Model.find({ _id: { $in: ids } }).select("personal.fullName personal.email personal.profilePic organization.orgName identity.exhibitorName identity.email identity.logo").lean();
       const map = {};
-      docs.forEach((d) => { map[String(d._id)] = d; });
+      for (const d of docs) map[String(d._id)] = d;
       roleDocs[role] = map;
     })
   );
 
+  // 5) Normalize display info per role
   const normActor = (role, doc) => {
-    if (!doc) return { name: '', org: '', email: '' };
-    if (role === 'exhibitor') {
+    if (!doc) return { name: "", org: "", email: "", avatar: "" };
+
+    if (role === "exhibitor") {
       return {
-        name: doc.identity?.contactName || doc.identity?.exhibitorName || '',
-        org: doc.identity?.exhibitorName || doc.identity?.orgName || '',
-        email: doc.identity?.email || '',
+        name: doc.identity?.contactName || doc.identity?.exhibitorName || "",
+        org: doc.identity?.exhibitorName || doc.identity?.orgName || "",
+        email: doc.identity?.email || "",
+        avatar: doc.identity?.logo || "",
       };
     }
-    if (role === 'speaker') {
+    if (role === "speaker") {
       return {
-        name: doc.personal?.fullName || '',
-        org: doc.organization?.orgName || '',
-        email: doc.personal?.email || '',
+        name: doc.personal?.fullName || "",
+        org: doc.organization?.orgName || "",
+        email: doc.personal?.email || "",
+        avatar: doc.personal?.profilePic || "",
       };
     }
-    // attendee default
+    // attendee
     return {
-      name: doc.personal?.fullName || '',
-      org: doc.organization?.orgName || '',
-      email: doc.personal?.email || '',
+      name: doc.personal?.fullName || "",
+      org: doc.organization?.orgName || "",
+      email: doc.personal?.email || "",
+      avatar: doc.personal?.profilePic || "",
     };
   };
 
-  // group attendance by meetId
-  const attByMeet = new Map();
-  for (const a of allAttendance) {
-    const k = String(a.meetId);
-    if (!attByMeet.has(k)) attByMeet.set(k, []);
-    const doc = roleDocs[a.role]?.[String(a.actorId)];
-    const meta = normActor(a.role, doc);
-    attByMeet.get(k).push({
-      actorId: String(a.actorId),
-      role: a.role,
-      name: meta.name,
-      org: meta.org,
-      email: meta.email,
-      attendedAt: a.attendedAt || a.createdAt || null,
-      scannerId: a.scannerId || null,
-      source: a.source || 'qr',
-    });
-  }
+  // 6) Build grouped response by meetId
+  const grouped = new Map(); // meetId -> block
 
-  // build blocks
-  let data = meets.map((m) => {
-    const whenISO = m.slotISO || m.requestedAt || null;
+  for (const m of meets) {
     const senderDoc = roleDocs[m.senderRole]?.[String(m.senderId)];
     const receiverDoc = roleDocs[m.receiverRole]?.[String(m.receiverId)];
     const sender = { role: m.senderRole, id: String(m.senderId), ...normActor(m.senderRole, senderDoc) };
     const receiver = { role: m.receiverRole, id: String(m.receiverId), ...normActor(m.receiverRole, receiverDoc) };
-    const attendance = attByMeet.get(String(m._id)) || [];
 
-    // compute attended-by flags (0/2)
-    const attendedSender = attendance.some(x => x.actorId === sender.id);
-    const attendedReceiver = attendance.some(x => x.actorId === receiver.id);
-
-    return {
+    grouped.set(String(m._id), {
       meetId: String(m._id),
-      subject: m.subject || '',
-      when: whenISO,
+      subject: m.subject || "",
+      when: m.requestedAt || m.slotISO || null,
       hasVLink: !!m.vmeetLink,
       sender,
       receiver,
-      attendedCount: (attendedSender ? 1 : 0) + (attendedReceiver ? 1 : 0),
-      attendedBy: {
-        sender: attendedSender,
-        receiver: attendedReceiver
-      },
-      attendance
-    };
-  });
+      attendance: [],
+    });
+  }
 
-  // q filter (subject/participants/email/org)
+  // 7) Attach each attendance row to the right meet block
+  for (const a of allAttendance) {
+    const key = String(a.meetingId || a.meetId); // accept both
+    const blk = grouped.get(key);
+    if (!blk) continue;
+
+    let role = String(a.role || "").toLowerCase();
+    const actorIdStr = String(a.actorId);
+    if (!role) {
+      if (actorIdStr === blk.sender.id) role = String(blk.sender.role || "").toLowerCase();
+      else if (actorIdStr === blk.receiver.id) role = String(blk.receiver.role || "").toLowerCase();
+    }
+
+    // find the actor doc from preloaded role map; fall back to sender/receiver doc if needed
+    const fromRoleMap =
+      roleDocs[role]?.[actorIdStr] ||
+      (actorIdStr === blk.sender.id ? roleDocs[String(blk.sender.role || "").toLowerCase()]?.[blk.sender.id] : null) ||
+      (actorIdStr === blk.receiver.id ? roleDocs[String(blk.receiver.role || "").toLowerCase()]?.[blk.receiver.id] : null);
+    const meta = normActor(role, fromRoleMap);
+
+    blk.attendance.push({
+      actorId: actorIdStr,
+      role,
+      name: meta.name,
+      org: meta.org,
+     email: meta.email,
+      avatar: meta.avatar,
+      kind: a.kind || (blk.hasVLink ? "virtual" : "physical"),
+      attendedAt: a.at || a.attendedAt || a.createdAt || null,
+      scannerId: a.by || a.scannerId || null,
+      source: a.source || "qr",
+    });
+  }
+
+  // 8) Optional text filter across subject/participants/attendance metadata
+  let data = Array.from(grouped.values());
   if (q) {
     const hits = (blk) => {
-      const base = `${blk.subject} ${blk.sender.name} ${blk.sender.org} ${blk.sender.email} ${blk.receiver.name} ${blk.receiver.org} ${blk.receiver.email}`.toLowerCase();
-      const att = blk.attendance.map(x => `${x.name} ${x.org} ${x.email}`.toLowerCase()).join(' ');
-      return (base + ' ' + att).includes(q);
+      const base =
+        `${blk.subject} ${blk.sender.name} ${blk.sender.org} ${blk.sender.email} ` +
+        `${blk.receiver.name} ${blk.receiver.org} ${blk.receiver.email}`.toLowerCase();
+      const att = blk.attendance
+        .map((x) => `${x.name} ${x.org} ${x.email}`.toLowerCase())
+        .join(" ");
+      return (base + " " + att).includes(q);
     };
     data = data.filter(hits);
   }
@@ -6778,7 +6937,7 @@ exports.actorGetPendingFeedback = asyncHandler(async (req, res) => {
   const now = new Date();
   const rows = await FeedbackPrompt.find({
     actorId: meId,
-    status: { $in: ['pending','shown'] },
+    status: { $in: ['pending'] },
     dueAt: { $lte: now }
   })
   .sort({ dueAt: 1, createdAt: 1 })
