@@ -114,7 +114,7 @@ exports.getCommunityFacets = async (req, res, next) => {
 
 /* ---------- LIST: grouped-by-subRole OR flat by ?subRole= ---------- */
 exports.getCommunityList = async (req, res, next) => {
-  try{
+  try {
     const eventId = str(req.query.eventId);
     const subRole = str(req.query.subRole);        // when present => flat mode
     const country = str(req.query.country);
@@ -122,50 +122,110 @@ exports.getCommunityList = async (req, res, next) => {
     const page    = Math.max(1, toNum(req.query.page, 1));
     const limit   = Math.max(1, Math.min(100, toNum(req.query.limit, 24)));
     const skip    = Math.max(0, (page - 1) * limit);
+    const eventIdObj = isId(eventId) ? new mongoose.Types.ObjectId(eventId) : null;
+
+    // Event attendance model (check-in)
+    const EventCheckin =
+      mongoose.models.eventCheckin ||
+      mongoose.model(
+        "eventCheckin",
+        new mongoose.Schema(
+          {
+            eventId:   { type: mongoose.Schema.Types.ObjectId, index: true, required: true },
+            actorId:   { type: mongoose.Schema.Types.ObjectId, index: true, required: true },
+            actorRole: { type: String, enum: ["attendee","exhibitor","speaker","admin"], required: true },
+            at:        { type: Date, default: Date.now },
+            by:        { type: mongoose.Schema.Types.ObjectId, index: true },
+          },
+          { versionKey: false, timestamps: false }
+        )
+      );
 
     // Build common filters
     const like = q ? new RegExp(esc(q), "i") : null;
     const baseMatch = (idField, countryPath) => {
       const m = {};
-      if (isId(eventId)) m[idField] = new mongoose.Types.ObjectId(eventId);
+      if (eventIdObj) m[idField] = eventIdObj;
       if (country) m[countryPath] = rxEq(country);
       if (q) {
         m.$or = [
           { "personal.fullName": like }, { "identity.fullName": like },
-          { "personal.email": like }, { "identity.email": like },
+          { "personal.email": like },    { "identity.email": like },
           { "organization.orgName": like }
         ];
       }
       return m;
     };
 
-    // FLAT mode (when subRole provided)
+    // ───────────────────────── FLAT MODE ─────────────────────────
     if (subRole) {
       const matchAtt = baseMatch("id_event","personal.country");   matchAtt.subRole = rxEqTrim(subRole);
       const matchSpk = baseMatch("id_event","identity.country");   matchSpk.subRole = rxEqTrim(subRole);
 
-      const [attRows, spkRows, attCnt, spkCnt] = await Promise.all([
+      const [attRows, spkRows, attCnt, spkCnt, checkins] = await Promise.all([
         attendee ? attendee.find(matchAtt).skip(skip).limit(limit).lean() : [],
         speaker  ? speaker.find(matchSpk).skip(skip).limit(limit).lean() : [],
         attendee ? attendee.countDocuments(matchAtt) : 0,
         speaker  ? speaker.countDocuments(matchSpk)  : 0,
+        eventIdObj
+          ? EventCheckin.find({
+              eventId: eventIdObj,
+              actorRole: { $in: ["attendee", "speaker"] },
+            })
+              .select("actorId actorRole")
+              .lean()
+          : [],
       ]);
+
+      // lookup sets for who attended
+      const attSet = new Set();
+      const spkSet = new Set();
+      (checkins || []).forEach((c) => {
+        const key = String(c.actorId);
+        if (c.actorRole === "attendee") attSet.add(key);
+        else if (c.actorRole === "speaker") spkSet.add(key);
+      });
+
       const items = [
-        ...(attRows||[]).map(mapAtt),
-        ...(spkRows||[]).map(mapSpk),
+        ...(attRows || []).map((r) => ({
+          ...mapAtt(r),
+          isAtt: attSet.has(String(r._id)),
+        })),
+        ...(spkRows || []).map((r) => ({
+          ...mapSpk(r),
+          isAtt: spkSet.has(String(r._id)),
+        })),
       ];
-      return res.json({ success:true, items, total: attCnt + spkCnt });
+
+      return res.json({ success: true, items, total: attCnt + spkCnt });
     }
 
-    // GROUPED mode (no subRole): return groups with up to N samples each
+    // ───────────────────────── GROUPED MODE ──────────────────────
     const matchAtt = baseMatch("id_event","personal.country");
     const matchSpk = baseMatch("id_event","identity.country");
     const sampleN = Math.min(8, limit);
 
-    const [attAll, spkAll] = await Promise.all([
+    const [attAll, spkAll, checkins] = await Promise.all([
       attendee ? attendee.find(matchAtt).select("_id personal organization subRole").lean() : [],
       speaker  ? speaker.find(matchSpk).select("_id personal identity organization subRole").lean() : [],
+      eventIdObj
+        ? EventCheckin.find({
+            eventId: eventIdObj,
+            actorRole: { $in: ["attendee", "speaker"] },
+          })
+            .select("actorId actorRole")
+            .lean()
+        : [],
     ]);
+
+    // lookup sets for who attended (for all buckets)
+    const attSet = new Set();
+    const spkSet = new Set();
+    (checkins || []).forEach((c) => {
+      const key = String(c.actorId);
+      if (c.actorRole === "attendee") attSet.add(key);
+      else if (c.actorRole === "speaker") spkSet.add(key);
+    });
 
     const bucket = new Map();   // key = normalized subRole => members[]
     const labelOf = new Map();  // key => first seen trimmed label
@@ -182,14 +242,23 @@ exports.getCommunityList = async (req, res, next) => {
     (attAll||[]).forEach(push);
     (spkAll||[]).forEach(push);
 
-   const groups = [...bucket.entries()]
+    const groups = [...bucket.entries()]
       .sort((a,b)=> b[1].length - a[1].length || (labelOf.get(a[0])||a[0]).localeCompare(labelOf.get(b[0])||b[0]))
       .map(([k, arr])=>({
         name: labelOf.get(k) || k,
         count: arr.length,
-        items: arr.slice(0, sampleN).map(x => ("personal" in x ? mapAtt(x) : mapSpk(x)))
+        items: arr.slice(0, sampleN).map((x) => {
+          const base = ("personal" in x ? mapAtt(x) : mapSpk(x));
+          const isAtt =
+            "personal" in x
+              ? attSet.has(String(x._id))
+              : spkSet.has(String(x._id))
+          return { ...base, isAtt };
+        }),
       }));
 
     res.json({ success:true, groups, total: (attAll?.length||0) + (spkAll?.length||0) });
-  }catch(e){ next(e); }
+  } catch (e) {
+    next(e);
+  }
 };
