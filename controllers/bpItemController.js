@@ -736,6 +736,7 @@ exports.marketList = asyncHdl(async (req, res) => {
 
   if (kind === 'product' || kind === 'service') match.kind = kind;
   if (sector) match.sector = String(sector).toLowerCase().trim();
+  console.log("sector",sector);
   if (subsectorId && ObjectId(subsectorId)) match.subsectorId = ObjectId(subsectorId);
 
   const tagList = String(tags || '')
@@ -962,11 +963,11 @@ exports.getMarketBusinesses = async (req, res, next) => {
     const q           = str(req.query.q);
     const industry    = str(req.query.industry);
     const country     = str(req.query.country);
-
+    const normSect = (arr)=>( arr.push(...arr.map(s => String(s).toLocaleLowerCase())),arr);
     // multi-selects (CSV)
     const sizeList    = str(req.query.size).split(",").map(s=>s.trim()).filter(Boolean);
     const badgeList   = str(req.query.badges).split(",").map(s=>s.trim()).filter(Boolean);
-    const sectorList  = str(req.query.sector).split(",").map(s=>s.trim()).filter(Boolean);
+    const sectorList  = normSect(str(req.query.sector).split(",").map(s=>s.trim()).filter(Boolean));
 
     const page        = Math.max(1, toNum(req.query.page, 1));
     const limit       = Math.max(1, Math.min(100, toNum(req.query.limit, 24)));
@@ -977,6 +978,8 @@ exports.getMarketBusinesses = async (req, res, next) => {
     // ---- Build BusinessProfile filter (STRICT published:true)
     const profileQ = { published: true };
     if (industry) profileQ.industries = rxEq(industry);
+    console.log("sectorList",sectorList)
+    console.log("rxEq(industry)",rxEq(industry))
     if (country)  profileQ.countries  = rxEq(country);
     if (sizeList.length) profileQ.size = sizeList.length === 1 ? rxEq(sizeList[0]) : { $in: sizeList.map(rxEq) };
     if (badgeList.length) profileQ.badges = { $all: badgeList };
