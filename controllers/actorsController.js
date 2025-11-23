@@ -923,7 +923,7 @@ exports.getActorFullById = asyncHdl(async (req, res) => {
   async function collectRoleDocs(actorId){
     const files = ['BusinessOwner','Investor','Consultant','Expert','Employee','Student'];
     const found = [];
-    for (const f of files){
+    for (const f of files){ 
       try {
         let M;
         try { M = require(`../models/${f}`); }
