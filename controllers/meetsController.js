@@ -549,18 +549,318 @@ function renderEmail({
     <div style="max-width:640px;margin:12px auto 0;color:#64748b;font-size:12px">This is an automated message from Eventra.</div>
   </div>`;
 }
+async function sendMeetingEmailsAndNotifications({
+  req,
+  created,
+  eventId,
+  senderId,
+  senderRole,
+  senderDoc,
+  receiverId,
+  receiverRole,
+  receiverDoc,
+  slotISO,
+  subject,
+  message,
+  bothVirtual,
+  halfVirtual,
+  senderVirtual,
+  receiverVirtual,
+}) {
+  const FRONT = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
+
+  // Event is optional now – for global virtual meetings we may not have any
+  let eventObj = null;
+  if (eventId && Event) {
+    try {
+      eventObj = await Event.findById(eventId)
+        .select("title name city country timezone")
+        .lean();
+    } catch (e) {
+      console.warn("[requestMeeting] Event lookup failed:", e?.message || e);
+    }
+  }
+
+  const evTitle =
+    eventObj?.title ||
+    eventObj?.name ||
+    (eventId ? "Event" : "Virtual meeting");
+  const evTZ = eventObj?.timezone || "UTC";
+
+  const senderDisp = displayFromDoc(senderRole, senderDoc);
+  const receiverDisp = displayFromDoc(receiverRole, receiverDoc);
+
+  const prettyDate = fmtDate(slotISO, evTZ);
+  const prettyTime = fmtTime(slotISO, evTZ);
+
+  const rowsCommon = [
+    ["Event", evTitle],
+    ["Date", prettyDate],
+    ["Time", prettyTime + (evTZ ? ` (${evTZ})` : "")],
+    ["Subject", subject],
+  ];
+
+  const modeLabel = bothVirtual
+    ? "Online (virtual for both)"
+    : halfVirtual
+    ? senderVirtual
+      ? "Hybrid (you virtual, receiver in-person)"
+      : "Hybrid (you in-person, receiver virtual)"
+    : "In-person (both in venue)";
+
+  const rowsSender = [
+    ...rowsCommon,
+    ["Mode", modeLabel],
+    ["To", receiverDisp.name || receiverDisp.email || "—"],
+  ];
+
+  // Receiver sees from their POV
+  const modeLabelReceiver = bothVirtual
+    ? "Online (virtual for both)"
+    : halfVirtual
+    ? receiverVirtual
+      ? "Hybrid (you virtual, sender in-person)"
+      : "Hybrid (you in-person, sender virtual)"
+    : "In-person (both in venue)";
+
+  const rowsReceiver = [
+    ...rowsCommon,
+    ["Mode", modeLabelReceiver],
+    ["From", senderDisp.name || senderDisp.email || "—"],
+    ["Message", message || "(no message)"],
+  ];
+
+  const introSenderExtra = bothVirtual
+    ? " This meeting is online (virtual for both)."
+    : halfVirtual
+    ? " This meeting will be hybrid (one side virtual)."
+    : "";
+
+  const introReceiverExtra = bothVirtual
+    ? " This meeting is online (virtual for both)."
+    : halfVirtual
+    ? " This meeting will be hybrid (one side virtual)."
+    : "";
+
+  const isAdmin = req?.user?.role === "admin";
+
+  // Sender email
+  const ti = isAdmin
+    ? "You’ve Been Matched!  Your Next B2B Connection Awaits"
+    : "Your meeting request was sent";
+
+  const int = isAdmin
+    ? `Hi ${senderDisp.name || ""},
+
+Eventra’s AI just did its magic — you’ve been automatically matched with ${
+        receiverDisp.name || "participant"
+      }.
+Our system detected strong business potential between your profiles.
+
+👉 Go to your Eventra account, open “View Meetings” under your profile, and check your new invitation to confirm or decline.
+
+Eventra - Connect. Grow, Globalize`
+    : `Thanks ${senderDisp.name || ""}! We sent your request to <b>${
+        receiverDisp.name || "participant"
+      }</b>. You’ll receive an email when they respond.${introSenderExtra}`;
+
+  const htmlSender = renderEmail({
+    title: ti,
+    intro: int,
+    rows: rowsSender,
+    ctaHref: `${FRONT}/meetings`,
+    ctaLabel: "Open my meetings",
+  });
+
+  // Receiver email
+  const ti2 = isAdmin
+    ? "You’ve Been Matched!  Your Next B2B Connection Awaits"
+    : "You have a new meeting request";
+
+  const int2 = isAdmin
+    ? `Hi ${receiverDisp.name || ""},
+
+Eventra’s AI just did its magic — you’ve been automatically matched with ${
+        senderDisp.name || "participant"
+      }.
+Our system detected strong business potential between your profiles.
+
+👉 Go to your Eventra account, open “View Meetings” under your profile, and check your new invitation to confirm or decline.
+
+Eventra - Connect. Grow, Globalize`
+    : `Hello ${
+        receiverDisp.name || ""
+      }, you received a meeting request from <b>${
+        senderDisp.name || "a participant"
+      }</b>.${introReceiverExtra}`;
+
+  const htmlReceiver = renderEmail({
+    title: ti2,
+    intro: int2,
+    rows: rowsReceiver,
+    ctaHref: `${FRONT}/meetings`,
+    ctaLabel: "Review request",
+  });
+
+  const mailErrors = [];
+
+  try {
+    if (senderDisp.email) {
+      await sendMail(
+        senderDisp.email,
+        "Eventra · Request sent",
+        htmlSender
+      );
+    }
+  } catch (e) {
+    mailErrors.push("sender");
+  }
+
+  try {
+    if (receiverDisp.email) {
+      await sendMail(
+        receiverDisp.email,
+        "Eventra · New meeting request",
+        htmlReceiver
+      );
+    }
+  } catch (e) {
+    mailErrors.push("receiver");
+  }
+
+  try {
+    const meetUrl = `/meetings/${String(created._id)}`;
+    await ActorNotification.create([
+      {
+        actorId: receiverId,
+        title: "New meeting request",
+        body: `You have a meeting request from ${String(senderId)}`,
+        link: meetUrl,
+        priority: 5,
+      },
+      {
+        actorId: senderId,
+        title: "Meeting request sent",
+        body: `Your request to ${String(receiverId)} was created`,
+        link: meetUrl,
+        priority: 3,
+      },
+    ]);
+  } catch (e) {
+    console.error("[notif][requestMeeting]", e?.message || e);
+  }
+
+  return { mailErrors };
+}
+
+// NEW: pure virtual meeting creation – no event constraints, only
+// "same actors + same time" conflict check.
+async function createVirtualMeetingNoEvent({
+  req,
+  senderId,
+  senderRole,
+  receiverId,
+  receiverRole,
+  subject,
+  message,
+  slotISO,
+  senderDoc,
+  receiverDoc,
+  eventId, // optional, used only for emails if valid
+}) {
+  const activeStatuses = ["pending", "confirmed", "rescheduled"];
+
+  // conflict: same actors, same slot (any event)
+  const existing = await MeetRequest.findOne({
+    $or: [
+      { senderId, receiverId },
+      { senderId: receiverId, receiverId: senderId },
+    ],
+    slotISO,
+    status: { $in: activeStatuses },
+  }).lean();
+
+  if (existing) {
+    return {
+      status: 409,
+      body: {
+        message:
+          "Active meeting already exists for these participants at this time",
+      },
+    };
+  }
+
+  const created = await MeetRequest.create({
+    eventId: mongoose.isValidObjectId(eventId) ? eventId : undefined,
+    senderId,
+    senderRole,
+    receiverId,
+    receiverRole,
+    subject,
+    message,
+    requestedAt: new Date(),
+    status: "pending",
+    slotISO,
+    proposedNewAt: null,
+  });
+
+  const senderVirtual = true;
+  const receiverVirtual = true;
+  const bothVirtual = true;
+  const halfVirtual = false;
+
+  const { mailErrors } = await sendMeetingEmailsAndNotifications({
+    req,
+    created,
+    eventId,
+    senderId,
+    senderRole,
+    senderDoc,
+    receiverId,
+    receiverRole,
+    receiverDoc,
+    slotISO,
+    subject,
+    message,
+    bothVirtual,
+    halfVirtual,
+    senderVirtual,
+    receiverVirtual,
+  });
+
+  return {
+    status: 201,
+    body: {
+      success: true,
+      message: mailErrors.length
+        ? "Meeting created; some emails failed to send"
+        : "Meeting created and emails sent",
+      data: {
+        id: created._id,
+        status: created.status,
+        slotISO: created.slotISO,
+        sender: { id: senderId, role: senderRole },
+        receiver: { id: receiverId, role: receiverRole },
+        slotCounter: null,
+      },
+      emailFailed: mailErrors,
+    },
+  };
+}
 exports.requestMeeting = asyncHandler(async (req, res) => {
   // Body expected from your UI:
   // { eventId, receiverId, receiverRole, dateTimeISO, subject, message }
-  const senderId = req.user?.role === "admin" ? req.body?.senderId : req.user?._id;
+  const senderId =
+    req.user?.role === "admin" ? req.body?.senderId : req.user?._id;
   const senderRole =
     req.user?.role === "admin"
       ? req.body?.senderRole || "attendee"
       : req.user?.role;
-  const eventId = req.body?.eventId;
+
+  const rawEventId = req.body?.eventId;
   const receiverId = req.body?.receiverId;
   const receiverRole = req.body?.receiverRole;
-  const slotISO = req.body?.dateTimeISO; // 30-min ISO (UTC recommended)
+  const slotISO = req.body?.dateTimeISO; // ISO (UTC recommended)
   const subject = String(
     req.body?.subject || "suggested by AI matchmaking tool"
   ).trim();
@@ -568,30 +868,34 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
     req.body?.message ||
       "You’re a strong match. We hope this meeting happens. Great fit detected. Looking forward to your meeting. Excellent match—hoping you can connect soon. Strong alignment—let’s make this meeting happen. High match score. We’re excited for your meetup."
   ).trim();
-  console.log("senderId 1", senderId);
-  console.log("senderRole 2", senderRole);
-  if (!mongoose.isValidObjectId(senderId))
+
+  if (!mongoose.isValidObjectId(senderId)) {
     return res.status(401).json({ message: "Auth required" });
-  if (!mongoose.isValidObjectId(eventId))
-    return res.status(400).json({ message: "Bad eventId" });
-  if (!mongoose.isValidObjectId(receiverId))
+  }
+  if (!mongoose.isValidObjectId(receiverId)) {
     return res.status(400).json({ message: "Bad receiverId" });
+  }
   if (
     !["attendee", "exhibitor", "speaker"].includes(
       String(receiverRole || "").toLowerCase()
     )
-  )
+  ) {
     return res.status(400).json({ message: "Bad receiverRole" });
-  if (!slotISO || Number.isNaN(new Date(slotISO).getTime()))
+  }
+  if (!slotISO || Number.isNaN(new Date(slotISO).getTime())) {
     return res.status(400).json({ message: "Bad dateTimeISO" });
-  if (!subject) return res.status(400).json({ message: "Subject required" });
+  }
+  if (!subject) {
+    return res.status(400).json({ message: "Subject required" });
+  }
 
   if (String(senderId) === String(receiverId)) {
     console.error("[requestMeeting:validation] same id");
-    return res
-      .status(400)
-      .json({ message: "You cannot send a meeting request to yourself." });
+    return res.status(400).json({
+      message: "You cannot send a meeting request to yourself.",
+    });
   }
+
   // Load sender / receiver docs for email & validation
   const SenderModel = getModelByRole(senderRole);
   const ReceiverModel = getModelByRole(receiverRole);
@@ -604,15 +908,57 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
     SenderModel.findById(senderId).lean(),
     ReceiverModel.findById(receiverId).lean(),
   ]);
-  if (!senderDoc) return res.status(404).json({ message: "Sender not found" });
-  if (!receiverDoc)
+
+  if (!senderDoc) {
+    return res.status(404).json({ message: "Sender not found" });
+  }
+  if (!receiverDoc) {
     return res.status(404).json({ message: "Receiver not found" });
+  }
 
   const senderVirtual = !!senderDoc.virtualMeet;
   const receiverVirtual = !!receiverDoc.virtualMeet;
   const bothVirtual = senderVirtual && receiverVirtual;
   const halfVirtual = senderVirtual !== receiverVirtual;
+
+  // EVENT HANDLING:
+  // - For FULLY VIRTUAL (bothVirtual): eventId is OPTIONAL and not required.
+  // - For others (physical/hybrid): eventId is REQUIRED and used with all
+  //   the old event-based logic (whitelist, capacity, etc).
+  let eventId = null;
+  if (!bothVirtual) {
+    if (!mongoose.isValidObjectId(rawEventId)) {
+      return res.status(400).json({ message: "Bad eventId" });
+    }
+    eventId = rawEventId;
+  } else {
+    // optional: use eventId only for context (emails), but not for caps
+    if (mongoose.isValidObjectId(rawEventId)) {
+      eventId = rawEventId;
+    }
+  }
+
+  // If both virtual => use the new global virtual flow
+  if (bothVirtual) {
+    const result = await createVirtualMeetingNoEvent({
+      req,
+      senderId,
+      senderRole,
+      receiverId,
+      receiverRole,
+      subject,
+      message,
+      slotISO,
+      senderDoc,
+      receiverDoc,
+      eventId,
+    });
+    return res.status(result.status).json(result.body);
+  }
+
+  // ----------------- OLD EVENT-BOUND LOGIC (unchanged) -----------------
   const slotNorm = norm30(slotISO); // normalize before checking
+
   const [wSender2, wReceiver2] = await Promise.all([
     SlotWhitelist.findOne({ eventId, actorId: senderId })
       .select("slots")
@@ -621,20 +967,21 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
       .select("slots")
       .lean(),
   ]);
+
   const needCheck = !!(wSender2 || wReceiver2); // only enforce if at least one list exists
   if (needCheck) {
     const sSet = toSetISO(wSender2?.slots || []);
     const rSet = toSetISO(wReceiver2?.slots || []);
     const k = iso(slotNorm);
     if (!(sSet.has(k) && rSet.has(k))) {
-      return res
-        .status(409)
-        .json({
-          message: "Selected slot is not whitelisted by both participants.",
-        });
+      return res.status(409).json({
+        message: "Selected slot is not whitelisted by both participants.",
+      });
     }
   }
+
   const activeStatuses = ["pending", "confirmed", "rescheduled"];
+
   const existing = await MeetRequest.findOne({
     eventId,
     $or: [
@@ -646,7 +993,8 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
 
   if (existing) {
     return res.status(409).json({
-      message: "Active meeting already exists for these participants and event",
+      message:
+        "Active meeting already exists for these participants and event",
     });
   }
 
@@ -667,10 +1015,15 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
         physCapMax = Number(eventObjForCaps.b2bCapacity);
       if (Number(eventObjForCaps?.postsCount) > 0)
         hybridCapMax = Number(eventObjForCaps.postsCount);
-    } catch {}
+    } catch (e) {
+      console.warn(
+        "[requestMeeting] Event capacity lookup failed:",
+        e?.message || e
+      );
+    }
   }
-  // sensible fallback for hybrid if postsCount missing
-  if (!Number.isFinite(hybridCapMax) || hybridCapMax == null) hybridCapMax = 10;
+  if (!Number.isFinite(hybridCapMax) || hybridCapMax == null)
+    hybridCapMax = 10;
 
   let used = 0,
     limit = 0;
@@ -697,10 +1050,11 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
     }
     used = Number(slotDoc?.used || 0);
     limit = Number(slotDoc?.cap || physCapMax);
-    if (used >= limit)
+    if (used >= limit) {
       return res
         .status(409)
         .json({ message: "Slot is full, please choose another time" });
+    }
   }
 
   if (counterKind === "hybrid") {
@@ -715,15 +1069,19 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
           cap: hybridCapMax,
         });
       } catch {
-        hDoc = await HybridMeetingSlot.findOne({ eventId, slotISO }).lean();
+        hDoc = await HybridMeetingSlot.findOne({
+          eventId,
+          slotISO,
+        }).lean();
       }
     }
     used = Number(hDoc?.used || 0);
     limit = Number(hDoc?.cap || hybridCapMax);
-    if (used >= limit)
-      return res
-        .status(409)
-        .json({ message: "Hybrid slot is full, please choose another time" });
+    if (used >= limit) {
+      return res.status(409).json({
+        message: "Hybrid slot is full, please choose another time",
+      });
+    }
   }
 
   // Create meeting
@@ -755,168 +1113,32 @@ exports.requestMeeting = asyncHandler(async (req, res) => {
       { upsert: true }
     );
   }
+
   if (!bothVirtual && !halfVirtual) {
     await MeetRequest.updateOne(
       { _id: created._id },
       { $unset: { vmeetLink: 1 } }
     );
   }
-  // Email both parties
-  const FRONT = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
-  let eventObj = null;
-  if (Event) {
-    try {
-      eventObj = await Event.findById(eventId)
-        .select("title name city country timezone")
-        .lean();
-    } catch {}
-  }
-  const evTitle = eventObj?.title || eventObj?.name || "Event";
-  const evTZ = eventObj?.timezone || "UTC";
 
-  const senderDisp = displayFromDoc(senderRole, senderDoc);
-  const receiverDisp = displayFromDoc(receiverRole, receiverDoc);
-
-  const prettyDate = fmtDate(slotISO, evTZ);
-  const prettyTime = fmtTime(slotISO, evTZ);
-
-  const rowsCommon = [
-    ["Event", evTitle],
-    ["Date", prettyDate],
-    ["Time", prettyTime + (evTZ ? ` (${evTZ})` : "")],
-    ["Subject", subject],
-  ];
-  const modeLabel = bothVirtual
-    ? "Online (virtual for both)"
-    : halfVirtual
-    ? senderVirtual
-      ? "Hybrid (you virtual, receiver in-person)"
-      : "Hybrid (you in-person, receiver virtual)"
-    : "In-person (both in venue)";
-
-  const rowsSender = [...rowsCommon, ["Mode", modeLabel]];
-
-  // Receiver sees it from their POV too (swap the hybrid text if needed)
-  const modeLabelReceiver = bothVirtual
-    ? "Online (virtual for both)"
-    : halfVirtual
-    ? receiverVirtual
-      ? "Hybrid (you virtual, sender in-person)"
-      : "Hybrid (you in-person, sender virtual)"
-    : "In-person (both in venue)";
-
-  const rowsReceiver = [...rowsCommon, ["Mode", modeLabelReceiver]];
-
-  const introSenderExtra = bothVirtual
-    ? " This meeting is online (virtual for both)."
-    : halfVirtual
-    ? " This meeting will be hybrid (one side virtual)."
-    : "";
-
-  const introReceiverExtra = bothVirtual
-    ? " This meeting is online (virtual for both)."
-    : halfVirtual
-    ? " This meeting will be hybrid (one side virtual)."
-    : "";
-  // Sender mail
-  const ti =
-    req.user.role === "admin"
-      ? "You’ve Been Matched!  Your Next B2B Connection Awaits"
-      : "Your meeting request was sent";
-  const int =
-    req.user.role === "admin"
-      ? `Hi ${senderDisp.name || ""},
-
-Eventra’s AI just did its magic — you’ve been automatically matched with ${
-          receiverDisp.name || "participant"
-        }.
-Our system detected strong business potential between your profiles.
-
-👉 Go to your Eventra account, open “View Meetings” under your profile, and check your new invitation to confirm or decline.
-
-Eventra - Connect. Grow, Globalize`
-      : `Thanks ${senderDisp.name || ""}! We sent your request to <b>${
-          receiverDisp.name || "participant"
-        }</b>. You’ll receive an email when they respond.${introSenderExtra}`;
-  const htmlSender = renderEmail({
-    title: ti,
-    intro: int,
-    rows: [
-      ...rowsSender,
-      ["To", receiverDisp.name || receiverDisp.email || "—"],
-    ],
-    ctaHref: `${FRONT}/meetings`,
-    ctaLabel: "Open my meetings",
+  const { mailErrors } = await sendMeetingEmailsAndNotifications({
+    req,
+    created,
+    eventId,
+    senderId,
+    senderRole,
+    senderDoc,
+    receiverId,
+    receiverRole,
+    receiverDoc,
+    slotISO,
+    subject,
+    message,
+    bothVirtual,
+    halfVirtual,
+    senderVirtual,
+    receiverVirtual,
   });
-  const ti2 = req.user.role === "admin" ? ti : "You have a new meeting request";
-  const int2 =
-    req.user.role === "admin"
-      ? `Hi ${receiverDisp.name || ""},
-
-Eventra’s AI just did its magic — you’ve been automatically matched with ${
-          senderDisp.name || "participant"
-        }.
-Our system detected strong business potential between your profiles.
-
-👉 Go to your Eventra account, open “View Meetings” under your profile, and check your new invitation to confirm or decline.
-
-Eventra - Connect. Grow, Globalize`
-      
-      : `Hello ${
-          receiverDisp.name || ""
-        }, you received a meeting request from <b>${
-          senderDisp.name || "a participant"
-        }</b>.${introReceiverExtra}`;
-  const htmlReceiver = renderEmail({
-    title: ti2,
-    intro: int2,
-    rows: [
-      ...rowsReceiver,
-      ["From", senderDisp.name || senderDisp.email || "—"],
-      ["Message", message || "(no message)"],
-    ],
-    ctaHref: `${FRONT}/meetings`,
-    ctaLabel: "Review request",
-  });
-
-  const mailErrors = [];
-  try {
-    if (senderDisp.email)
-      await sendMail(senderDisp.email, "Eventra · Request sent", htmlSender);
-  } catch (e) {
-    mailErrors.push("sender");
-  }
-  try {
-    if (receiverDisp.email)
-      await sendMail(
-        receiverDisp.email,
-        "Eventra · New meeting request",
-        htmlReceiver
-      );
-  } catch (e) {
-    mailErrors.push("receiver");
-  }
-  try {
-    const meetUrl = `/meetings/${String(created._id)}`;
-    await ActorNotification.create([
-      {
-        actorId: receiverId,
-        title: "New meeting request",
-        body: `You have a meeting request from ${String(senderId)}`,
-        link: meetUrl,
-        priority: 5,
-      },
-      {
-        actorId: senderId,
-        title: "Meeting request sent",
-        body: `Your request to ${String(receiverId)} was created`,
-        link: meetUrl,
-        priority: 3,
-      },
-    ]);
-  } catch (e) {
-    console.error("[notif][requestMeeting]", e?.message || e);
-  }
 
   return res.status(201).json({
     success: true,
@@ -6088,6 +6310,172 @@ exports.getSuggestedListAdmin = asyncHandler(async (req, res) => {
 
   return res.json({ success: true, count: data.length, data });
 });
+exports.getSuggestedVirtualListAdmin = asyncHandler(async (req, res) => {
+  // Admin calls this. Must pass eventId in query.
+  const q = req.query || {};
+  const eventId =
+    q.eventId && mongoose.isValidObjectId(q.eventId) ? toId(q.eventId) : null;
+  const limit = Math.min(200, Math.max(1, Number(q.limit || 50)));
+  const pool = Math.min(2000, Math.max(2, Number(q.pool || 400))); // candidates considered
+
+  if (!eventId) {
+    return res.status(400).json({ message: "eventId is required" });
+  }
+
+  // Pool: attendees in event who are open to meetings AND declared as virtual
+  // virtualMeet is allowed to be boolean true or string "true"
+  const base = {
+    id_event: eventId,
+    "matchingIntent.openToMeetings": { $ne: false },
+    virtualMeet: { $in: [true, "true"] },
+  };
+
+  const rows = await attendee
+    .find(base)
+    .select(
+      "_id personal.fullName personal.country personal.preferredLanguages organization.orgName verified personal.profilePic virtualMeet"
+    )
+    .limit(pool)
+    .lean();
+
+  if (!rows.length) {
+    return res.json({ success: true, count: 0, data: [] });
+  }
+
+  // Build list of ids for later filtering
+  const ids = rows.map((r) => String(r._id));
+
+  // 1) Build a set of pairs that ALREADY have a meet between them
+  //    (pending / accepted / reschedule-proposed) so we don't suggest them again.
+  const existingReqs = await MeetRequest.find({
+    eventId,
+    status: { $in: ["pending", "accepted", "reschedule-proposed"] },
+    senderId: { $in: ids },
+    receiverId: { $in: ids },
+  })
+    .select("senderId receiverId")
+    .lean();
+
+  const blockedPairs = new Set();
+  for (const r of existingReqs) {
+    const a = String(r.senderId);
+    const b = String(r.receiverId);
+    const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+    blockedPairs.add(key);
+  }
+
+  // 2) Prepare feature vectors using BusinessProfile if exists; also keep a tiny bp cache for logo fallback
+  const vectors = new Map(); // actorId -> vector
+  const bpLogo = new Map(); // actorId -> logo url if any
+
+  await Promise.all(
+    rows.map(async (r) => {
+      const bp = await bpFor(r._id, eventId);
+      const v = {
+        actorId: String(r._id),
+        industries: words(bp?.industries || []),
+        offering: words(bp?.offering || []),
+        seeking: words(bp?.seeking || []),
+        languages: words(bp?.languages || r?.personal?.preferredLanguages || []),
+        countries: words(bp?.countries || [r?.personal?.country].filter(Boolean)),
+      };
+      vectors.set(String(r._id), v);
+
+      const logo =
+        bp?.logo?.url ||
+        bp?.logo ||
+        (Array.isArray(bp?.images) ? bp.images[0] : null);
+      if (logo) bpLogo.set(String(r._id), String(logo));
+    })
+  );
+
+  // Helper to extract a photo from attendee row or bp cache
+  const photoOf = (row) => {
+    const r = row || {};
+    return (
+      r?.personal?.profilePic ||
+      r?.personal?.photo ||
+      bpLogo.get(String(r?._id)) ||
+      ""
+    );
+  };
+
+  // 3) Build all candidate pairs, skip those who already have a meet
+  const pairs = [];
+  for (let i = 0; i < ids.length; i++) {
+    for (let j = i + 1; j < ids.length; j++) {
+      const idA = ids[i];
+      const idB = ids[j];
+
+      // Skip if they already have (pending/accepted/reschedule) meet
+      const pairKey = idA < idB ? `${idA}|${idB}` : `${idB}|${idA}`;
+      if (blockedPairs.has(pairKey)) continue;
+
+      const A = vectors.get(idA);
+      const B = vectors.get(idB);
+      const metaA = rows[i] || {};
+      const metaB = rows[j] || {};
+
+      const sc =
+        scorePair(A, B, metaA, metaB) + scorePair(B, A, metaB, metaA);
+
+      if (sc > 0) {
+        pairs.push({ a: idA, b: idB, score: sc });
+      }
+    }
+  }
+
+  // Sort by score descending
+  pairs.sort((x, y) => y.score - x.score);
+
+  // 4) Pick top N pairs, still ensuring unique attendee per side (same behavior as before)
+  const used = new Set();
+  const picked = [];
+  for (const p of pairs) {
+    if (picked.length >= limit) break;
+    if (used.has(p.a) || used.has(p.b)) continue;
+    used.add(p.a);
+    used.add(p.b);
+    picked.push(p);
+  }
+
+  // 5) Attach payload for UI (same shape, but no slot chosen: slotISO=null, slotReason="admin-pick")
+  const actorsMap = new Map(rows.map((r) => [String(r._id), r]));
+  const data = [];
+
+  for (const p of picked) {
+    const aId = p.a;
+    const bId = p.b;
+    const ra = actorsMap.get(aId) || {};
+    const rb = actorsMap.get(bId) || {};
+
+    data.push({
+      suggId: suggIdOf(aId, bId),
+      eventId: String(eventId),
+      score: p.score,
+      // no automatic slot now – admin will pick the time
+      slotISO: null,
+      slotReason: "admin-pick",
+      a: {
+        id: aId,
+        name: ra?.personal?.fullName || "",
+        role: "attendee",
+        photo: photoOf(ra),
+        adminLinks: { attendee: `/admin/members/attendees?id=${aId}` },
+      },
+      b: {
+        id: bId,
+        name: rb?.personal?.fullName || "",
+        role: "attendee",
+        photo: photoOf(rb),
+        adminLinks: { attendee: `/admin/members/attendees?id=${bId}` },
+      },
+    });
+  }
+
+  return res.json({ success: true, count: data.length, data });
+});
+
 const { google } = require("googleapis");
 // ───────────────────────── ADMIN: generate Google Meet (platform link) ─────────────────────────
 // POST /admin/meets/:id/gmeet
@@ -7006,4 +7394,3 @@ exports.actorSubmitFeedback = asyncHandler(async (req, res) => {
 
   res.json({ ok:true });
 });
-

@@ -122,7 +122,10 @@ router.patch('/chat/:roomId/seen',      protect, actor.markSeen);
 
 // Upload files to a room (creates a message)
 router.post('/chat/:roomId/files',      protect, chatBlockGuard, actor.uploadFiles);
-
+router.patch(
+  '/admin/attendees/virtual',
+  actor.setAttendeesVirtual
+);
 
 
 

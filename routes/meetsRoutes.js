@@ -27,6 +27,7 @@ router.get('/',                     protect, meetsCtrl.getMyMeetings);        //
 router.post('/actions',                     protect, meetsCtrl.makeMeetingAction);        // Part 4
 router.get('/suggested',                     protect, meetsCtrl.getSuggestedList);        // Part 4
 router.get('/admin/suggested',                     protect, meetsCtrl.getSuggestedListAdmin);        // Part 4
+router.get('/admin/suggested/virtual',                     protect, meetsCtrl.getSuggestedVirtualListAdmin);        // Part 4
 router.get('/meets/agenda/:actorId',     protect, meetsCtrl.listActorAgenda); // Part 4
 router.get('/meets/:id/ics',             protect, meetsCtrl.getMeetingICS);        // Part 5
 router.get('/meetings/prefs/:actorId', protect, meetsCtrl.getMeetingPrefs);

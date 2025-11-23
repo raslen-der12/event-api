@@ -3655,3 +3655,105 @@ exports.listSpeakerAssignedSessions = asyncHdl(async (req, res) => {
 
   return res.json({ success: true, count: merged.length, data: merged });
 });
+exports.setAttendeesVirtual = asyncHdl(async (req, res) => {
+  let { eventId, attendeeIds, virtual } = req.body || {};
+
+  // default: turn ON virtual
+  const toStr = (v) => (v == null ? '' : String(v)).toLowerCase().trim();
+  const setVirtual = (() => {
+    const s = toStr(virtual);
+    if (['false', '0', 'no', 'off'].includes(s)) return false;
+    if (['true', '1', 'yes', 'on'].includes(s)) return true;
+    return true; // default
+  })();
+
+  const filter = {};
+
+  // scope by event if provided
+  if (eventId && isId(eventId)) {
+    filter.id_event = eventId;
+  }
+
+  // scope by explicit ids if provided
+  const ids = Array.isArray(attendeeIds)
+    ? attendeeIds.filter(isId)
+    : [];
+  if (ids.length) {
+    filter._id = { $in: ids };
+  }
+
+  // safety: require at least event or ids
+  if (!filter.id_event && !filter._id) {
+    return res.status(400).json({
+      success: false,
+      message: 'Provide eventId and/or attendeeIds to select attendees'
+    });
+  }
+
+  // load candidates (only those that actually need change)
+  const rows = await attendee
+    .find(filter)
+    .select('_id virtualMeet')
+    .lean()
+    .exec();
+
+  if (!rows.length) {
+    return res.json({
+      success: true,
+      updated: 0,
+      virtual: setVirtual,
+      message: 'No attendees matched filter'
+    });
+  }
+
+  const targetIds = rows
+    .filter(r => !!r && r.virtualMeet !== setVirtual)
+    .map(r => r._id);
+
+  if (!targetIds.length) {
+    return res.json({
+      success: true,
+      updated: 0,
+      virtual: setVirtual,
+      message: 'All selected attendees already in desired mode'
+    });
+  }
+
+  // update attendees
+  await attendee.updateMany(
+    { _id: { $in: targetIds } },
+    { $set: { virtualMeet: setVirtual } }
+  );
+
+  // create notifications only when turning to VIRTUAL
+  let notified = 0;
+  if (setVirtual) {
+    const now = new Date();
+    const baseNote = {
+      title: 'You are now a virtual attendee',
+      body: 'An admin switched your participation mode to virtual. You can switch back to physical at any time from your personal profile page.',
+      link: '/profile',
+      priority: 8,
+      createdAt: now
+    };
+
+    const docs = targetIds.map(actorId => ({
+      actorId,
+      ...baseNote
+    }));
+
+    try {
+      const resInsert = await Notif.insertMany(docs, { ordered: false });
+      notified = Array.isArray(resInsert) ? resInsert.length : docs.length;
+    } catch (e) {
+      console.warn('setAttendeesVirtual notif insert failed:', e?.message);
+    }
+  }
+
+  return res.json({
+    success: true,
+    virtual: setVirtual,
+    updated: targetIds.length,
+    notified
+  });
+});

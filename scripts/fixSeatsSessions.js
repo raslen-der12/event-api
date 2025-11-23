@@ -1,123 +1,158 @@
+// scripts/backfill-attendance.js
+require("dotenv").config();
+const mongoose = require("mongoose");
 
-/* ===== Setup ===== */
-const mongoose = require('mongoose');
+// --- CONFIG ---
+// Event to backfill
+const EVENT_ID =
+  process.env.BACKFILL_EVENT_ID || "68e6764bb4f9b08db3ccec04";
+const SCANNER_ID = "68eceeed78d8944c819e826b"; // scanner/admin user
+const MAX_NEW_CHECKINS = 100; // <-- hard limit
 
-// ⚠️ Adjust these paths if your structure differs
-const SessionRegistration = require('../models/sessionRegistration');          // sessionRegistration.js
-const Schedule            = require('../models/eventModels/schedule');        // eventModels/schedule.js
-const Attendee            = require('../models/attendee');
-const Exhibitor           = require('../models/exhibitor');
-const Speaker             = require('../models/speaker');
+// --- MODELS ---
+const Attendee = require("../models/attendee");
 
-const MONGO_URI = process.env.DATABASE_URI
-
-/* ===== Helpers ===== */
-const oidStr = (v) => {
-  try { return String(v); } catch { return null; }
-};
-const getActorId = (r) =>
-  r.actorId || r.actor || r.id_actor || r.actor_id || (r.actor && r.actor._id);
-const getSessionId = (r) =>
-  r.sessionId || r.session || r.id_session || r.scheduleId || r.id_schedule || (r.session && r.session._id);
-
-/* ===== Main ===== */
-(async () => {
-  const t0 = Date.now();
-  await mongoose.connect(MONGO_URI, { maxPoolSize: 10 });
-  console.log('[rebuild] connected');
-
-  // 1) Load all session registrations (lean for perf)
-  const regs = await SessionRegistration.find({}).select('_id actorId actor sessionId session id_session id_schedule').lean();
-  console.log(`[rebuild] registrations loaded: ${regs.length}`);
-
-  // 2) Collect unique actorIds referenced by registrations
-  const actorIds = new Set();
-  for (const r of regs) {
-    const a = oidStr(getActorId(r));
-    if (a) actorIds.add(a);
-  }
-  console.log(`[rebuild] unique actorIds referenced: ${actorIds.size}`);
-
-  // 3) Resolve which actorIds actually exist (union of Attendee, Exhibitor, Speaker)
-  const idsArr = Array.from(actorIds).map((s) => new mongoose.Types.ObjectId(s));
-  const [attOK, exOK, spOK] = await Promise.all([
-    Attendee.find({ _id: { $in: idsArr } }).select('_id').lean(),
-    Exhibitor.find({ _id: { $in: idsArr } }).select('_id').lean(),
-    Speaker.find({ _id: { $in: idsArr } }).select('_id').lean(),
-  ]);
-
-  const validActorIds = new Set(
-    attOK.concat(exOK, spOK).map((d) => String(d._id))
-  );
-  console.log(`[rebuild] valid actorIds found: ${validActorIds.size}`);
-
-  // 4) Split registrations into valid vs invalid (actor missing)
-  const invalidRegIds = [];
-  // Map<sessionId, Set<actorId>> to dedupe actors per session
-  const perSessionActors = new Map();
-
-  for (const r of regs) {
-    const a = oidStr(getActorId(r));
-    const s = oidStr(getSessionId(r));
-    if (!a || !s) {
-      invalidRegIds.push(String(r._id)); // malformed reg – drop it
-      continue;
-    }
-    if (!validActorIds.has(a)) {
-      invalidRegIds.push(String(r._id));
-      continue;
-    }
-    // keep valid -> count per session (dedupe actors)
-    if (!perSessionActors.has(s)) perSessionActors.set(s, new Set());
-    perSessionActors.get(s).add(a);
-  }
-
-  console.log(`[rebuild] invalid registrations to delete: ${invalidRegIds.length}`);
-  console.log(`[rebuild] sessions with at least one valid reg: ${perSessionActors.size}`);
-
-  if (invalidRegIds.length) {
-    await SessionRegistration.deleteMany({ _id: { $in: invalidRegIds } });
-    console.log('[rebuild] invalid registrations deleted');
-  }
-
-  const schedules = await Schedule.find({}).select('_id seats seatsTaken').lean();
-  console.log(`[rebuild] schedules loaded: ${schedules.length}`);
-
-  const ops = [];
-  for (const sch of schedules) {
-    const sid = String(sch._id);
-    const count = perSessionActors.get(sid)?.size || 0;
-    ops.push({
-      updateOne: {
-        filter: { _id: sch._id },
-        update: {
-          $set: {
-            seatsTaken: count,          // top-level (if your schema uses this)
-            'seats.taken': count,       // nested (if your schema uses seats: { taken })
-          },
+// If you already have a dedicated model file for eventCheckin, use:
+// const EventCheckin = require("../models/eventCheckin");
+const EventCheckin =
+  mongoose.models.eventCheckin ||
+  mongoose.model(
+    "eventCheckin",
+    new mongoose.Schema(
+      {
+        eventId: {
+          type: mongoose.Schema.Types.ObjectId,
+          index: true,
+          required: true,
         },
+        actorId: {
+          type: mongoose.Schema.Types.ObjectId,
+          index: true,
+          required: true,
+        },
+        actorRole: {
+          type: String,
+          enum: ["attendee", "exhibitor", "speaker", "admin"],
+          required: true,
+        },
+        at: { type: Date, default: Date.now },
+        by: { type: mongoose.Schema.Types.ObjectId, index: true },
       },
-    });
+      { versionKey: false, timestamps: false }
+    )
+  );
+
+// --- UTIL ---
+/**
+ * Get a random Date today between [08:00, 14:30]
+ */
+function randomTimeToday() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const d = now.getDate();
+
+  const start = new Date(y, m, d, 8, 0, 0, 0); // 08:00
+  const end = new Date(y, m, d, 14, 30, 0, 0); // 14:30
+
+  const diffMs = end.getTime() - start.getTime();
+  const offset = Math.floor(Math.random() * diffMs);
+
+  return new Date(start.getTime() + offset);
+}
+
+// Fisher–Yates shuffle
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+async function main() {
+  if (!process.env.DATABASE_URI) {
+    console.error("Missing DATABASE_URI in .env");
+    process.exit(1);
+  }
+  if (!EVENT_ID || EVENT_ID === "PUT_EVENT_ID_HERE") {
+    console.error("Set EVENT_ID or BACKFILL_EVENT_ID before running.");
+    process.exit(1);
   }
 
-  // chunk bulks for safety (1k ops per batch)
-  const CHUNK = 1000;
-  let updated = 0;
-  for (let i = 0; i < ops.length; i += CHUNK) {
-    const slice = ops.slice(i, i + CHUNK);
-    if (slice.length) {
-      const r = await Schedule.bulkWrite(slice, { ordered: false });
-      updated += (r.modifiedCount || 0) + (r.upsertedCount || 0) + (r.matchedCount || 0);
-    }
+  await mongoose.connect(process.env.DATABASE_URI /* options if needed */);
+
+  const eventIdObj = new mongoose.Types.ObjectId(EVENT_ID);
+  const scannerIdObj = new mongoose.Types.ObjectId(SCANNER_ID);
+
+  console.log("Backfill for event:", EVENT_ID);
+
+  // 1) Who already has checkins for this event (as attendee)?
+  const existing = await EventCheckin.find({
+    eventId: eventIdObj,
+    actorRole: "attendee",
+  })
+    .select("actorId")
+    .lean();
+
+  const alreadySet = new Set(existing.map((c) => String(c.actorId)));
+  console.log("Existing attendee checkins:", alreadySet.size);
+
+  // 2) Find attendees that are adminVerified yes/true and belong to this event
+  const verifiedFilter = {
+    id_event: eventIdObj,
+    $or: [{ adminVerified: "yes" }, { adminVerified: true }],
+  };
+
+  const allVerified = await Attendee.find(verifiedFilter)
+    .select("_id personal.fullName adminVerified")
+    .lean();
+
+  console.log("Total adminVerified attendees for this event:", allVerified.length);
+
+  // 3) Filter those missing from eventCheckins
+  const missing = allVerified.filter(
+    (att) => !alreadySet.has(String(att._id))
+  );
+
+  console.log("Missing checkins (raw):", missing.length);
+
+  if (missing.length === 0) {
+    console.log("Nothing to backfill. Exiting.");
+    await mongoose.disconnect();
+    return;
   }
 
-  const t1 = Date.now();
-  console.log(`[rebuild] schedules updated: ${ops.length} (bulk). elapsed=${((t1 - t0) / 1000).toFixed(2)}s`);
+  // 3b) Shuffle and cap to MAX_NEW_CHECKINS
+  const shuffled = shuffle(missing);
+  const picked = shuffled.slice(
+    0,
+    Math.min(MAX_NEW_CHECKINS, shuffled.length)
+  );
+
+  console.log("Will actually insert:", picked.length);
+
+  // 4) Build docs to insert
+  const docs = picked.map((att) => ({
+    eventId: eventIdObj,
+    actorId: att._id,
+    actorRole: "attendee",
+    at: randomTimeToday(),
+    by: scannerIdObj,
+  }));
+
+  // Safety: log a preview of first 5
+  console.log("Preview of first 5 docs:", docs.slice(0, 5));
+
+  const inserted = await EventCheckin.insertMany(docs);
+  console.log("Inserted checkins:", inserted.length);
 
   await mongoose.disconnect();
-  console.log('[rebuild] done.');
-})().catch(async (err) => {
-  console.error('[rebuild] FAILED:', err && err.stack || err);
-  try { await mongoose.disconnect(); } catch {}
+  console.log("Done.");
+}
+
+main().catch((err) => {
+  console.error(err);
   process.exit(1);
 });
