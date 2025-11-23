@@ -6328,6 +6328,9 @@ exports.getSuggestedVirtualListAdmin = asyncHandler(async (req, res) => {
     id_event: eventId,
     "matchingIntent.openToMeetings": { $ne: false },
     virtualMeet: { $in: [true, "true"] },
+
+    // ⬇ NEW: exclude Student actorType
+    actorType: { $ne: "Student" },
   };
 
   const rows = await attendee
@@ -6376,8 +6379,12 @@ exports.getSuggestedVirtualListAdmin = asyncHandler(async (req, res) => {
         industries: words(bp?.industries || []),
         offering: words(bp?.offering || []),
         seeking: words(bp?.seeking || []),
-        languages: words(bp?.languages || r?.personal?.preferredLanguages || []),
-        countries: words(bp?.countries || [r?.personal?.country].filter(Boolean)),
+        languages: words(
+          bp?.languages || r?.personal?.preferredLanguages || []
+        ),
+        countries: words(
+          bp?.countries || [r?.personal?.country].filter(Boolean)
+        ),
       };
       vectors.set(String(r._id), v);
 
@@ -6428,7 +6435,7 @@ exports.getSuggestedVirtualListAdmin = asyncHandler(async (req, res) => {
   // Sort by score descending
   pairs.sort((x, y) => y.score - x.score);
 
-  // 4) Pick top N pairs, still ensuring unique attendee per side (same behavior as before)
+  // 4) Pick top N pairs, still ensuring unique attendee per side
   const used = new Set();
   const picked = [];
   for (const p of pairs) {
@@ -6439,7 +6446,7 @@ exports.getSuggestedVirtualListAdmin = asyncHandler(async (req, res) => {
     picked.push(p);
   }
 
-  // 5) Attach payload for UI (same shape, but no slot chosen: slotISO=null, slotReason="admin-pick")
+  // 5) Attach payload for UI
   const actorsMap = new Map(rows.map((r) => [String(r._id), r]));
   const data = [];
 
@@ -6453,7 +6460,6 @@ exports.getSuggestedVirtualListAdmin = asyncHandler(async (req, res) => {
       suggId: suggIdOf(aId, bId),
       eventId: String(eventId),
       score: p.score,
-      // no automatic slot now – admin will pick the time
       slotISO: null,
       slotReason: "admin-pick",
       a: {
@@ -6475,6 +6481,7 @@ exports.getSuggestedVirtualListAdmin = asyncHandler(async (req, res) => {
 
   return res.json({ success: true, count: data.length, data });
 });
+
 
 const { google } = require("googleapis");
 // ───────────────────────── ADMIN: generate Google Meet (platform link) ─────────────────────────
