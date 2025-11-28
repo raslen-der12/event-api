@@ -79,7 +79,8 @@ app.use('/biz', require('./routes/bp.admin.routes'));
 app.use('/admin/actors', require('./routes/adminActorsRoutes'));
 app.use('/community', require('./routes/community.routes'));
 app.use('/polls', require('./routes/pollsRoutes'));
-
+app.use('/event-managers', require('./routes/eventManagerRoutes'));
+app.use("/event-manager/dashboard",require("./routes/eventManagerDashboardRoutes"));
 app.use((_req, res) => {
   console.log('404 Not Found');
   res.status(404).json({ message: '404 Not Found but ready to get requests' });

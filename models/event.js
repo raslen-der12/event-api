@@ -48,11 +48,41 @@ const eventSchema = new mongoose.Schema(
     /* ─── Capacity & metrics ───────────────────────────────────────────────── */
     capacity: { type: Number, min: 1 },
     seatsTaken: { type: Number, default: 0, min: 0 },
+        /* ─── Ticket plans (wizard draft) ──────────────────────────────────────── */
+    ticketPlans: [
+      {
+        name:     { type: String, trim: true, maxlength: 80 },
+        price:    { type: Number, min: 0, default: 0 },
+        currency: { type: String, trim: true, maxlength: 8, default: 'EUR' },
+        capacity: { type: Number, min: 0 },
+      },
+    ],
+
+    /* ─── Draft organizers (wizard draft) ─────────────────────────────────── */
+    draftOrganizers: [
+      {
+        name: { type: String, trim: true, maxlength: 120 },
+        role: { type: String, trim: true, maxlength: 80 },
+        link: { type: String, trim: true, maxlength: 200 },
+      },
+    ],
+
+    /* ─── Draft gallery (wizard draft) ────────────────────────────────────── */
+    draftGallery: [
+      {
+        title: { type: String, trim: true, maxlength: 100 },
+        type:  { type: String, enum: ['image', 'video', 'pdf'], default: 'image' },
+        file:  { type: String, trim: true, maxlength: 500 },
+      },
+    ],
 
     /* ─── Status flags ─────────────────────────────────────────────────────── */
     isPublished: { type: Boolean, default: false },
     isCancelled: { type: Boolean, default: false },
-    
+    ownerUser:  { type: mongoose.Schema.Types.ObjectId, ref: 'attendee', default: null },
+    ownerActor: { type: mongoose.Schema.Types.ObjectId, ref: 'attendee', default: null },
+    onboardingCompleted: { type: Boolean, default: false },
+    onboardingSource:    { type: String, enum: ['event-manager', 'admin', 'legacy'], default: 'event-manager' },
     /* ─── Metadata ─────────────────────────────────────────────────────────── */
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now }
