@@ -78,7 +78,12 @@ const speakerSchema = new mongoose.Schema({
 
   // Keep single role field (enum) if you need roleKind constraints; otherwise remove enum
   roleKind: { type: String, enum: ROLE_KIND_ENUM, index: true, default: null },
-
+  user: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'user',
+    index: true,
+    required: false,
+  },
   /* Core auth & event link */
   verified   : { type:Boolean, default:false },
   pwd        : { type:String, minlength:8, select:false }, // removed required:true to allow flexibility

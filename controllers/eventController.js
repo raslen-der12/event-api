@@ -522,87 +522,109 @@ exports.deleteEventCollectionItem = asyncHandler(async (req, res) => {
   }
 });
 
-/* ──────────────────────────────────────────────────────────────────────────────
- *  🌍  PUBLIC: getEventFull  (GET /api/events/:eventId/full)
- * ─────────────────────────────────────────────────────────────────────────── */
-/**
- * Fetch *all* visitor-visible content for a single event in one round-trip.
- * Steps:
- *   1.  Validate eventId & check short-lived cache.
- *   2.  Parallel Mongo queries using lean() to minimise overhead.
- *   3.  Merge results into a single JSON blob.
- *   4.  Cache the payload (Redis) and return.
- *
- * Response:
- *   {
- *     success : true,
- *     data    : {
- *       event, organizers, impacts, features,
- *       gallery, schedule, comments
- *     }
- *   }
- */
 
 exports.getEvents = asyncHandler(async (req, res) => {
+  // Public list: only published & not cancelled
+  const events = await Event.find({
+    isPublished: true,
+    isCancelled: { $ne: true },
+  }).lean();
 
-  const events = await Event.find().lean();
   res.json({ success: true, data: events });
 });
 
-
-
-
-
-
-
-
-
-
-
-
 exports.getEventFull = asyncHandler(async (req, res) => {
-  const {eventId} = req.body;
+  const { eventId } = req.body;
   console.log(eventId);
-  if (!mongoose.isValidObjectId(eventId))
-    return res.status(400).json({ message: 'Invalid eventId' });
+
+  if (!mongoose.isValidObjectId(eventId)) {
+    return res.status(400).json({ message: "Invalid eventId" });
+  }
 
   /* 1️⃣  Check cache */
   const CACHE_KEY = `eventFull:${eventId}`;
   const cached = await cacheGet(CACHE_KEY);
-  if (cached) return res.json({ success: true, data: cached });
+  if (cached) {
+    // Make sure cached event is valid & published
+    if (!cached.event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+    if (!cached.event.isPublished || cached.event.isCancelled) {
+      return res
+        .status(403)
+        .json({ message: "Event is not published or is cancelled" });
+    }
+
+    return res.json({ success: true, data: cached });
+  }
 
   /* 2️⃣  Master + child queries in parallel */
-  const [
+  const [event, organizers, impacts, features, gallery, schedule, comments] =
+    await Promise.all([
+      Event.findById(eventId).lean(),
+      Organizer.find({ id_event: eventId }).lean(),
+      Impact.find({ id_event: eventId }).lean(),
+      Feature.find({ id_event: eventId }).lean(),
+      Gallery.find({ id_event: eventId }).sort({ createdAt: -1 }).limit(24).lean(),
+      Schedule.find({ id_event: eventId }).sort({ startTime: 1 }).lean(),
+      Comment.find({ id_event: eventId, verified: true })
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .lean(),
+    ]);
+
+  if (!event) {
+    return res.status(404).json({ message: "Event not found" });
+  }
+
+  // ⬅️ Publish / cancel gate
+  if (!event.isPublished || event.isCancelled) {
+    return res
+      .status(403)
+      .json({ message: "Event is not published or is cancelled" });
+  }
+
+  /* 3️⃣  Merge + cache + respond */
+  const payload = {
     event,
     organizers,
     impacts,
     features,
     gallery,
     schedule,
-    comments
-  ] = await Promise.all([
-    Event.findById(eventId).lean(),
-    Organizer.find({ id_event: eventId }).lean(),
-    Impact.find({ id_event: eventId }).lean(),
-    Feature.find({ id_event: eventId }).lean(),
-    Gallery.find({ id_event: eventId })
-           .sort({ createdAt: -1 })
-           .limit(24)
-           .lean(),
-    Schedule.find({ id_event: eventId })
-            .sort({ startTime: 1 })
-            .lean(),
-    Comment.find({ id_event: eventId, verified: true })
-           .sort({ createdAt: -1 })
-           .limit(50)
-           .lean()
-  ]);
+    comments,
+  };
 
-  /* 3️⃣  Merge + cache + respond */
-  const payload = { event, organizers, impacts, features, gallery, schedule, comments };
   await cacheSet(CACHE_KEY, payload);
 
   res.json({ success: true, data: payload });
+});
+
+exports.getEventMini = asyncHandler(async (req, res) => {
+  const { eventId } = req.body;
+  console.log(eventId);
+
+  if (!mongoose.isValidObjectId(eventId)) {
+    return res.status(400).json({ message: "Invalid eventId" });
+  }
+
+  const event = await Event.findById(eventId)
+    .select(
+      "title slug startDate endDate city country cover isPublished isCancelled seatsTaken capacity"
+    )
+    .lean();
+
+  if (!event) {
+    return res.status(404).json({ message: "Event not found here" });
+  }
+
+  if (!event.isPublished || event.isCancelled) {
+    return res
+      .status(403)
+      .json({ message: "Event is not published or is cancelled" });
+  }
+
+  res.json({ success: true, data: event });
 });
 
 /* Export the cache-init so server.js can inject redis */
@@ -2481,14 +2503,4 @@ exports.cancelReminder = asyncHandler(async (req,res)=>{
   res.json({ success:true, removed:num });
 });
 
-exports.getEventMini= asyncHandler(async (req, res) => {
-  const {eventId} = req.body;
-  console.log(eventId);
-  if (!mongoose.isValidObjectId(eventId))
-    return res.status(400).json({ message: 'Invalid eventId' });
 
-  const event = await Event.findById(eventId).lean();
-  if (!event) return res.status(404).json({ message: 'Event not found here' });
-
-  res.json({ success: true, data: event });
-});

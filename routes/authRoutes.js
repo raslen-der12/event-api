@@ -8,10 +8,10 @@ const { imageUploader } = require('../middleware/uploader');
 router.post('/login',loginLimiter,   authCtrl.login);
 router.get ('/refresh', authCtrl.refresh); 
 router.post('/logout',  protect, authCtrl.logout);
-
-router.post('/register/attendee', imageUploader.single('photo') ,  authCtrl.registerAttendee);   
+router.post('/user/register',       authCtrl.registerUser);
+router.post('/register/attendee',protect, imageUploader.single('photo') ,  authCtrl.registerAttendee);   
 router.post(
-   '/register/exhibitor',
+   '/register/exhibitor', protect,
    imageUploader.fields([
      { name: 'logo',  maxCount: 1 },
      { name: 'photo', maxCount: 1 },
@@ -23,12 +23,16 @@ router.post ('/verify-email',        authCtrl.verifyEmail);
 router.post('/resend-verification', authCtrl.resendVerification);
 router.post('/forgot-password', authCtrl.forgotPassword);
 router.post('/reset-password',  authCtrl.resetPassword);
-
+router.post('/google-login',   authCtrl.googleLogin);
 router.get ('/google', googleCtrl.verifyIdToken);
 router.post('/resend-verification/:actorId',authCtrl.resendVerificationById);
 router.post('/set-password', authCtrl.setPassword);          // { id, role, pwd }
 router.post('/change-email', authCtrl.changeEmail);          // { id, role, newEmail }
 router.post('/restore-email', authCtrl.restoreEmail);
-
+router.get('/user/other-labels', authCtrl.listOtherActorLabels);
+router.post(
+  '/user/resend-verification',
+  authCtrl.resendUserVerificationByEmail
+);
 
 module.exports = router

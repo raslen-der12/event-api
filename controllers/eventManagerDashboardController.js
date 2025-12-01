@@ -8,7 +8,10 @@ const EventManagerApplication = require("../models/EventManagerApplication");
 // tickets stay in event.ticketPlans, organizers in event.draftOrganizers.
 
 /* ────────────────────────── Auth context helper ───────────────────────── */
-
+function resolveUploadPath(file) {
+  if (!file) return null;
+  return file.location || file.path || file.filename || null;
+}
 function getAuthContext(req) {
   const ctx = { userId: null, actorId: null };
 
@@ -36,25 +39,21 @@ function getAuthContext(req) {
  */
 async function resolveManagerContext(req) {
   const base = getAuthContext(req);
-  console.log(req.user._id);
-  const userId = req.userId || req.user._id;
-  console.log(userId);
+  const userId = base.userId;
+
   if (!userId) {
     return { userId: null, actorId: null, application: null };
   }
 
-  const application = await EventManagerApplication.findOne({
-    user: userId,
-    status: "Approved",
-  })
+  const application = await EventManagerApplication.findOne({ user: userId })
+    .sort({ createdAt: -1 })
     .select("_id user actor status planId planLabel")
     .lean();
 
-  if (!application) {
-    return { userId, actorId: null, application: null };
-  }
-
-  const actorId = application.actor || null;
+  const actorId =
+    (application && (application.actor || base.actorId || userId)) ||
+    base.actorId ||
+    userId;
 
   return { userId, actorId, application };
 }
@@ -105,22 +104,62 @@ exports.createEventFromWizard = async (req, res, next) => {
         message: "You must be logged in to create an event.",
       });
     }
-    actorId= userId;
-    if (!actorId) {
-      return res.status(403).json({
-        error: "NOT_EVENT_MANAGER",
-        message:
-          "You need an approved Event Manager profile before creating events.",
-      });
-    }
+    
 
-    const {
-      basics = {},
-      schedule = [],
-      tickets = [],
-      organizers = [],
-      gallery = [],
-    } = req.body || {};
+    let {
+  basics = null,
+  schedule = null,
+  tickets = null,
+  organizers = null,
+  gallery = null,
+} = req.body || {};
+
+// multipart/form-data: fields arrive as strings → parse
+if (typeof basics === "string") {
+  try {
+    basics = JSON.parse(basics);
+  } catch {
+    basics = {};
+  }
+}
+if (typeof schedule === "string") {
+  try {
+    schedule = JSON.parse(schedule);
+  } catch {
+    schedule = [];
+  }
+}
+if (typeof tickets === "string") {
+  try {
+    tickets = JSON.parse(tickets);
+  } catch {
+    tickets = [];
+  }
+}
+if (typeof organizers === "string") {
+  try {
+    organizers = JSON.parse(organizers);
+  } catch {
+    organizers = [];
+  }
+}
+if (typeof gallery === "string") {
+  try {
+    gallery = JSON.parse(gallery);
+  } catch {
+    gallery = [];
+  }
+}
+
+
+// files coming from upload middleware (multer.fields([...]))
+const uploadedCover = req.files && Array.isArray(req.files.cover)
+  ? req.files.cover[0]
+  : null;
+
+const uploadedGallery = req.files && Array.isArray(req.files.gallery)
+  ? req.files.gallery
+  : [];
 
     const {
       title,
@@ -133,7 +172,7 @@ exports.createEventFromWizard = async (req, res, next) => {
       venueName,
       capacity,
       cover,
-    } = basics;
+    } = basics || {};
 
     if (!title || !startDate || !endDate || !target) {
       return res.status(400).json({
@@ -166,7 +205,7 @@ exports.createEventFromWizard = async (req, res, next) => {
           venueName: venueName || "",
           capacity: capacity || undefined,
           cover: cover || undefined,
-
+          isPublished: false,
           // owner: we store both user + actor for future flexibility
           ownerUser: userId || null,
           ownerActor: actorId || null,
@@ -231,11 +270,18 @@ exports.createEventFromWizard = async (req, res, next) => {
 
     const galleryDocs = [];
     if (Array.isArray(gallery) && gallery.length > 0) {
-      for (const g of gallery) {
-        if (!g.file) continue;
+      for (let i = 0; i < gallery.length; i += 1) {
+        const g = gallery[i] || {};
+        const upload = uploadedGallery[i] || null;
+
+        const filePath =
+          resolveUploadPath(upload) || g.file || g.url || g.path || "";
+
+        if (!filePath) continue;
+
         galleryDocs.push({
           id_event: event._id,
-          file: g.file,
+          file: filePath,
           title: g.title || "",
           type: g.type || "image",
         });
@@ -307,18 +353,10 @@ exports.listMyEventsForManager = async (req, res, next) => {
       });
     }
 
-    if (!actorId) {
-      return res.status(403).json({
-        error: "NOT_EVENT_MANAGER",
-        message: "You need an approved Event Manager profile to view events.",
-      });
-    }
-
     const filter = {
       ownerUser: userId,
       ownerActor: actorId,
     };
-
     const docs = await Event.find(filter)
       .sort({ startDate: 1 })
       .select(
@@ -359,13 +397,6 @@ exports.getEventForManagerDashboard = async (req, res, next) => {
       return res.status(401).json({
         error: "AUTH_REQUIRED",
         message: "You must be logged in to view this event.",
-      });
-    }
-
-    if (!actorId) {
-      return res.status(403).json({
-        error: "NOT_EVENT_MANAGER",
-        message: "You need an approved Event Manager profile to view events.",
       });
     }
 
@@ -491,7 +522,11 @@ exports.updateEventForManagerDashboard = async (req, res, next) => {
 
   try {
     const { userId, actorId } = await resolveManagerContext(req);
+    const uploadedCover =
+      req.files && Array.isArray(req.files.cover) ? req.files.cover[0] : null;
 
+    const uploadedGallery =
+      req.files && Array.isArray(req.files.gallery) ? req.files.gallery : [];
     if (!userId) {
       await session.abortTransaction();
       session.endSession();
@@ -574,7 +609,13 @@ exports.updateEventForManagerDashboard = async (req, res, next) => {
       if (city !== undefined) event.city = String(city || "");
       if (country !== undefined) event.country = String(country || "");
       if (venueName !== undefined) event.venueName = String(venueName || "");
-      if (cover !== undefined) event.cover = cover || "";
+
+// prefer uploaded file if provided, fallback to body.cover
+        const coverPath = resolveUploadPath(uploadedCover) || cover || "";
+        if (coverPath) {
+          event.cover = coverPath;
+        }
+
 
       if (capacity !== undefined) {
         const num = Number(capacity);

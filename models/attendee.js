@@ -38,6 +38,11 @@ const MatchingIntentSchema = new mongoose.Schema({
 
 const AttendeeSchema = new mongoose.Schema({
   // Lightweight “actor role” system
+  user: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'user',
+    index: true,
+  },
   actorType         : { type: String, trim: true, default: '' },     // BusinessOwner, Consultant, Employee, Investor, Student, Expert
   role              : { type: String, trim: true, default: '' },     // BusinessOwner, Consultant, Employee, Investor, Student, Expert
   actorHeadline     : { type: String, trim: true, default: '' },     // short tagline

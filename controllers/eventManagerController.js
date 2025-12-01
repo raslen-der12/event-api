@@ -1,5 +1,7 @@
 // controllers/eventManagerController.js
 const EventManagerApplication = require("../models/EventManagerApplication");
+const User = require("../models/user");
+
 const { sendMail } = require("../config/mailer"); // <- your existing mailer
 
 /**
@@ -119,7 +121,7 @@ exports.applyEventManager = async (req, res, next) => {
       });
     }
 
-    const doc = await EventManagerApplication.create({
+        const doc = await EventManagerApplication.create({
       user: userId || undefined,
       actor: actorId || undefined,
       planId,
@@ -143,6 +145,29 @@ exports.applyEventManager = async (req, res, next) => {
       notes,
     });
 
+    // 👉 Immediately make this user an Event Manager
+    if (userId) {
+      try {
+        const user = await User.findById(userId);
+        if (user) {
+          // roles[] array style
+          if (Array.isArray(user.roles)) {
+            if (!user.roles.includes("EVENT_MANAGER")) {
+              user.roles.push("EVENT_MANAGER");
+            }
+          } else if (typeof user.role === "string") {
+            // single role style
+            if (user.role !== "EVENT_MANAGER") {
+              user.role = "EVENT_MANAGER";
+            }
+          }
+          await user.save();
+        }
+      } catch (e) {
+        console.error("applyEventManager: failed to promote user to EVENT_MANAGER", e);
+      }
+    }
+
     return res.status(201).json({
       ok: true,
       application: {
@@ -156,6 +181,7 @@ exports.applyEventManager = async (req, res, next) => {
         createdAt: doc.createdAt,
       },
     });
+
   } catch (err) {
     console.error("applyEventManager error:", err);
     next(err);
@@ -368,7 +394,7 @@ exports.adminUpdateApplicationStatus = async (req, res, next) => {
       });
     }
 
-    const prevStatus = doc.status;
+   const prevStatus = doc.status;
 
     doc.status = status;
     doc.reviewNotes = reviewNotes || undefined;
@@ -376,7 +402,32 @@ exports.adminUpdateApplicationStatus = async (req, res, next) => {
 
     await doc.save();
 
-    // If we just switched to Approved, send email
+    // 👉 If rejected, revert user back (remove EVENT_MANAGER)
+    if (status === "Rejected" && doc.user) {
+      try {
+        const user = await User.findById(doc.user);
+        if (user) {
+          if (Array.isArray(user.roles)) {
+            user.roles = user.roles.filter((r) => r !== "EVENT_MANAGER");
+            if (!user.roles.length) {
+              user.roles = ["USER"];
+            }
+          } else if (typeof user.role === "string") {
+            if (user.role === "EVENT_MANAGER") {
+              user.role = "USER";
+            }
+          }
+          await user.save();
+        }
+      } catch (e) {
+        console.error(
+          "adminUpdateApplicationStatus: failed to downgrade EVENT_MANAGER user",
+          e
+        );
+      }
+    }
+
+    // If we just switched to Approved, send email (only message, no role change)
     if (prevStatus !== "Approved" && doc.status === "Approved") {
       try {
         await sendEventManagerApprovedEmail(doc.toObject());

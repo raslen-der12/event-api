@@ -19,7 +19,7 @@ const attendee  = require('../models/attendee');
 const Exhibitor = require('../models/exhibitor');
 const ActorNotification = require('../models/actorNotification');
 const Event = require('../models/event'); // model name is "Event" (capital E); change path if needed
-
+const User      = require('../models/user');
 const Speaker   = require('../models/speaker');
 const { sendMail } = require('../config/mailer');
 const RoleBusinessOwner = require('../models/roles/BusinessOwner');
@@ -43,7 +43,10 @@ const normBool = (v) => ['1','true','yes','y','on'].includes(toStr(v).toLowerCas
 const csvToArr = (v) => toStr(v).split(',').map(s => s.trim()).filter(Boolean);
 const isId = (v) => mongoose.isValidObjectId(v);
 
-
+const { OAuth2Client } = require('google-auth-library'); // pour Google login
+const googleClient = process.env.GOOGLE_CLIENT_ID
+  ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID)
+  : null;
 
 // ---- Cross-collection email uniqueness helpers ----
 function normalizeEmail(e) {
@@ -54,9 +57,34 @@ function normalizeEmail(e) {
 function safeRequire(p) {
   try { return require(p); } catch { return null; }
 }
+const USER_ACTOR_TYPES = Object.freeze([
+  'BusinessOwner',
+  'Investor',
+  'Consultant',
+  'Expert',
+  'Employee',
+  'Student',
+  'Other',
+]);
 
+function normalizeActorType(input) {
+  const s = String(input || '').trim().toLowerCase();
+  if (!s) return null;
+
+  if (['businessowner','business owner','owner','entrepreneur','business_owner'].includes(s)) {
+    return 'BusinessOwner';
+  }
+  if (['investor'].includes(s)) return 'Investor';
+  if (['consultant'].includes(s)) return 'Consultant';
+  if (['expert'].includes(s)) return 'Expert';
+  if (['employee','staff','worker'].includes(s)) return 'Employee';
+  if (['student'].includes(s)) return 'Student';
+  if (['other','autre'].includes(s)) return 'Other';
+  return null;
+}
 // Adjust paths if your model paths differ
 const EMAIL_MODELS = {
+  User          : safeRequire('../models/user'),
   Attendee      : safeRequire('../models/attendee'),
   Exhibitor     : safeRequire('../models/exhibitor'),
   Speaker       : safeRequire('../models/speaker'),
@@ -440,152 +468,238 @@ async function createSessionRegs({ actorId, actorRole, eventId, sessions=[] }) {
   }));
   await sessionRegistration.insertMany(docs, { ordered: false }).catch(() => {});
 }
-/* ───────────────────────── LOGIN HANDLER ──────────────────────────── */
+// ───────────────────────── LOGIN USER (plateforme) ─────────────────────────
+// POST /auth/user/login
+// Body: { email, pwd }
 exports.login = asyncHandler(async (req, res) => {
-  let {  loginInput, pwd } = req.body;
-  if (!loginInput || !pwd){ return res.status(400).json({ message: 'Email/username and password are required' });}
+  let { email, loginInput, pwd } = req.body || {};
 
-  loginInput = loginInput.trim();
-  pwd        = pwd.trim();
+  // frontend may send `loginInput`, treat it as email for now
+  email = email || loginInput;
 
-  const isEmail = EMAIL_RX.test(loginInput);
-
-  /* 1️⃣  Build search order – admins last */
-  const lookups = [
-    {
-      model : Admin,
-      where : { email: loginInput.toLowerCase() },
-      role  : 'admin'
-    },
-    // attendee
-    {
-      model : attendee,
-      where : isEmail
-              ? { 'personal.email' : loginInput.toLowerCase() }
-              : { 'personal.fullName': loginInput },
-      role  : 'attendee'
-    },
-    // EXHIBITOR
-    {
-      model : Exhibitor,
-      where : isEmail
-              ? { 'identity.email' : loginInput.toLowerCase() }
-              : { 'identity.exhibitorName': loginInput },
-      role  : 'exhibitor'
-    },
-    // SPEAKER
-    {
-      model : Speaker,
-      where : isEmail
-              ? { 'personal.email': loginInput.toLowerCase() }
-              : { 'personal.fullName': loginInput },
-      role  : 'speaker'
-    },
-    // ADMIN
-    
-  ];
-
-  /* 2️⃣  Find the first matching document */
-  let foundUser = null, role = null;
-  for (const { model, where, role: r } of lookups) {
-    foundUser = await model.findOne(where).select('+pwd').exec();
-    if (foundUser) { role = r; break; }
+  if (!email || !pwd) {
+    return res.status(400).json({ message: 'Email and password are required' });
   }
 
-  if (!foundUser)
+  email = String(email).trim().toLowerCase();
+  pwd   = String(pwd).trim();
+
+  if (!EMAIL_RX.test(email)) {
+    return res.status(400).json({ message: 'Valid email is required' });
+  }
+
+  const user = await User.findOne({ email })
+    .select('+pwd +verified')
+    .exec();
+
+  if (!user) {
     return res.status(403).json({ message: 'Incorrect email or password' });
+  }
 
-  /* 3️⃣  Password check */
-  const ok = await bcrypt.compare(pwd, foundUser.pwd);
-  if (!ok)
-    return res.status(403).json({ message: 'Incorrect email or password ' });
+  const ok = await user.comparePassword(pwd);
 
-  /* 4️⃣  JWTs */
+  if (!ok) {
+    return res.status(403).json({ message: 'Incorrect email or password' });
+  }
+
+  if (!user.verified) {
+    return res.status(403).json({
+      success: false,
+      code   : 'EMAIL_NOT_VERIFIED',
+      message: 'Please verify your e-mail before logging in.',
+    });
+  }
+
+  const authRole = user.isAdmin ? 'admin' : 'user';
+
+  const tokenPayload = {
+    email    : user.email,
+    role     : authRole,
+    ActorId  : user._id.toString(),
+    userId   : user._id.toString(),
+    actorType: user.actorType || null,
+    subRole  : user.subRole || [],
+  };
+
   const accessToken = jwt.sign(
-    { UserInfo: { email: loginInput.toLowerCase(), role ,ActorId: foundUser["_id"], virtualMeet : foundUser.virtualMeet} },
+    { UserInfo: tokenPayload },
     process.env.ACCESS_TOKEN_SECRET,
-    { expiresIn: '15m' }
+    { expiresIn: '30m' }
   );
 
   const refreshToken = jwt.sign(
-    { email: loginInput.toLowerCase(), role ,ActorId: foundUser._id.toString()},
+    tokenPayload,
     process.env.REFRESH_TOKEN_SECRET,
     { expiresIn: '7d' }
   );
 
-  /* 5️⃣  Cookie + response */
   const isProduction = process.env.NODE_ENV === 'production';
+
   res.cookie('jwt', refreshToken, {
-    httpOnly : true,
-    secure   : isProduction,
-    sameSite : isProduction,
-    maxAge   : 7 * 24 * 60 * 60 * 1000
+    httpOnly: true,
+    secure  : isProduction,
+    sameSite: isProduction ? 'strict' : 'lax',
+    maxAge  : 7 * 24 * 60 * 60 * 1000,
   });
-  res.json({
-    success : true,
-    message : 'Login successful',
-    data    : {
+
+  return res.json({
+    success: true,
+    message: 'Login successful',
+    data: {
       accessToken,
-      actorId   : foundUser._id,
-      tokenType : 'Bearer',
-      expiresIn : '15m'
-    }
+      tokenType: 'Bearer',
+      expiresIn: '30m',
+      user: {
+        id          : user._id,
+        fullName    : user.fullName,
+        email       : user.email,
+        phone       : user.phone,
+        organization: user.organization,
+        jobTitle    : user.jobTitle,
+        actorType   : user.actorType,
+        subRole     : user.subRole,
+        role        : authRole,
+      },
+    },
   });
 });
+exports.verifyUserEmail = asyncHandler(async (req, res) => {
+  const id    = (req.body?.id || req.query?.id || '').trim();
+  const token = String(req.body?.token || req.query?.token || '').trim();
+
+  if (!id || !token) {
+    return res.status(400).json({ message: 'Missing id or token' });
+  }
+  if (!mongoose.isValidObjectId(id)) {
+    return res.status(400).json({ message: 'Bad user id' });
+  }
+
+  const user = await User.findById(id)
+    .select('+verifyToken +verifyExpires +verified')
+    .exec();
+
+  if (!user) {
+    return res.status(404).json({ message: 'User not found' });
+  }
+  if (user.verified) {
+    return res.json({ success: true, message: 'Already verified' });
+  }
+  if (!user.verifyToken || !user.verifyExpires) {
+    return res.status(400).json({ message: 'No verification token set' });
+  }
+
+  const expiresMs = Number(user.verifyExpires);
+  if (!Number.isFinite(expiresMs) || expiresMs <= Date.now()) {
+    return res.status(400).json({ message: 'Verification link expired' });
+  }
+
+  const ok = await bcrypt.compare(token, user.verifyToken);
+  if (!ok) {
+    return res.status(400).json({ message: 'Invalid verification token' });
+  }
+
+  user.verified      = true;
+  user.verifyToken   = undefined;
+  user.verifyExpires = undefined;
+  await user.save();
+
+  return res.json({ success: true, message: 'E-mail verified.' });
+});
 exports.refresh = asyncHandler(async (req, res) => {
-
-  /* 0️⃣  Must have cookie */
+  // 0) Must have refresh cookie
   const refreshToken = req.cookies?.jwt;
-  if (!refreshToken) return res.status(401).json({ message: 'Unauthorized' });
+  if (!refreshToken) return res.status(401).json({ message: "Unauthorized" });
 
-  /* 1️⃣  Verify refresh JWT */
+  // 1) Verify refresh JWT
   let payload;
   try {
     payload = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
-    // payload = { email, role }
   } catch {
-    return res.status(403).json({ message: 'Forbidden' });
+    return res.status(403).json({ message: "Forbidden" });
   }
 
-  const { email, role } = payload;
-  if (!email || !role) return res.status(400).json({ message: 'Bad token' });
+  const { email, role } = payload || {};
+  if (!email || !role)
+    return res.status(400).json({ message: "Bad token" });
 
-  /* 2️⃣  Look up user in the appropriate collection */
+  // 2) Look up user in the appropriate collection
   let foundUser = null;
+  let actorType = null;
+  let subRole = [];
 
   switch (role) {
-    case 'attendee':
-      foundUser = await attendee.findOne({ 'personal.email': email }).exec();
+    // New v2 platform users (and admins) stored in User collection
+    case "user":
+    case "admin": {
+      foundUser = await User.findOne({ email }).exec();
+      if (!foundUser && role === "admin") {
+        // backward-compat: old admins collection
+        foundUser = await Admin.findOne({ email }).exec();
+      }
+      if (!foundUser) {
+        return res.status(401).json({ message: "Unauthorized" });
+      }
+      actorType = foundUser.actorType || null;
+      subRole = Array.isArray(foundUser.subRole) ? foundUser.subRole : [];
       break;
-    case 'exhibitor':
-      foundUser = await Exhibitor.findOne({ 'identity.email': email }).exec();
+    }
+
+    // Legacy B2B actors (still supported for older tokens)
+    case "attendee":
+      foundUser = await attendee.findOne({ "personal.email": email }).exec();
+      actorType = "attendee";
+      subRole = ["attendee"];
       break;
-    case 'speaker':
-      foundUser = await Speaker.findOne({ 'personal.email': email }).exec();
+    case "exhibitor":
+      foundUser = await Exhibitor.findOne({ "identity.email": email }).exec();
+      actorType = "exhibitor";
+      subRole = ["exhibitor"];
       break;
-    case 'admin':
-      foundUser = await Admin.findOne({ email }).exec();
+    case "speaker":
+      foundUser = await Speaker.findOne({ "personal.email": email }).exec();
+      actorType = "speaker";
+      subRole = ["speaker"];
       break;
     default:
-      return res.status(400).json({ message: 'Unknown role' });
+      return res.status(400).json({ message: "Unknown role" });
   }
 
-  if (!foundUser) return res.status(401).json({ message: 'Unauthorized' });
+  if (!foundUser) return res.status(401).json({ message: "Unauthorized" });
 
-  /* 3️⃣  Sign new access token */
+  // 3) Sign new access token with normalized UserInfo
+  const ActorId = foundUser._id.toString();
+  const userId =
+    foundUser.user?.toString?.() ||
+    ActorId;
+
+  const tokenPayload = {
+    email,
+    role,
+    ActorId,
+    userId,
+    actorType,
+    subRole,
+  };
+
+  if (typeof foundUser.virtualMeet !== "undefined") {
+    tokenPayload.virtualMeet = foundUser.virtualMeet;
+  }
+
   const accessToken = jwt.sign(
-    { UserInfo: { email, role ,ActorId: foundUser._id.toString(), virtualMeet : foundUser.virtualMeet} },
+    { UserInfo: tokenPayload },
     process.env.ACCESS_TOKEN_SECRET,
-    { expiresIn: '15m' }
+    { expiresIn: "30m" }
   );
 
-  /* 4️⃣  Send fresh access-token */
+  // 4) Send fresh access-token
   res.json({
     accessToken,
-    ActorId: foundUser._id.toString(),
-    role
+    ActorId,
+    role,
   });
 });
+
+
 /**************************************************************************************************
  *  REGISTRATION + EMAIL-VERIFICATION
  *  -------------------------------------------------------------------
@@ -634,7 +748,10 @@ async function notifyRegistrationPending(actorId, role, eventId) {
 /* ─────────────────────────── 1. attendee ─────────────────────────── */
 exports.registerAttendee = asyncHandler(async (req, res) => {
   // -------- logging helpers --------
-  const rid = String(req.headers["x-request-id"] || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`);
+  const rid = String(
+    req.headers["x-request-id"] ||
+      `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+  );
   const tag = (p) => `[registerAttendee#${rid}] ${p}`;
   const log = (...a) => console.log(tag("LOG"), ...a);
   const warn = (...a) => console.warn(tag("WARN"), ...a);
@@ -642,13 +759,94 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
   const timeStart = (label) => console.time(tag(label));
   const timeEnd = (label) => console.timeEnd(tag(label));
 
-  // -------- request envelope --------
+  // -------- resolve current platform user from JWT --------
+  let authPayload = null;
+  try {
+    // Support both shapes: req.user or req.user.UserInfo
+    const raw = req.user || {};
+    authPayload = raw.UserInfo || raw;
+
+    log("AUTH_PAYLOAD", {
+      hasUser: !!req.user,
+      keys: Object.keys(authPayload || {}),
+      role: authPayload?.role || null,
+      userId: authPayload?.userId || authPayload?.ActorId || null,
+    });
+  } catch (e) {
+    warn("AUTH_PAYLOAD_RESOLVE_FAIL", e?.message);
+  }
+
+  const currentRole = authPayload?.role || null;
+  const currentUserId =
+    authPayload?.userId || authPayload?.ActorId || authPayload?._id || null;
+
+  if (!currentUserId) {
+    warn("UNAUTHENTICATED_ATTEMPT");
+    return res
+      .status(401)
+      .json({ message: "You must be logged in to register for this event." });
+  }
+
+  // For now, only platform "user" can register as attendee (not event-manager, not legacy roles)
+  if (currentRole && currentRole !== "user" && currentRole !== "admin") {
+    warn("ROLE_NOT_ALLOWED", { currentRole, currentUserId });
+    return res.status(403).json({
+      message:
+        "Only platform users can register as attendees from this endpoint.",
+    });
+  }
+
+  // If you later add a dedicated "event-manager" authRole, block it explicitly:
+  if (currentRole === "event-manager") {
+    warn("EVENT_MANAGER_ATTEMPT", { currentUserId });
+    return res.status(403).json({
+      message: "Event managers cannot register as attendees from this endpoint.",
+    });
+  }
+
+  // -------- load platform user --------
+  timeStart("User.findById");
+  const platformUser = await User.findById(currentUserId)
+    .select("fullName email phone organization jobTitle actorType subRole")
+    .exec()
+    .catch((e) => {
+      error("User.findById error:", e?.message);
+      return null;
+    });
+  timeEnd("User.findById");
+
+  if (!platformUser) {
+    warn("PLATFORM_USER_NOT_FOUND", { currentUserId });
+    return res.status(401).json({ message: "User not found or inactive." });
+  }
+
+  const baseEmail = toStr(platformUser.email).trim().toLowerCase();
+  const baseFullName = toStr(platformUser.fullName || "").trim();
+  const basePhone = toStr(platformUser.phone || "").trim();
+  const baseOrg = toStr(platformUser.organization || "").trim();
+  const baseJobTitle = toStr(platformUser.jobTitle || "").trim();
+  const baseActorType = platformUser.actorType || "";
+  const baseSubRole = Array.isArray(platformUser.subRole)
+    ? platformUser.subRole
+    : [];
+
+  if (!EMAIL_RX.test(baseEmail)) {
+    warn("PLATFORM_USER_BAD_EMAIL", { baseEmail });
+    return res.status(400).json({
+      message:
+        "Your account email is invalid. Please contact support or update your profile.",
+    });
+  }
+
+  // -------- envelope + debug info --------
   try {
     log("BEGIN", {
       method: req.method,
       url: req.originalUrl || req.url,
       ip: req.ip,
-      ips: req.ips,
+      role: currentRole,
+      currentUserId,
+      email: baseEmail,
       xfwd: req.headers["x-forwarded-for"] || null,
     });
     log("HEADERS", {
@@ -661,45 +859,52 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     const bodyKeys = Object.keys(req.body || {});
     log("BODY_KEYS", bodyKeys);
   } catch (e) {
-    // never block request because of logging
     warn("Envelope logging failed:", e?.message);
   }
 
-  // -------- destructure inputs (unchanged) --------
+  // -------- destructure event registration inputs --------
   const {
     eventId,
-    pwd,
-    actorType = '',
-    inviteCode = '',
-    actorHeadline = '',
-    'personal.fullName': fullName,
-    'personal.email': email,
-    'personal.phone': phone,
-    'personal.country': country,
-    'personal.city': city,
-    'personal.gender': gender, // <-- NEW
+    actorType = "",
+    inviteCode = "",
+    actorHeadline = "",
 
-    'organization.orgName': orgName,
-    'organization.jobTitle': jobTitle,
-    'organization.businessRole': businessRole,
+    // Allow overriding identity fields, but base defaults from platformUser
+    "personal.fullName": fullNameRaw,
+    "personal.email": emailRaw, // ignored for identity, used only for logging
+    "personal.phone": phoneRaw,
+    "personal.country": country,
+    "personal.city": city,
+    "personal.gender": gender,
 
-    'businessProfile.preferredLanguages': prefLangCsv,
+    "organization.orgName": orgNameRaw,
+    "organization.jobTitle": jobTitleRaw,
+    "organization.businessRole": businessRole,
 
-    'matchingIntent.objective': objective,
-    'matchingIntent.openToMeetings': openToMeetings,
+    "businessProfile.preferredLanguages": prefLangCsv,
 
-    'links.website': website,
-    'links.linkedin': linkedin,
+    "matchingIntent.objective": objective,
+    "matchingIntent.openToMeetings": openToMeetings,
+
+    "links.website": website,
+    "links.linkedin": linkedin,
   } = req.body || {};
+
   const virtualMeetRaw = req.body?.virtualMeet;
 
   // Sessions (raw)
   const sessionIds = []
-    .concat(req.body?.['sessionIds[]'] || req.body?.sessionIds || [])
+    .concat(req.body?.["sessionIds[]"] || req.body?.sessionIds || [])
     .flat()
     .filter(Boolean);
 
-  // -------- input snapshot (sanitized) --------
+  // -------- merge platform & body identity --------
+  const fullName = toStr(fullNameRaw || baseFullName).trim();
+  const phone = toStr(phoneRaw || basePhone).trim();
+  const orgName = toStr(orgNameRaw || baseOrg).trim();
+  const jobTitle = toStr(jobTitleRaw || baseJobTitle).trim();
+  const email = baseEmail; // force use of platform email
+
   log("INPUT_SNAPSHOT", {
     eventId,
     fullName,
@@ -721,74 +926,76 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     inviteCode,
     sessionIdsCount: sessionIds.length,
     virtualMeetRawType: typeof virtualMeetRaw,
-    pwdLength: (typeof pwd === "string" ? pwd.length : 0),
-    fileUploaded: !!req.file,
-    filePath: req.file?.path || null,
+    baseActorType,
+    baseSubRole,
   });
 
-  // -------- cross-email assertions --------
-  timeStart("assertEmailAvailableEverywhere");
-  try {
-    await assertEmailAvailableEverywhere(req.body?.email);
-    log("assertEmailAvailableEverywhere: OK");
-  } catch (e) {
-    timeEnd("assertEmailAvailableEverywhere");
-    error("assertEmailAvailableEverywhere: FAIL", e?.message);
-    return res.status(400).json({ message: e?.message || "Email check failed" });
-  }
-  timeEnd("assertEmailAvailableEverywhere");
-
-  // -------- basic validation (unchanged responses; just log) --------
+  // -------- basic validation (platform-aware) --------
   if (!isId(eventId)) {
     warn("VALIDATION_FAIL: eventId invalid", { eventId });
-    return res.status(400).json({ message: 'Valid eventId is required' });
+    return res.status(400).json({ message: "Valid eventId is required" });
   }
-  if (!toStr(fullName).trim()) {
+  if (!fullName) {
     warn("VALIDATION_FAIL: fullName missing");
-    return res.status(400).json({ message: 'Full name is required' });
+    return res.status(400).json({ message: "Full name is required" });
   }
-  if (!EMAIL_RX.test(toStr(email))) {
+  if (!EMAIL_RX.test(email)) {
     warn("VALIDATION_FAIL: email invalid", { email });
-    return res.status(400).json({ message: 'Valid email is required' });
+    return res.status(400).json({ message: "Valid email is required" });
   }
   if (!toStr(country).trim()) {
     warn("VALIDATION_FAIL: country missing");
-    return res.status(400).json({ message: 'Country is required' });
+    return res.status(400).json({ message: "Country is required" });
   }
   if (!sessionIds.length) {
     warn("VALIDATION_FAIL: sessionIds empty");
-    return res.status(400).json({ message: 'Please select at least one session' });
+    return res
+      .status(400)
+      .json({ message: "Please select at least one session" });
   }
-  if (typeof virtualMeetRaw === 'undefined') {
+  if (typeof virtualMeetRaw === "undefined") {
     warn("VALIDATION_FAIL: virtualMeet missing");
-    return res.status(400).json({ message: 'Meeting mode (virtual/physical) is required' });
-  }
-  const PASSWORD_MIN = 8;
-  if (!toStr(pwd)) {
-    warn("VALIDATION_FAIL: password missing");
-    return res.status(400).json({ message: 'Password is required' });
-  }
-  if (toStr(pwd).length < PASSWORD_MIN) {
-    warn("VALIDATION_FAIL: password too short", { length: toStr(pwd).length });
-    return res.status(400).json({ message: `Password must be at least ${PASSWORD_MIN} characters` });
+    return res.status(400).json({
+      message: "Meeting mode (virtual/physical) is required",
+    });
   }
 
-  // -------- uniqueness in Attendees --------
-  timeStart("attendee.exists");
-  const existsEmail = await attendee.exists({ 'personal.email': toStr(email).toLowerCase() }).catch((e) => {
-    error("attendee.exists error:", e?.message);
-    throw e;
-  });
-  timeEnd("attendee.exists");
-  if (existsEmail) {
-    warn("UNIQUENESS_FAIL: email already registered");
-    return res.status(409).json({ message: 'Email already registered' });
+  // IMPORTANT: we no longer enforce global email availability here,
+  // because the email is already reserved by the platform User.
+  // Each platform user can register to events using the same address.
+  //   → assertEmailAvailableEverywhere(email) IS INTENTIONALLY NOT CALLED.
+
+  // -------- avoid duplicate attendee for same event+user --------
+  timeStart("attendee.exists[event+email]");
+  const existsForEvent = await attendee
+    .exists({
+      id_event: eventId,
+      "personal.email": email.toLowerCase(),
+    })
+    .catch((e) => {
+      error("attendee.exists error:", e?.message);
+      throw e;
+    });
+  timeEnd("attendee.exists[event+email]");
+
+  if (existsForEvent) {
+    warn("UNIQUENESS_FAIL: already registered for this event", {
+      email,
+      eventId,
+    });
+    return res.status(409).json({
+      message:
+        "You are already registered for this event with this email address.",
+    });
   }
 
-  // -------- normalize flags & pwd hash --------
-  const subRole = parseSubRoles(req.body);
-  const actorTypeNorm = toStr(actorType).trim();
-  const finalSubRole = actorTypeNorm === 'BusinessOwner' ? [] : subRole;
+  // -------- normalize flags / languages / subRoles --------
+  const subRoleFromBody = parseSubRoles(req.body);
+  const actorTypeNorm = toStr(actorType || baseActorType).trim();
+  const finalSubRole =
+    actorTypeNorm === "BusinessOwner" ? [] : (subRoleFromBody.length
+      ? subRoleFromBody
+      : baseSubRole);
 
   const preferredLanguages = csvToArr(prefLangCsv).slice(0, 3);
   const openFlag = normBool(openToMeetings);
@@ -802,72 +1009,100 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     virtualFlag,
   });
 
+  // -------- generate an internal random password for attendee --------
+  // Attendee no longer defines auth; login is via User.
+  // We keep a hashed random password ONLY to satisfy old schema requirements.
   timeStart("bcrypt.hash");
-  const salt    = await bcrypt.genSalt(12);
-  const pwdHash = await bcrypt.hash(toStr(pwd), salt);
+  const randomPwd = randomBytes(32).toString("hex");
+  const salt = await bcrypt.genSalt(12);
+  const pwdHash = await bcrypt.hash(randomPwd, salt);
   timeEnd("bcrypt.hash");
 
   const inviteCodeStr = toStr(inviteCode).trim();
 
-  const DEF_PHOTO = `${(process.env.DEF_ROOT || '').replace(/\/+$/,'')}/uploads/default/photodef.png`;
-  const profilePicUrl = req.file?.path ? localPathToWebUrl(req.file.path) : DEF_PHOTO;
+  const DEF_PHOTO = `${(process.env.DEF_ROOT || "").replace(
+    /\/+$/,
+    ""
+  )}/uploads/default/photodef.png`;
+  const profilePicUrl = req.file?.path
+    ? localPathToWebUrl(req.file.path)
+    : DEF_PHOTO;
   log("PHOTO_SELECT", { profilePicUrl, hadUpload: !!req.file });
 
   // -------- persist attendee --------
   timeStart("attendee.create");
-  const created = await attendee.create({
-    personal: {
-      fullName: toStr(fullName).trim(),
-      email: toStr(email).toLowerCase().trim(),
-      firstEmail : toStr(email).toLowerCase().trim(),
-      phone: toStr(phone).trim(),
-      country: toStr(country).toUpperCase(),
-      city: toStr(city).trim(),
-      gender: toStr(gender).trim(),
-      profilePic: profilePicUrl,
-      preferredLanguages
-    },
-    organization: {
-      orgName: toStr(orgName).trim(),
-      jobTitle: toStr(jobTitle).trim(),
-      businessRole: toStr(businessRole).trim()
-    },
-    matchingIntent: {
-      objectives: csvToArr(objective).length ? csvToArr(objective) : (toStr(objective) ? [toStr(objective)] : []),
-      openToMeetings: openFlag
-    },
-    virtualMeet: virtualFlag,
-    links: { website: toStr(website).trim(), linkedin: toStr(linkedin).trim() },
-    id_event: eventId,
+  const created = await attendee
+    .create({
+      personal: {
+        fullName,
+        email,
+        firstEmail: email,
+        phone,
+        country: toStr(country).toUpperCase(),
+        city: toStr(city).trim(),
+        gender: toStr(gender).trim(),
+        profilePic: profilePicUrl,
+        preferredLanguages,
+      },
+      organization: {
+        orgName,
+        jobTitle,
+        businessRole: toStr(businessRole).trim(),
+      },
+      matchingIntent: {
+        objectives: csvToArr(objective).length
+          ? csvToArr(objective)
+          : toStr(objective)
+          ? [toStr(objective)]
+          : [],
+        openToMeetings: openFlag,
+      },
+      virtualMeet: virtualFlag,
+      links: {
+        website: toStr(website).trim(),
+        linkedin: toStr(linkedin).trim(),
+      },
+      id_event: eventId,
 
-    actorType: toStr(actorType).trim(),
-    role: toStr(actorType).trim(),
-    actorHeadline: toStr(actorHeadline).trim(),
-    pwd: pwdHash,
-    subRole: finalSubRole,
-    verified: false,
-    adminVerified: 'pending'
-  }).catch((e) => {
-    error("attendee.create failed:", e?.message);
-    throw e;
-  });
+      // Keep actorType/subRole/headline consistent with platform user
+      actorType: actorTypeNorm,
+      role: actorTypeNorm,
+      actorHeadline: toStr(actorHeadline).trim(),
+
+      // internal-only auth, not used by frontend anymore
+      pwd: pwdHash,
+
+      subRole: finalSubRole,
+      verified: false,
+      adminVerified: "pending",
+
+      // Optional: snapshot link to platform user (if you later add this field to schema)
+      // userId: platformUser._id,
+    })
+    .catch((e) => {
+      error("attendee.create failed:", e?.message);
+      throw e;
+    });
   timeEnd("attendee.create");
   log("CREATED_ATTENDEE", { id: created?._id?.toString() });
 
-  // -------- verify token + link --------
-  const raw = randomBytes(32).toString('hex');
-  created.verifyToken   = await bcrypt.hash(raw, 12);
+  // -------- verify token + link (event-level verification) --------
+  const rawVerify = randomBytes(32).toString("hex");
+  created.verifyToken = await bcrypt.hash(rawVerify, 12);
   created.verifyExpires = Date.now() + 24 * 60 * 60 * 1000;
   await created.save();
-  const verifyLink = `${process.env.FRONTEND_URL}/verify-email?token=${raw}&role=attendee&id=${created._id}`;
+
+  const verifyLink = `${process.env.FRONTEND_URL}/verify-email?token=${rawVerify}&role=attendee&id=${created._id}`;
   log("VERIFY_LINK_READY", { verifyLink });
 
   // -------- sessions normalize & validate --------
   timeStart("loadAndValidateSessions");
-  const normSessions = await loadAndValidateSessions(eventId, sessionIds).catch((e) => {
-    error("loadAndValidateSessions failed:", e?.message);
-    throw e;
-  });
+  const normSessions = await loadAndValidateSessions(eventId, sessionIds).catch(
+    (e) => {
+      error("loadAndValidateSessions failed:", e?.message);
+      throw e;
+    }
+  );
   timeEnd("loadAndValidateSessions");
   log("SESSIONS_LOADED", {
     count: normSessions.length,
@@ -876,10 +1111,10 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
 
   // -------- conflict system --------
   const conflictBucket = (track) => {
-    const t = String(track || '').toLowerCase();
-    if (t.includes('atelier')) return 'atelier';
-    if (t.includes('masterclass')) return 'masterclass';
-    return 'other';
+    const t = String(track || "").toLowerCase();
+    if (t.includes("atelier")) return "atelier";
+    if (t.includes("masterclass")) return "masterclass";
+    return "other";
   };
 
   const seen = new Map();
@@ -894,9 +1129,10 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
         bucket: conflictBucket(s.track),
       });
       return res.status(409).json({
-        message: 'Conflicting sessions selected for the same time/track family',
+        message:
+          "Conflicting sessions selected for the same time/track family",
         conflictAt: s._id,
-        conflictWith: seen.get(key)._id
+        conflictWith: seen.get(key)._id,
       });
     }
     seen.set(key, s);
@@ -910,11 +1146,11 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     log("attachSeatsAndEnforce: OK");
   } catch (e) {
     timeEnd("attachSeatsAndEnforce");
-    if (e && e.message === 'SESSION_FULL') {
+    if (e && e.message === "SESSION_FULL") {
       warn("SESSION_FULL", { sessionId: e.sessionId });
       return res.status(409).json({
-        message: 'One or more sessions are full',
-        fullSessionId: e.sessionId
+        message: "One or more sessions are full",
+        fullSessionId: e.sessionId,
       });
     }
     error("attachSeatsAndEnforce: FAIL", e?.message);
@@ -924,49 +1160,80 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
 
   // -------- create regs + bump seats --------
   timeStart("createSessionRegs");
-  await createSessionRegs({ actorId: created._id, actorRole: 'attendee', eventId, sessions: normSessions }).catch((e) => {
+  await createSessionRegs({
+    actorId: created._id,
+    actorRole: "attendee",
+    eventId,
+    sessions: normSessions,
+  }).catch((e) => {
     error("createSessionRegs failed:", e?.message);
     throw e;
   });
   timeEnd("createSessionRegs");
+
   timeStart("bumpScheduleSeatsTaken");
-  await bumpScheduleSeatsTaken(normSessions.map(s => s._id), +1).catch((e) => {
+  await bumpScheduleSeatsTaken(
+    normSessions.map((s) => s._id),
+    +1
+  ).catch((e) => {
     error("bumpScheduleSeatsTaken failed:", e?.message);
     throw e;
   });
   timeEnd("bumpScheduleSeatsTaken");
-  normSessions.forEach(s => { delete s.__raw; });
+  normSessions.forEach((s) => {
+    delete s.__raw;
+  });
 
   // -------- event doc for PDF --------
   timeStart("loadEventDoc");
   const eventDoc =
-    (await Event.findById(eventId).lean().catch((e) => {
-      warn("Event.findById failed, falling back skeleton:", e?.message);
-      return null;
-    })) || { _id: eventId, title: 'Event', startDate: new Date(), endDate: new Date(), city: '', country: '' };
+    (await Event.findById(eventId)
+      .lean()
+      .catch((e) => {
+        warn("Event.findById failed, falling back skeleton:", e?.message);
+        return null;
+      })) || {
+      _id: eventId,
+      title: "Event",
+      startDate: new Date(),
+      endDate: new Date(),
+      city: "",
+      country: "",
+    };
   timeEnd("loadEventDoc");
 
   // -------- build PDF --------
   timeStart("buildRegistrationPdf");
-  const pdf = await buildRegistrationPdf({ event: eventDoc, actor: created, role: 'attendee', sessions: normSessions }).catch((e) => {
+  const pdf = await buildRegistrationPdf({
+    event: eventDoc,
+    actor: created,
+    role: "attendee",
+    sessions: normSessions,
+  }).catch((e) => {
     error("buildRegistrationPdf failed:", e?.message);
     throw e;
   });
   timeEnd("buildRegistrationPdf");
-  log("PDF_READY", { bytes: (pdf?.length ?? null) });
+  log("PDF_READY", { bytes: pdf?.length ?? null });
 
   // -------- email compose --------
   const brandLogoPath = process.env.BRAND_LOGO_PATH;
-  const who = created?.personal?.fullName || 'there';
+  const who = created?.personal?.fullName || "there";
 
-  // (the existing HTML/template stays the same)
-  // ... building rowsHtml, hdr, sessionsHtml, html (unchanged) ...
-
-  const rowsHtml = normSessions.map(s => {
-    const startStr = s.startAt ? s.startAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
-    const endStr   = s.endAt   ? s.endAt.toLocaleTimeString([],   { hour: '2-digit', minute: '2-digit' }) : '—';
-    const inner = 'padding:12px 10px;line-height:1.5;mso-line-height-rule:exactly;white-space:normal;word-break:break-word;overflow-wrap:anywhere;';
-    return `
+  const rowsHtml = normSessions
+    .map((s) => {
+      const startStr = s.startAt
+        ? s.startAt.toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          })
+        : "—";
+      const endStr = s.endAt
+        ? s.endAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : "—";
+      const inner =
+        "padding:12px 10px;line-height:1.5;mso-line-height-rule:exactly;white-space:normal;word-break:break-word;overflow-wrap:anywhere;";
+      return `
       <tr>
         <td style="padding:0;border-bottom:1px solid #eee;vertical-align:top;width:110px">
           <div style="${inner}white-space:nowrap">${startStr}–${endStr}</div>
@@ -975,31 +1242,39 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
           <div style="${inner}font-weight:600">${escapeHtml(s.title)}</div>
         </td>
         <td style="padding:0;border-bottom:1px solid #eee;vertical-align:top;width:160px">
-          <div style="${inner}">${escapeHtml(s.room?.name || '')}</div>
+          <div style="${inner}">${escapeHtml(s.room?.name || "")}</div>
         </td>
         <td style="padding:0;border-bottom:1px solid #eee;vertical-align:top;width:130px;color:#64748b">
-          <div style="${inner}">${escapeHtml(s.track || '')}</div>
+          <div style="${inner}">${escapeHtml(s.track || "")}</div>
         </td>
       </tr>`;
-  }).join('');
+    })
+    .join("");
 
   const logoImg = brandLogoPath
     ? `<img src="cid:brandlogo@cid" alt="Logo" style="max-height:40px;vertical-align:middle;margin-right:8px" />`
-    : '';
+    : "";
 
   const hdr = `
     <div style="padding:14px 0;border-bottom:1px solid #e5e7eb;margin-bottom:12px">
       ${logoImg}
       <div style="font:700 18px/1.2 system-ui,Segoe UI,Roboto;display:inline-block;vertical-align:middle">
-        ${escapeHtml(eventDoc.title || 'Event')}
+        ${escapeHtml(eventDoc.title || "Event")}
       </div>
       <div style="font:600 12px/1.4 system-ui;color:#64748b">
-        ${new Date(eventDoc.startDate||Date.now()).toLocaleDateString()} → ${new Date(eventDoc.endDate||Date.now()).toLocaleDateString()}
-        ${eventDoc.city ? `• ${escapeHtml(eventDoc.city)}` : ''} ${eventDoc.country ? `• ${escapeHtml(eventDoc.country)}` : ''}
+        ${new Date(
+          eventDoc.startDate || Date.now()
+        ).toLocaleDateString()} → ${new Date(
+    eventDoc.endDate || Date.now()
+  ).toLocaleDateString()}
+        ${
+          eventDoc.city ? `• ${escapeHtml(eventDoc.city)}` : ""
+        } ${eventDoc.country ? `• ${escapeHtml(eventDoc.country)}` : ""}
       </div>
     </div>`;
 
-  const sessionsHtml = normSessions.length ? `
+  const sessionsHtml = normSessions.length
+    ? `
     <h3 style="font:800 14px system-ui;margin:12px 0 8px">Your selected sessions</h3>
     <table role="presentation" cellpadding="0" cellspacing="0"
            style="border-collapse:collapse;border-spacing:0;width:100%;font:600 12px system-ui;table-layout:auto;mso-table-lspace:0;mso-table-rspace:0">
@@ -1020,14 +1295,19 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
         </tr>
       </thead>
       <tbody>${rowsHtml}</tbody>
-    </table>` : '';
+    </table>`
+    : "";
 
   const html = `
     ${hdr}
     <p style="font:600 14px system-ui">Hello ${escapeHtml(who)},</p>
     <p style="font:600 13px system-ui">
-    Thank you for registering to <b>${escapeHtml(eventDoc.title || 'the event')}</b>.
-    Your current meeting mode is <b>${virtualFlag ? 'Virtual' : 'Physical (in-person)'}</b>.
+    Thank you for registering to <b>${escapeHtml(
+      eventDoc.title || "the event"
+    )}</b>.
+    Your current meeting mode is <b>${
+      virtualFlag ? "Virtual" : "Physical (in-person)"
+    }</b>.
     We attached your confirmation PDF below (with your sessions and QR).
     </p>
     <p style="font:600 13px system-ui;margin:12px 0">
@@ -1038,29 +1318,41 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
     <p style="font:600 13px system-ui;margin-top:14px">Best regards,<br/>IPDAYS X GITS 2025</p>
   `;
 
-  const attachments = [{ filename: 'registration.pdf', content: pdf, contentType: 'application/pdf' }];
+  const attachments = [
+    {
+      filename: "registration.pdf",
+      content: pdf,
+      contentType: "application/pdf",
+    },
+  ];
   if (brandLogoPath) {
-    attachments.push({ filename: path.basename(brandLogoPath), path: brandLogoPath, cid: 'brandlogo@cid' });
+    attachments.push({
+      filename: path.basename(brandLogoPath),
+      path: brandLogoPath,
+      cid: "brandlogo@cid",
+    });
   }
 
   // -------- send email --------
   timeStart("sendMail");
   await sendMail(
     created.personal.email,
-    'GITS: Confirm your registration',
+    "GITS: Confirm your registration",
     html,
-    'Please see the attached PDF for your registration details. Verify your email using the link inside.',
+    "Please see the attached PDF for your registration details. Verify your email using the link inside.",
     attachments
-  ).then(() => {
-    log("EMAIL_SENT", {
-      to: created.personal.email,
-      attachments: attachments.length,
-      hasLogoCID: !!brandLogoPath
+  )
+    .then(() => {
+      log("EMAIL_SENT", {
+        to: created.personal.email,
+        attachments: attachments.length,
+        hasLogoCID: !!brandLogoPath,
+      });
+    })
+    .catch((e) => {
+      error("EMAIL_FAIL", e?.message);
+      throw e;
     });
-  }).catch((e) => {
-    error("EMAIL_FAIL", e?.message);
-    throw e;
-  });
   timeEnd("sendMail");
 
   // -------- event seat increment --------
@@ -1071,22 +1363,32 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
   } catch (e) {
     timeEnd("incEventSeatsTakenOrThrow");
     error("incEventSeatsTakenOrThrow: FAIL -> rollback attendee", e?.message);
-    try { await attendee.findByIdAndDelete(created._id); log("ROLLBACK_ATTENDEE_OK"); } catch (e2) { error("ROLLBACK_ATTENDEE_FAIL", e2?.message); }
-    return res.status(409).json({ message: 'Event is full' });
+    try {
+      await attendee.findByIdAndDelete(created._id);
+      log("ROLLBACK_ATTENDEE_OK");
+    } catch (e2) {
+      error("ROLLBACK_ATTENDEE_FAIL", e2?.message);
+    }
+    return res.status(409).json({ message: "Event is full" });
   }
   timeEnd("incEventSeatsTakenOrThrow");
 
   // -------- notifications --------
   timeStart("notifyRegistrationPending");
-  await notifyRegistrationPending(created._id, 'attendee', eventId).then(() => {
-    log("notifyRegistrationPending: OK");
-  }).catch((e) => {
-    // Not fatal; but log
-    warn("notifyRegistrationPending: FAIL (non-blocking)", e?.message);
-  });
+  await notifyRegistrationPending(created._id, "attendee", eventId)
+    .then(() => {
+      log("notifyRegistrationPending: OK");
+    })
+    .catch((e) => {
+      warn(
+        "notifyRegistrationPending: FAIL (non-blocking)",
+        e?.message
+      );
+    });
   timeEnd("notifyRegistrationPending");
 
   // -------- invite code usage (non-blocking) --------
+
   if (inviteCodeStr) {
     timeStart("inviteCode.increment");
     try {
@@ -1095,17 +1397,26 @@ exports.registerAttendee = asyncHandler(async (req, res) => {
         { $inc: { usageCount: 1 } },
         { new: false }
       ).lean();
-      log("inviteCode.increment", { code: inviteCodeStr, foundEnabled: !!r });
+      log("inviteCode.increment", {
+        code: inviteCodeStr,
+        foundEnabled: !!r,
+      });
     } catch (e) {
-      error('inviteCode increment failed:', e?.message || e);
+      error("inviteCode increment failed:", e?.message || e);
     } finally {
       timeEnd("inviteCode.increment");
     }
   }
 
   // -------- success --------
-  log("END_SUCCESS", { id: created._id?.toString(), role: 'attendee' });
-  return res.status(201).json({ success: true, data: { id: created._id, role: 'attendee' } });
+  log("END_SUCCESS", {
+    id: created._id?.toString(),
+    role: "attendee",
+    currentUserId,
+  });
+  return res
+    .status(201)
+    .json({ success: true, data: { id: created._id, role: "attendee" } });
 });
 
 
@@ -1414,6 +1725,7 @@ exports.registerSpeaker = asyncHandler(async (req,res)=>{
 
 
 const ROLE_MODEL = {
+  user     : User,
   attendee : attendee,
   exhibitor: Exhibitor,
   speaker  : Speaker,
@@ -1457,8 +1769,116 @@ async function issueVerification(userDoc, email, role, opts = {}) {
     <p>This link expires in 24 hours.</p>
   `, attachments);
 }
+// ───────────────────────── REGISTER USER (plateforme) ─────────────────────────
+// POST /auth/user/register
+// Body: {
+//   actorType | role, subRole, fullName, email, phone, organization, jobTitle,
+//   pwd, pwd2
+// }
+exports.registerUser = asyncHandler(async (req, res) => {
+  const {
+    actorType,
+    role,
+    fullName,
+    email,
+    phone,
+    organization,
+    jobTitle,
+    pwd,
+    pwd2,
+    otherRoleLabel
+  } = req.body || {};
 
+  const baseType = actorType || role;
+  const actorTypeNorm = normalizeActorType(baseType);
 
+  if (!actorTypeNorm) {
+    return res.status(400).json({ message: 'Valid role/actorType is required (BusinessOwner, Investor, Consultant, Expert, Employee, Student, Other).' });
+  }
+  if (!toStr(fullName).trim()) {
+    return res.status(400).json({ message: 'Full name is required' });
+  }
+  if (!EMAIL_RX.test(toStr(email))) {
+    return res.status(400).json({ message: 'Valid email is required' });
+  }
+
+  const pwdStr  = toStr(pwd);
+  const pwd2Str = toStr(pwd2);
+  if (!pwdStr) {
+    return res.status(400).json({ message: 'Password is required' });
+  }
+  if (pwdStr.length < 8) {
+    return res.status(400).json({ message: 'Password must be at least 8 characters' });
+  }
+  if (pwd2Str && pwd2Str !== pwdStr) {
+    return res.status(400).json({ message: 'Passwords do not match' });
+  }
+
+  // liste subRole depuis body (utilise déjà ton helper)
+  const subRoleArr = parseSubRoles(req.body);
+
+  const emailLower = toStr(email).toLowerCase().trim();
+
+  // Check global (user + autres modèles qui ont root email)
+  try {
+    await assertEmailAvailableEverywhere(emailLower);
+  } catch (e) {
+    return res.status(409).json({ message: 'Email already in use' });
+  }
+
+  // Check direct dans User
+  const existsUser = await User.findOne({ email: emailLower }).lean();
+  if (existsUser) {
+    return res.status(409).json({ message: 'Email already registered' });
+  }
+
+  // On laisse le pre-save hook hasher le mot de passe
+  const userDoc = await User.create({
+    fullName: toStr(fullName).trim(),
+    email   : emailLower,
+    phone   : toStr(phone).trim(),
+    organization: toStr(organization).trim().slice(0, 120),
+    jobTitle    : toStr(jobTitle).trim().slice(0, 100),
+    actorType   : actorTypeNorm,
+    subRole     : subRoleArr,
+    otherRoleLabel:
+      actorTypeNorm === 'Other'
+        ? toStr(otherRoleLabel).trim().slice(0, 120)
+        : undefined,
+    pwd         : pwdStr,
+    loginProvider: 'password',
+    verified    : false,
+  });
+
+  // Envoie mail de vérification (réutilise ton helper existant)
+  await issueVerification(userDoc, userDoc.email, 'user');
+
+  return res.status(201).json({
+    success: true,
+    message: 'User registered. Please verify your email.',
+    data: {
+      id       : userDoc._id,
+      email    : userDoc.email,
+      actorType: userDoc.actorType,
+      subRole  : userDoc.subRole,
+    },
+  });
+});
+
+exports.listOtherActorLabels = asyncHandler(async (req, res) => {
+  const raw = await User.distinct("otherRoleLabel", { actorType: "Other" });
+
+  const data = (raw || [])
+    .map((v) => toStr(v).trim())
+    .filter(Boolean)
+    .slice(0, 200)
+    .map((value) => ({ value }));
+
+  return res.json({
+    success: true,
+    data,
+  });
+});
 /* ───────────────────────── VERIFY EMAIL ───────────────────────────── */
 exports.verifyEmail = asyncHandler(async (req, res) => {
   // accept POST body OR GET query seamlessly
@@ -1504,40 +1924,46 @@ exports.verifyEmail = asyncHandler(async (req, res) => {
 
 
 exports.forgotPassword = asyncHandler(async (req, res) => {
-  const { email } = req.body;
-  if (!email || !EMAIL_RX.test(email))
-    return res.status(400).json({ message:'Valid e-mail required' });
-
-  const mailLower = email.toLowerCase();
-  /* Search all 3 user collections (admins too) */
-  const lookOrder = [
-    { role:'attendee' , query:{ 'personal.email' : mailLower } },
-    { role:'exhibitor', query:{ 'identity.email': mailLower } },
-    { role:'speaker'  , query:{ 'personal.email' : mailLower } },
-    { role:'admin'    , query:{ email: mailLower } }
-  ];
-
-  let user, role;
-  for (const { role:r, query } of lookOrder) {
-    user = await ROLE_MODEL[r].findOne(query).exec();
-    if (user) { role = r; break; }
+  const { email } = req.body || {};
+  if (!email || !EMAIL_RX.test(email)) {
+    return res.status(400).json({ message: 'Valid e-mail required' });
   }
-  if (!user)
-    return res.status(200).json({ success:true, message:'If that e-mail exists we have sent instructions.' });
 
-  /* Create reset token */
+  const mailLower = email.toLowerCase().trim();
+  const user = await User.findOne({ email: mailLower })
+    .select('+resetToken +resetExpires')
+    .exec();
+
+  // Soft success
+  if (!user) {
+    return res.status(200).json({
+      success: true,
+      message: 'If that e-mail exists we have sent instructions.',
+    });
+  }
+
   const raw  = randomBytes(32).toString('hex');
   const hash = await bcrypt.hash(raw, 12);
+
   user.resetToken   = hash;
-  user.resetExpires = Date.now() + 60*60*1000;  // 1 h
+  user.resetExpires = Date.now() + 60 * 60 * 1000; // 1h
   await user.save();
-  const link = `${process.env.FRONTEND_URL}/reset-password?token=${raw}&role=${role}&id=${user._id}`;
-  await sendMail(email, 'Password reset', `
-    <p>You requested a password reset.</p>
-    <p><a href="${link}">Click here to set a new password</a> (valid 1 hour).</p>`
+
+  const link = `${process.env.FRONTEND_URL}/reset-password?token=${raw}&type=user&id=${user._id}`;
+
+  await sendMail(
+    mailLower,
+    'Password reset',
+    `
+      <p>You requested a password reset.</p>
+      <p><a href="${link}">Click here to set a new password</a> (valid 1 hour).</p>
+    `
   );
 
-  res.status(200).json({ success:true, message:'If the e-mail exists, a reset link has been sent.' });
+  return res.status(200).json({
+    success: true,
+    message: 'If the e-mail exists, a reset link has been sent.',
+  });
 });
 
 // POST /api/auth/set-password
@@ -1578,78 +2004,185 @@ exports.setPassword = asyncHandler(async (req, res) => {
   res.json({ success:true, message:'Password updated' });
 });
 
+// ───────────────────────── GOOGLE LOGIN USER ─────────────────────────
+// POST /auth/user/google-login
+// Body: { idToken, actorType|role, subRole, phone, organization, jobTitle }
+exports.googleLogin = asyncHandler(async (req, res) => {
+  const {
+    idToken,
+    actorType,
+    role,
+    phone,
+    organization,
+    jobTitle,
+  } = req.body || {};
+
+  if (!idToken) {
+    return res.status(400).json({ message: 'idToken is required' });
+  }
+  if (!googleClient) {
+    return res.status(500).json({ message: 'Google OAuth not configured (GOOGLE_CLIENT_ID missing).' });
+  }
+
+  // Vérification du token Google
+  const ticket = await googleClient.verifyIdToken({
+    idToken,
+    audience: process.env.GOOGLE_CLIENT_ID,
+  });
+  const payload = ticket.getPayload();
+
+  const email   = payload?.email;
+  const googleId = payload?.sub;
+  const fullName = payload?.name || email;
+
+  if (!email || !googleId) {
+    return res.status(400).json({ message: 'Google token missing email or subject.' });
+  }
+
+  const emailLower = email.toLowerCase().trim();
+
+  // Cherche user existant
+  let user = await User.findOne({ googleId }).exec();
+  if (!user) {
+    user = await User.findOne({ email: emailLower }).exec();
+  }
+
+  const actorTypeNorm = normalizeActorType(actorType || role) || 'Other';
+  const subRoleArr    = parseSubRoles(req.body);
+
+  if (!user) {
+    // Création d’un nouveau user via Google
+    const randomPwd = randomBytes(16).toString('hex');
+
+    user = await User.create({
+      fullName: toStr(fullName).trim().slice(0, 120),
+      email   : emailLower,
+      phone   : toStr(phone).trim(),
+      organization: toStr(organization).trim().slice(0, 120),
+      jobTitle    : toStr(jobTitle).trim().slice(0, 100),
+      actorType   : actorTypeNorm,
+      subRole     : subRoleArr,
+      pwd         : randomPwd,
+      googleId    : googleId,
+      loginProvider: 'google',
+      verified    : payload.email_verified ?? true,
+    });
+  } else {
+    // Mise à jour googleId si manquant + verified si email confirmé
+    let changed = false;
+    if (!user.googleId) {
+      user.googleId = googleId;
+      changed = true;
+    }
+    if (payload.email_verified && !user.verified) {
+      user.verified = true;
+      changed = true;
+    }
+    if (changed) await user.save();
+  }
+
+  const authRole = user.isAdmin ? 'admin' : 'user';
+
+  const tokenPayload = {
+    email    : user.email,
+    role     : authRole,
+    ActorId  : user._id.toString(),
+    userId   : user._id.toString(),
+    actorType: user.actorType || null,
+    subRole  : user.subRole || [],
+  };
+
+  const accessToken = jwt.sign(
+    { UserInfo: tokenPayload },
+    process.env.ACCESS_TOKEN_SECRET,
+    { expiresIn: '30m' }
+  );
+
+  const refreshToken = jwt.sign(
+    tokenPayload,
+    process.env.REFRESH_TOKEN_SECRET,
+    { expiresIn: '7d' }
+  );
+
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  res.cookie('jwt', refreshToken, {
+    httpOnly: true,
+    secure  : isProduction,
+    sameSite: isProduction ? 'strict' : 'lax',
+    maxAge  : 7 * 24 * 60 * 60 * 1000,
+  });
+
+  return res.json({
+    success: true,
+    message: 'Login successful',
+    data: {
+      accessToken,
+      tokenType: 'Bearer',
+      expiresIn: '30m',
+      user: {
+        id         : user._id,
+        fullName   : user.fullName,
+        email      : user.email,
+        phone      : user.phone,
+        organization: user.organization,
+        jobTitle   : user.jobTitle,
+        actorType  : user.actorType,
+        subRole    : user.subRole,
+        role       : authRole,
+      },
+    },
+  });
+});
 
 
 /* ───────────────────────── 2. Reset-password ──────────────────────── */
 exports.resetPassword = asyncHandler(async (req, res) => {
-  const role  = String((req.body?.role || req.query?.role || '')).trim().toLowerCase();
-  const id    = (req.body?.id || req.query?.id || '').trim();
-  const token = String((req.body?.token || req.query?.token || '')).trim();
-  const pwd   = String(req.body?.pwd || req.query?.pwd || '');
-
-  if (!role || !id || !token || !pwd) {
-    return res.status(400).json({ message: 'Missing role, id, token or pwd' });
+  const { id, token, pwd } = req.body || {};
+  if (!id || !token || !pwd) {
+    return res.status(400).json({ message: 'id, token and pwd are required' });
   }
   if (!mongoose.isValidObjectId(id)) {
     return res.status(400).json({ message: 'Bad user id' });
   }
-  if (pwd.length < 8) {
+  if (String(pwd).length < 8) {
     return res.status(400).json({ message: 'Password must be at least 8 characters' });
   }
 
-  const Model = ROLE_MODEL[role];
-  if (!Model) return res.status(400).json({ message: 'Unsupported role' });
-
-  // include hidden token fields
-  const user = await Model.findById(id)
-    .select('+resetToken +resetExpires +resetTokenPrev +resetPrevExpires +pwd')
+  const user = await User.findById(id)
+    .select('+resetToken +resetExpires +pwd')
     .exec();
 
-  if (!user) return res.status(404).json({ message: 'User not found' });
-
-  const now = Date.now();
-
-  const currentValid = user.resetToken && user.resetExpires && Number(user.resetExpires) > now;
-  const prevValid    = user.resetTokenPrev && user.resetPrevExpires && Number(user.resetPrevExpires) > now;
-
-  let matched = false;
-
-  if (currentValid) {
-    matched = await bcrypt.compare(token, user.resetToken);
-  }
-  if (!matched && prevValid) {
-    matched = await bcrypt.compare(token, user.resetTokenPrev);
+  if (!user || !user.resetToken || !user.resetExpires) {
+    return res.status(400).json({ message: 'Invalid reset token' });
   }
 
-  if (!matched) {
+  if (Number(user.resetExpires) <= Date.now()) {
+    return res.status(400).json({ message: 'Reset token expired' });
+  }
+
+  const ok = await bcrypt.compare(String(token), user.resetToken);
+  if (!ok) {
     return res.status(400).json({ message: 'Invalid reset token' });
   }
 
   const salt = await bcrypt.genSalt(12);
-  user.pwd = await bcrypt.hash(pwd, salt);
+  user.pwd = await bcrypt.hash(String(pwd), salt);
 
-  // clear both tokens after success
-  user.resetToken = undefined;
+  user.resetToken   = undefined;
   user.resetExpires = undefined;
-  user.resetTokenPrev = undefined;
-  user.resetPrevExpires = undefined;
-
   await user.save();
 
   try {
-    const firstEmail = getRoleFirstEmail(user, role);
-    if (firstEmail) {
-      await sendMail(
-        firstEmail,
-        'Your password has been reset',
-        `<p>Your password was just reset using a reset link. If this wasn’t you, run “Forgot password” again and contact support.</p>`
-      );
-    }
+    await sendMail(
+      user.email,
+      'Your password has been reset',
+      `<p>Your password was just reset. If this wasn’t you, run “Forgot password” again and contact support.</p>`
+    );
   } catch (_) {}
 
   return res.json({ success: true, message: 'Password updated.' });
 });
-
 /* helper reused from Part 4 */
 
 
@@ -1885,6 +2418,30 @@ exports.resendVerificationById = asyncHandler(async (req, res) => {
   return res.json({ success: true, message: 'Verification e-mail re-sent.' });
 });
 
+exports.resendUserVerificationByEmail = asyncHandler(async (req, res) => {
+  const { email } = req.body || {};
+  const emailLower = toStr(email).toLowerCase().trim();
+
+  if (!EMAIL_RX.test(emailLower)) {
+    return res.status(400).json({ message: 'Valid email is required' });
+  }
+
+  const userDoc = await User.findOne({ email: emailLower }).exec();
+  if (!userDoc) {
+    return res.status(404).json({ message: 'User not found' });
+  }
+
+  if (userDoc.verified) {
+    return res.json({ success: true, message: 'Account already verified' });
+  }
+
+  await issueVerification(userDoc, userDoc.email, 'user');
+
+  return res.json({
+    success: true,
+    message: 'Verification e-mail re-sent.',
+  });
+});
 
 
 // POST /api/auth/reset-password   (also accepts GET with query for manual tests)
