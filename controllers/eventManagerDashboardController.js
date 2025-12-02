@@ -383,7 +383,77 @@ exports.listMyEventsForManager = async (req, res, next) => {
     next(err);
   }
 };
+exports.getClosestEventForManager = async (req, res, next) => {
+  try {
+    const { userId } = await resolveManagerContext(req);
+    const actorId = userId; // we currently use user as ownerActor too
 
+    if (!userId) {
+      return res.status(401).json({
+        error: "AUTH_REQUIRED",
+        message: "You must be logged in to view your events.",
+      });
+    }
+
+    const baseFilter = {
+      ownerUser: userId,
+      ownerActor: actorId,
+    };
+
+    const now = new Date();
+
+    // 1) Upcoming event
+    let e = await Event.findOne({
+      ...baseFilter,
+      startDate: { $gte: now },
+    })
+      .sort({ startDate: 1 })
+      .select(
+        "title slug startDate endDate city country cover onboardingCompleted isPublished"
+      )
+      .lean();
+
+    // 2) Fallback: latest past event
+    if (!e) {
+      e = await Event.findOne(baseFilter)
+        .sort({ startDate: -1 })
+        .select(
+          "title slug startDate endDate city country cover onboardingCompleted isPublished"
+        )
+        .lean();
+    }
+
+    if (!e) {
+      return res.status(404).json({
+        ok: false,
+        error: "NO_EVENTS",
+        message: "You don't have any managed events yet.",
+      });
+    }
+
+    const eventPayload = {
+      id: e._id,
+      title: e.title,
+      slug: e.slug,
+      startDate: e.startDate,
+      endDate: e.endDate,
+      city: e.city,
+      country: e.country,
+      cover: e.cover,
+      onboardingCompleted: !!e.onboardingCompleted,
+      isPublished: !!e.isPublished,
+    };
+
+    return res.json({
+      ok: true,
+      eventId: e._id,
+      event: eventPayload,
+    });
+  } catch (err) {
+    console.error("getClosestEventForManager error:", err);
+    next(err);
+  }
+};
 /* ────────────────────────── GET /event-manager/dashboard/events/:id ─────── */
 /**
  * Load a single event + schedule + media (+ header/aside meta) for dashboard.
