@@ -469,27 +469,25 @@ exports.getEventForManagerDashboard = async (req, res, next) => {
         message: "You must be logged in to view this event.",
       });
     }
-
-    const { id } = req.params;
-    if (!mongoose.isValidObjectId(id)) {
-      return res.status(400).json({ error: "INVALID_ID" });
+    console.log("userId",userId,"actorId",actorId);
+    const manager = await EventManagerApplication.findById(userId).lean();
+    if (!manager) {
+      return res.status(403).json({
+        error: "NOT_EVENT_MANAGER",
+        message: "You need an approved Event Manager profile to access events.",
+      });
     }
 
-    const event = await Event.findById(id).lean();
+    
+    const event = await Event.findOne({ ownerUser: manager.user }).lean();
+    console.log("event",event);
     if (!event) {
       return res.status(404).json({ error: "NOT_FOUND" });
     }
+    const id = event._id;
 
     // Ownership guard (strict: match both ownerUser + ownerActor)
-    if (
-      event.ownerUser?.toString() !== String(userId || "") ||
-      event.ownerActor?.toString() !== String(actorId || "")
-    ) {
-      return res.status(403).json({
-        error: "FORBIDDEN",
-        message: "You are not allowed to access this event.",
-      });
-    }
+    
 
     const [scheduleDocs, galleryDocs] = await Promise.all([
       EventSchedule.find({ id_event: event._id })

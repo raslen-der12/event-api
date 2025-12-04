@@ -37,6 +37,9 @@ const Schedule = require('../models/eventModels/schedule');
 const programRoom = require('../models/programRoom');
 const sessionRegistration = require('../models/sessionRegistration');
 const ActorInviteCode = require('../models/ActorInviteCode');
+
+const EventManagerApplication = require('../models/EventManagerApplication');
+
 require('dotenv').config({ path: '../.env' });
 const toStr = (v) => (v == null ? '' : String(v));
 const normBool = (v) => ['1','true','yes','y','on'].includes(toStr(v).toLowerCase());
@@ -234,6 +237,41 @@ async function bumpScheduleSeatsTaken(sessionIds, delta = 1) {
 
 
 
+/**
+ * Resolve auth role based on DB, *not* on user.role field.
+ * Rules:
+ *  - admin stays admin
+ *  - if baseRole === "user" and there is an EventManagerApplication
+ *    for this user with status != "Rejected" => "event-manager"
+ *  - otherwise keep baseRole (fallback "user")
+ */
+async function computeAuthRole(user, baseRole = "user") {
+  if (!user) return baseRole || 'user';
+  console.log("user",user,"baseRole", baseRole);
+  if (user.isAdmin) return 'admin';
+
+  const effectiveBase = baseRole || 'user';
+
+  // Only "upgrade" plain user to event-manager
+  if (effectiveBase === 'user') {
+    try {
+      const hasApplication = await EventManagerApplication.exists({
+        user: user._id,
+        status: { $ne: 'Rejected' },
+      }).lean() ;
+      console.log("hasApplication",hasApplication);
+
+      if (hasApplication) {
+        return 'event-manager';
+      }
+    } catch (e) {
+      console.error('[computeAuthRole] EventManagerApplication.exists failed:', e);
+      // on error, just keep base role
+    }
+  }
+
+  return effectiveBase;
+}
 
 
 
@@ -502,7 +540,7 @@ exports.login = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'Incorrect email or password' });
   }
 
-  if (!user.verified) {
+    if (!user.verified) {
     return res.status(403).json({
       success: false,
       code   : 'EMAIL_NOT_VERIFIED',
@@ -510,8 +548,8 @@ exports.login = asyncHandler(async (req, res) => {
     });
   }
 
-  const authRole = user.isAdmin ? 'admin' : 'user';
-
+  const authRole = await computeAuthRole(user);
+  console.log("authRole",authRole);
   const tokenPayload = {
     email    : user.email,
     role     : authRole,
@@ -619,9 +657,10 @@ exports.refresh = asyncHandler(async (req, res) => {
   }
 
   const { email, role } = payload || {};
+  console.log(payload);
   if (!email || !role)
     return res.status(400).json({ message: "Bad token" });
-
+  console.log(role);
   // 2) Look up user in the appropriate collection
   let foundUser = null;
   let actorType = null;
@@ -643,7 +682,13 @@ exports.refresh = asyncHandler(async (req, res) => {
       subRole = Array.isArray(foundUser.subRole) ? foundUser.subRole : [];
       break;
     }
-
+    case "event-manager": {
+      foundUser = await EventManagerApplication.findOne({ workEmail :email }).exec();
+      if (!foundUser) {
+        return res.status(401).json({ message: "Unauthorized" });
+      }
+      break;
+    }
     // Legacy B2B actors (still supported for older tokens)
     case "attendee":
       foundUser = await attendee.findOne({ "personal.email": email }).exec();
@@ -2081,7 +2126,7 @@ exports.googleLogin = asyncHandler(async (req, res) => {
     if (changed) await user.save();
   }
 
-  const authRole = user.isAdmin ? 'admin' : 'user';
+   const authRole = computeAuthRole(user);
 
   const tokenPayload = {
     email    : user.email,

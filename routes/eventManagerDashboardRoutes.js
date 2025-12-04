@@ -12,4 +12,9 @@ router.post("/events/wizard",protect, ctrl.createEventFromWizard);
 router.get("/events",protect, ctrl.listMyEventsForManager);
 router.get("/events/:id",protect, ctrl.getEventForManagerDashboard);
 router.patch("/events/:id",protect, ctrl.updateEventForManagerDashboard);
+router.get(
+  "/events/closest",
+  protect,
+  ctrl.getClosestEventForManager
+);
 module.exports = router;
