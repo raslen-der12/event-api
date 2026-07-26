@@ -1,13 +1,14 @@
-node_modules
+node_modules/
 .env
-/uploads
-uploads/*****
-uploads/.gitkeep
-/config/allowedOrigin.js
-config/allowedOrigin.js
+.env.*
+!.env.example
 
-config/allowedOrigin.js
 uploads/
 logs/
+exports/
+
+.DS_Store
+*.zip
 *.rar
-logs/
+
+config/allowedOrigin.js
